@@ -35,6 +35,8 @@ trap cleanup EXIT
 git -C "$repo" init -q -b main
 git -C "$repo" config user.name "Stakrr Test"
 git -C "$repo" config user.email "test@stakrr.local"
+git -C "$repo" config commit.gpgsign false
+git -C "$repo" config core.hooksPath /dev/null
 
 commit() {
     git -C "$repo" commit -q --allow-empty -m "$1"
