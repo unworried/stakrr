@@ -1,6 +1,13 @@
 # stakrr
 CLI tool designed to streamline downstacking from a rolling branch.
 
+---
+
+### why zig?
+you can only relax when the agents are sleeping. also, its fast and I like using it
+
+---
+
 ## design
 - working at the development HEAD
 - make a cut at the current HEAD or specified commit-like
