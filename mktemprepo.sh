@@ -55,5 +55,22 @@ export STAKRR="$bin"
 export STAKRR_TEST_REPO="$repo"
 
 cd "$repo"
+
+echo
+echo "Stakrr manual testing environment"
+echo "---------------------------------"
+echo "Repository: $repo"
+echo "Branch:     $rollbranch"
+echo "Binary:     $bin"
+echo
 git log --oneline --graph --decorate --all
+echo
+echo "Try:"
+echo "  stakrr init --base main"
+echo "  git config --local --get stakrr.state"
+echo "  stakrr init --base main   # Should fail"
+echo
+echo "Exit the shell with 'exit' or Ctrl-D."
+echo
+
 "${SHELL:-/bin/bash}" -i
