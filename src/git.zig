@@ -1,5 +1,4 @@
 const std = @import("std");
-
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -41,8 +40,8 @@ pub const Git = struct {
         };
     }
 
-    /// Execute a command that must succeed.
-    /// Returns an owned, newline-trimmed copy of stdout.
+    /// execute a command that must succeed
+    /// returns an owned, newline-trimmed copy of stdout
     pub fn output(
         self: *const Git,
         args: []const []const u8,
@@ -59,7 +58,7 @@ pub const Git = struct {
         return self.allocator.dupe(u8, trimmed);
     }
 
-    /// Require an ordinary Git working tree.
+    /// require an ordinary git working tree
     pub fn ensureWorkTree(self: *const Git) !void {
         const result = try self.run(&.{
             "rev-parse",
@@ -76,8 +75,8 @@ pub const Git = struct {
             return error.NotWorkingTree;
     }
 
-    /// Returns the full current branch ref.
-    /// Example: refs/heads/work
+    /// returns the full current branch ref
+    /// example: refs/heads/work
     pub fn currentBranch(self: *const Git) ![]u8 {
         const result = try self.run(&.{
             "symbolic-ref",
@@ -96,7 +95,7 @@ pub const Git = struct {
         ));
     }
 
-    /// Resolve a revision to an actual commit OID.
+    /// resolve a revision to an actual commit oid
     pub fn resolveCommit(self: *const Git, revision: []const u8) ![]u8 {
         const peeled = try std.fmt.allocPrint(
             self.allocator,
@@ -113,7 +112,7 @@ pub const Git = struct {
         });
     }
 
-    /// Check whether a is an ancestor of b.
+    /// check whether a is an ancestor of b
     pub fn isAncestor(
         self: *const Git,
         a: []const u8,
@@ -132,5 +131,71 @@ pub const Git = struct {
             1 => false,
             else => error.GitFailed,
         };
+    }
+
+    pub fn configGet(
+        self: *const Git,
+        key: []const u8,
+    ) !?[]u8 {
+        const result = try self.run(&.{
+            "config", "--local", "--get-all", key,
+        });
+        defer self.free(result);
+
+        const code = switch (result.term) {
+            .exited => |status| status,
+            else => return error.GitTerminated,
+        };
+
+        switch (code) {
+            1 => return null,
+            0 => {},
+            else => return error.GitFailed,
+        }
+
+        const value = std.mem.trimEnd(
+            u8,
+            result.stdout,
+            "\r\n",
+        );
+
+        // stakrr expects exactly one config value
+        if (value.len == 0 or
+            std.mem.indexOfScalar(u8, value, '\n') != null)
+        {
+            return error.InvalidGitConfig;
+        }
+
+        return try self.allocator.dupe(u8, value);
+    }
+
+    pub fn listStackRefs(self: *const Git) ![]u8 {
+        return self.output(&.{
+            "for-each-ref",
+            "--format=%(refname)%09%(objectname)",
+            "refs/heads/stakrr/",
+        });
+    }
+
+    pub fn countCommits(
+        self: *const Git,
+        older: []const u8,
+        newer: []const u8,
+    ) !usize {
+        const range = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}..{s}",
+            .{ older, newer },
+        );
+        defer self.allocator.free(range);
+
+        const text = try self.output(&.{
+            "rev-list",
+            "--count",
+            range,
+        });
+        defer self.allocator.free(text);
+
+        return std.fmt.parseInt(usize, text, 10);
     }
 };
