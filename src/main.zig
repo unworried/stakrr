@@ -1,71 +1,116 @@
 const std = @import("std");
-const Io = std.Io;
-
-const stakrr = @import("stakrr");
+const Git = @import("git.zig").Git;
 
 pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+    const allocator = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(allocator);
 
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
-
-    // Accessing command line arguments:
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+    if (args.len != 4 or
+        !std.mem.eql(u8, args[1], "init") or
+        !std.mem.eql(u8, args[2], "--base"))
+    {
+        try std.Io.File.stderr().writeStreamingAll(
+            init.io,
+            "usage: stakrr init --base <branch>\n",
+        );
+        return error.InvalidArguments;
     }
 
-    // In order to do I/O operations need an `Io` instance.
-    const io = init.io;
-
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
-
-    try stakrr.printAnotherMessage(stdout_writer);
-
-    try stdout_writer.flush(); // Don't forget to flush!
-}
-
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
-
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try command `zig build test --fuzz -Doptimize=ReleaseFast` to see if it manages to fail this test case!
-
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
+    const git = Git{
+        .allocator = allocator,
+        .io = init.io,
     };
+
+    initStack(&git, allocator, args[3]) catch |err| {
+        std.log.err("initialisation failed: {s}", .{
+            @errorName(err),
+        });
+        return err;
+    };
+}
+
+fn initStack(
+    git: *const Git,
+    allocator: std.mem.Allocator,
+    base_name: []const u8,
+) !void {
+    // 1. require standard working tree
+    try git.ensureWorkTree();
+
+    // 2. refuse existing initialisation
+    const existing = try git.run(&.{
+        "config", "--local", "--get", "stakrr.state",
+    });
+    defer git.free(existing);
+
+    switch (existing.term) {
+        .exited => |code| switch (code) {
+            0 => return error.AlreadyInitialised,
+            1 => {},
+            else => return error.GitFailed,
+        },
+        else => return error.GitTerminated,
+    }
+
+    // 3. identify rolling branch and base
+    const work_ref = try git.currentBranch();
+
+    const base_ref = try std.fmt.allocPrint(
+        allocator,
+        "refs/heads/{s}",
+        .{base_name},
+    );
+
+    // validate the base as a git branch ref
+    _ = try git.output(&.{
+        "check-ref-format",
+        base_ref,
+    });
+
+    if (std.mem.eql(u8, work_ref, base_ref))
+        return error.BaseEqualsWork;
+
+    // 4. resolve both branch tips
+    const base_oid = try git.resolveCommit(base_ref);
+    const work_oid = try git.resolveCommit(work_ref);
+
+    // 5. check ancestry
+    if (!try git.isAncestor(base_oid, work_oid))
+        return error.BaseNotAncestor;
+
+    // 6. reject merge commits for m1
+    const range = try std.fmt.allocPrint(
+        allocator,
+        "{s}..{s}",
+        .{ base_oid, work_oid },
+    );
+
+    const merges = try git.output(&.{
+        "rev-list",
+        "--min-parents=2",
+        range,
+    });
+
+    if (merges.len != 0)
+        return error.MergeCommitsUnsupported;
+
+    // 7. persist the initialisation metadata
+    const state = try std.fmt.allocPrint(
+        allocator,
+        "v1 {s} {s} {s}",
+        .{ base_ref, work_ref, base_oid },
+    );
+
+    _ = try git.output(&.{
+        "config",
+        "--local",
+        "--add",
+        "stakrr.state",
+        state,
+    });
+
+    std.log.info("initialised: {s} -> {s}", .{
+        base_ref,
+        work_ref,
+    });
 }
