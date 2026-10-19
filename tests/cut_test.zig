@@ -9,7 +9,7 @@ fn initialize(repo: *const Repo) ![]u8 {
     errdefer testing.allocator.free(base);
 
     try repo.exec(&.{ "switch", "-q", "-c", "work" });
-    try stack.initStack(&repo.git, testing.allocator, "main");
+    try stack.initStack(&repo.git, "main");
     return base;
 }
 
@@ -42,7 +42,7 @@ test "cut at HEAD creates the first layer without moving work" {
     const b = try repo.commit("B");
     defer testing.allocator.free(b);
 
-    try stack.cut(&repo.git, testing.allocator, "p1", null);
+    try stack.cut(&repo.git, "p1", null);
 
     try expectRef(&repo, "refs/heads/main", base);
     try expectRef(&repo, "refs/heads/work", b);
@@ -54,7 +54,7 @@ test "cut at HEAD creates the first layer without moving work" {
 
     try testing.expectEqualStrings("refs/heads/work", head);
 
-    var snapshot = try stack.inspect(&repo.git, testing.allocator);
+    var snapshot = try stack.inspect(&repo.git);
     defer snapshot.deinit();
 
     try testing.expectEqual(@as(usize, 1), snapshot.layers.len);
@@ -75,12 +75,12 @@ test "cut at an earlier commit leaves rolling work untouched" {
     const c = try repo.commit("C");
     defer testing.allocator.free(c);
 
-    try stack.cut(&repo.git, testing.allocator, "p1", "HEAD~1");
+    try stack.cut(&repo.git, "p1", "HEAD~1");
 
     try expectRef(&repo, "refs/heads/stakrr/p1", b);
     try expectRef(&repo, "refs/heads/work", c);
 
-    var snapshot = try stack.inspect(&repo.git, testing.allocator);
+    var snapshot = try stack.inspect(&repo.git);
     defer snapshot.deinit();
 
     try testing.expectEqual(@as(usize, 1), snapshot.unstacked_commits);
@@ -102,8 +102,8 @@ test "two sequential cuts create ordered boundaries" {
     const d = try repo.commit("D");
     defer testing.allocator.free(d);
 
-    try stack.cut(&repo.git, testing.allocator, "p1", "HEAD~1");
-    try stack.cut(&repo.git, testing.allocator, "p2", null);
+    try stack.cut(&repo.git, "p1", "HEAD~1");
+    try stack.cut(&repo.git, "p2", null);
 
     try expectRef(&repo, "refs/heads/stakrr/p1", c);
     try expectRef(&repo, "refs/heads/stakrr/p2", d);
@@ -111,7 +111,7 @@ test "two sequential cuts create ordered boundaries" {
     try expectRef(&repo, "refs/heads/main", base);
     try expectRef(&repo, "refs/heads/work", d);
 
-    var snapshot = try stack.inspect(&repo.git, testing.allocator);
+    var snapshot = try stack.inspect(&repo.git);
     defer snapshot.deinit();
 
     try testing.expectEqual(@as(usize, 2), snapshot.layers.len);
@@ -140,17 +140,17 @@ test "cut rejects empty boundaries" {
 
     try testing.expectError(
         error.EmptyCut,
-        stack.cut(&repo.git, testing.allocator, "p1", null),
+        stack.cut(&repo.git, "p1", null),
     );
 
     const b = try repo.commit("B");
     defer testing.allocator.free(b);
 
-    try stack.cut(&repo.git, testing.allocator, "p1", null);
+    try stack.cut(&repo.git, "p1", null);
 
     try testing.expectError(
         error.EmptyCut,
-        stack.cut(&repo.git, testing.allocator, "p2", null),
+        stack.cut(&repo.git, "p2", null),
     );
 
     try expectNoRef(&repo, "refs/heads/stakrr/p2");
@@ -169,11 +169,11 @@ test "cut rejects older and unrelated boundaries" {
     const c = try repo.commit("C");
     defer testing.allocator.free(c);
 
-    try stack.cut(&repo.git, testing.allocator, "p1", null);
+    try stack.cut(&repo.git, "p1", null);
 
     try testing.expectError(
         error.InvalidCutBoundary,
-        stack.cut(&repo.git, testing.allocator, "p2", b),
+        stack.cut(&repo.git, "p2", b),
     );
 
     try expectNoRef(&repo, "refs/heads/stakrr/p2");
@@ -188,7 +188,7 @@ test "cut rejects older and unrelated boundaries" {
 
     try testing.expectError(
         error.InvalidCutBoundary,
-        stack.cut(&repo.git, testing.allocator, "p2", unrelated),
+        stack.cut(&repo.git, "p2", unrelated),
     );
 }
 
@@ -202,14 +202,14 @@ test "cut rejects duplicate or invalid layer names" {
     const b = try repo.commit("B");
     defer testing.allocator.free(b);
 
-    try stack.cut(&repo.git, testing.allocator, "p1", null);
+    try stack.cut(&repo.git, "p1", null);
 
     const c = try repo.commit("C");
     defer testing.allocator.free(c);
 
     try testing.expectError(
         error.GitFailed,
-        stack.cut(&repo.git, testing.allocator, "p1", null),
+        stack.cut(&repo.git, "p1", null),
     );
 
     try expectRef(&repo, "refs/heads/stakrr/p1", b);
@@ -217,12 +217,12 @@ test "cut rejects duplicate or invalid layer names" {
 
     try testing.expectError(
         error.InvalidLayerName,
-        stack.cut(&repo.git, testing.allocator, "../bad", null),
+        stack.cut(&repo.git, "../bad", null),
     );
 
     try testing.expectError(
         error.InvalidLayerName,
-        stack.cut(&repo.git, testing.allocator, "", null),
+        stack.cut(&repo.git, "", null),
     );
 }
 
@@ -240,7 +240,7 @@ test "cut rejects non-work branch and moved base" {
 
     try testing.expectError(
         error.NotOnWorkBranch,
-        stack.cut(&repo.git, testing.allocator, "p1", null),
+        stack.cut(&repo.git, "p1", null),
     );
 
     const new_base = try repo.commit("moved main");
@@ -250,7 +250,7 @@ test "cut rejects non-work branch and moved base" {
 
     try testing.expectError(
         error.BaseMoved,
-        stack.cut(&repo.git, testing.allocator, "p1", null),
+        stack.cut(&repo.git, "p1", null),
     );
 
     try expectNoRef(&repo, "refs/heads/stakrr/p1");
@@ -278,7 +278,7 @@ test "cut allows staged changes without changing the index" {
     });
     defer testing.allocator.free(before);
 
-    try stack.cut(&repo.git, testing.allocator, "p1", null);
+    try stack.cut(&repo.git, "p1", null);
 
     const after = try repo.git.output(&.{
         "status", "--porcelain=v1",
@@ -382,7 +382,7 @@ test "cut rejects a side branch outside the rolling history" {
 
     try testing.expectError(
         error.CutOutsideWork,
-        stack.cut(&repo.git, testing.allocator, "outside", side),
+        stack.cut(&repo.git, "outside", side),
     );
 
     try expectNoRef(&repo, "refs/heads/stakrr/outside");
