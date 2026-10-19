@@ -1,7 +1,8 @@
 const std = @import("std");
 const testing = std.testing;
 
-const Git = @import("stakrr").git.Git;
+const stakrr_git = @import("stakrr").git;
+const Git = stakrr_git.Git;
 
 const Repo = @import("support/repo.zig").Repo;
 
@@ -162,6 +163,27 @@ test "run preserves Git's nonzero exit status" {
 
     try testing.expect(!result.term.success());
     try testing.expect(result.stderr.len > 0);
+}
+
+test "isOid accepts only full lowercase sha1/sha256 ids" {
+    const sha1: [40]u8 = @splat('a');
+    const sha256: [64]u8 = @splat('f');
+    const upper: [40]u8 = @splat('A');
+    const option: [40]u8 = ("--output=x" ++ @as([30]u8, @splat('a'))).*;
+
+    try testing.expect(stakrr_git.isOid(&sha1));
+    try testing.expect(stakrr_git.isOid(&sha256));
+    try testing.expect(!stakrr_git.isOid("abc"));
+    try testing.expect(!stakrr_git.isOid(&upper));
+    try testing.expect(!stakrr_git.isOid(&option));
+}
+
+test "isSafeBranchRef rejects options and protocol injection" {
+    try testing.expect(stakrr_git.isSafeBranchRef("refs/heads/main"));
+    try testing.expect(!stakrr_git.isSafeBranchRef("refs/heads/"));
+    try testing.expect(!stakrr_git.isSafeBranchRef("--output=x"));
+    try testing.expect(!stakrr_git.isSafeBranchRef("refs/heads/a\nverify x"));
+    try testing.expect(!stakrr_git.isSafeBranchRef("refs/heads/a b"));
 }
 
 test "configGet returns null when key is missing" {

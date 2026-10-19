@@ -2,6 +2,29 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
+/// True if `text` is a full hexadecimal SHA-1 or SHA-256 object id.
+pub fn isOid(text: []const u8) bool {
+    if (text.len != 40 and text.len != 64) return false;
+    for (text) |c| switch (c) {
+        '0'...'9', 'a'...'f' => {},
+        else => return false,
+    };
+    return true;
+}
+
+/// Cheap guard for persisted branch refs before they reach argv or the
+/// update-ref protocol: must be under refs/heads/ and contain no whitespace
+/// or control characters. Git applies its full naming rules on use.
+pub fn isSafeBranchRef(text: []const u8) bool {
+    const prefix = "refs/heads/";
+    if (!std.mem.startsWith(u8, text, prefix) or text.len == prefix.len)
+        return false;
+    for (text) |c| {
+        if (c <= ' ' or c == 0x7f) return false;
+    }
+    return true;
+}
+
 pub const Git = struct {
     allocator: Allocator,
     io: Io,
