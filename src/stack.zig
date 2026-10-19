@@ -84,7 +84,7 @@ pub fn initStack(
 
     // 3. identify rolling branch and base
     const work_ref = try git.currentBranch();
-    defer git.allocator.free(work_ref);
+    defer allocator.free(work_ref);
 
     const base_ref = try std.fmt.allocPrint(
         allocator,
@@ -105,9 +105,9 @@ pub fn initStack(
 
     // 4. resolve both branch tips
     const base_oid = try git.resolveCommit(base_ref);
-    defer git.allocator.free(base_oid);
+    defer allocator.free(base_oid);
     const work_oid = try git.resolveCommit(work_ref);
-    defer git.allocator.free(work_oid);
+    defer allocator.free(work_oid);
 
     // 5. check ancestry
     if (!try git.isAncestor(base_oid, work_oid))
@@ -141,9 +141,10 @@ pub fn initStack(
 }
 
 pub fn loadConfig(git: *const Git) !Config {
+    const allocator = git.allocator;
     const raw = (try git.configGet("stakrr.state")) orelse
         return error.NotInitialized;
-    errdefer git.allocator.free(raw);
+    errdefer allocator.free(raw);
 
     var tokens = std.mem.tokenizeScalar(u8, raw, ' ');
 
@@ -187,13 +188,13 @@ pub fn inspect(git: *const Git) !Snapshot {
     try git.ensureWorkTree();
 
     var config = try loadConfig(git);
-    errdefer config.deinit(git.allocator);
+    errdefer config.deinit(allocator);
 
     const base_oid = try git.resolveCommit(config.base_ref);
-    defer git.allocator.free(base_oid);
+    defer allocator.free(base_oid);
 
     const work_oid = try git.resolveCommit(config.work_ref);
-    errdefer git.allocator.free(work_oid);
+    errdefer allocator.free(work_oid);
 
     // anchor must be reachable from the rolling branch
     if (!try git.isAncestor(config.anchor_oid, work_oid))
@@ -206,7 +207,7 @@ pub fn inspect(git: *const Git) !Snapshot {
 
     // discover branches owned by stakrr
     const raw_refs = try git.listStackRefs();
-    errdefer git.allocator.free(raw_refs);
+    errdefer allocator.free(raw_refs);
 
     var layers: std.ArrayList(Layer) = .empty;
     errdefer layers.deinit(allocator);
@@ -320,7 +321,7 @@ pub fn cut(
     defer snapshot.deinit();
 
     const current_ref = try git.currentBranch();
-    defer git.allocator.free(current_ref);
+    defer allocator.free(current_ref);
 
     if (!std.mem.eql(u8, current_ref, snapshot.config.work_ref))
         return error.NotOnWorkBranch;
@@ -346,8 +347,8 @@ pub fn cut(
     const target = if (revision) |rev|
         try git.resolveCommit(rev)
     else
-        try git.allocator.dupe(u8, snapshot.work_oid);
-    defer git.allocator.free(target);
+        try allocator.dupe(u8, snapshot.work_oid);
+    defer allocator.free(target);
 
     const last_layer: ?Layer = if (snapshot.layers.len != 0)
         snapshot.layers[snapshot.layers.len - 1]
