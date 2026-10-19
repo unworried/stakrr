@@ -83,6 +83,7 @@ test "cli: full init, cut, status, reset flow" {
     const reset = try stakrr(&repo, &.{ "reset", "--delete-layers" });
     defer reset.deinit();
     try testing.expectEqual(@as(u8, 0), reset.code);
+    try testing.expectEqualStrings("stack reset\ndeleted 1 layer branch\n", reset.stdout);
 
     const again = try stakrr(&repo, &.{ "init", "--base=main" });
     defer again.deinit();

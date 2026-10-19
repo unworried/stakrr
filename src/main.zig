@@ -132,7 +132,9 @@ fn runCommand(
         .version => try stdout.print("stakrr {s}\n", .{build_options.version}),
         .init => |options| {
             try stack.initStack(git, options.base);
-            try stdout.print("stack initialized on {s}\n", .{options.base});
+            try stdout.writeAll("stack initialized on ");
+            try term.styled(out, .accent, "{s}", .{options.base});
+            try stdout.writeByte('\n');
         },
         .status => {
             var snapshot = try stack.inspect(git);
@@ -142,21 +144,25 @@ fn runCommand(
         },
         .cut => |options| {
             try stack.cut(git, options.name, options.at);
-            try stdout.print("created layer: stakrr/{s}\n", .{options.name});
+            try stdout.writeAll("created layer: ");
+            try term.styled(out, .accent, "stakrr/{s}", .{options.name});
+            try stdout.writeByte('\n');
         },
         .reset => |options| {
             const result = try stack.reset(git, options.delete_layers);
             try stdout.writeAll("stack reset\n");
             if (result.deleted_layers != 0)
-                try stdout.print(
-                    "deleted {d} layer branch(es)\n",
-                    .{result.deleted_layers},
-                );
-            if (result.kept_layers != 0)
-                try stdout.print(
-                    "kept {d} layer branch(es) under stakrr/; remove them or run 'stakrr reset --delete-layers' before re-initializing\n",
-                    .{result.kept_layers},
-                );
+                try stdout.print("deleted {d} layer {s}\n", .{
+                    result.deleted_layers,
+                    plural(result.deleted_layers, "branch", "branches"),
+                });
+            if (result.kept_layers != 0) {
+                try term.styled(out, .warn, "kept {d} layer {s} under stakrr/", .{
+                    result.kept_layers,
+                    plural(result.kept_layers, "branch", "branches"),
+                });
+                try stdout.writeAll("; remove them or run 'stakrr reset --delete-layers' before re-initializing\n");
+            }
         },
     }
 }
