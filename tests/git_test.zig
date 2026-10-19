@@ -165,6 +165,20 @@ test "run preserves Git's nonzero exit status" {
     try testing.expect(result.stderr.len > 0);
 }
 
+test "failed commands record git's stderr in diagnostics" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    var diagnostics: stakrr_git.Diagnostics = .{};
+    repo.git.diagnostics = &diagnostics;
+
+    try testing.expectError(
+        error.GitFailed,
+        repo.git.resolveCommit("missing-revision"),
+    );
+    try testing.expect(diagnostics.stderr().len > 0);
+}
+
 test "isOid accepts only full lowercase sha1/sha256 ids" {
     const sha1: [40]u8 = @splat('a');
     const sha256: [64]u8 = @splat('f');

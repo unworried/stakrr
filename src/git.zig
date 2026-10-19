@@ -16,6 +16,22 @@ pub const Error = error{
     StreamTooLong,
 };
 
+/// Optional sink for the stderr of the last failed Git command.
+pub const Diagnostics = struct {
+    buf: [1024]u8 = undefined,
+    len: usize = 0,
+
+    pub fn stderr(self: *const Diagnostics) []const u8 {
+        return self.buf[0..self.len];
+    }
+
+    fn record(self: *Diagnostics, text: []const u8) void {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        self.len = @min(trimmed.len, self.buf.len);
+        @memcpy(self.buf[0..self.len], trimmed[0..self.len]);
+    }
+};
+
 /// True if `text` is a full hexadecimal SHA-1 or SHA-256 object id.
 pub fn isOid(text: []const u8) bool {
     if (text.len != 40 and text.len != 64) return false;
@@ -43,6 +59,7 @@ pub const Git = struct {
     allocator: Allocator,
     io: Io,
     cwd: ?Io.Dir = null,
+    diagnostics: ?*Diagnostics = null,
 
     const stdout_limit = 16 * 1024 * 1024;
     const stderr_limit = 64 * 1024;
@@ -86,6 +103,12 @@ pub const Git = struct {
         };
     }
 
+    /// record git's stderr for the caller and report the failure
+    fn fail(self: *const Git, stderr: []const u8) error{GitFailed} {
+        if (self.diagnostics) |diag| diag.record(stderr);
+        return error.GitFailed;
+    }
+
     /// execute a command that must succeed
     /// returns an owned, newline-trimmed copy of stdout
     pub fn output(
@@ -96,7 +119,7 @@ pub const Git = struct {
         defer self.freeResult(result);
 
         if ((try exitCode(result)) != 0)
-            return error.GitFailed;
+            return self.fail(result.stderr);
 
         const trimmed = std.mem.trimEnd(u8, result.stdout, "\r\n");
         return self.allocator.dupe(u8, trimmed);
@@ -106,7 +129,7 @@ pub const Git = struct {
     pub fn exec(self: *const Git, args: []const []const u8) !void {
         const result = try self.run(args);
         defer self.freeResult(result);
-        if ((try exitCode(result)) != 0) return error.GitFailed;
+        if ((try exitCode(result)) != 0) return self.fail(result.stderr);
     }
 
     pub fn checkRefFormat(self: *const Git, ref_name: []const u8) !void {
@@ -131,7 +154,7 @@ pub const Git = struct {
                 std.mem.trimEnd(u8, result.stdout, "\r\n"),
             ),
             1 => null,
-            else => error.GitFailed,
+            else => self.fail(result.stderr),
         };
     }
 
@@ -230,7 +253,7 @@ pub const Git = struct {
         return switch (try exitCode(result)) {
             0 => true,
             1 => false,
-            else => error.GitFailed,
+            else => self.fail(result.stderr),
         };
     }
 
@@ -243,15 +266,10 @@ pub const Git = struct {
         });
         defer self.freeResult(result);
 
-        const code = switch (result.term) {
-            .exited => |status| status,
-            else => return error.GitTerminated,
-        };
-
-        switch (code) {
+        switch (try exitCode(result)) {
             1 => return null,
             0 => {},
-            else => return error.GitFailed,
+            else => return self.fail(result.stderr),
         }
 
         const value = std.mem.trimEnd(
@@ -392,8 +410,7 @@ pub const Git = struct {
         child.stdin.?.close(self.io);
         child.stdin = null;
 
-        // drain git's stderr instead of forwarding it to the
-        // test runner. preserve the subprocess exit status
+        // capture git's stderr instead of forwarding it to the terminal
         var stderr_buffer: [4096]u8 = undefined;
         var stderr_reader = child.stderr.?.reader(
             self.io,
@@ -409,6 +426,6 @@ pub const Git = struct {
         const term = try child.wait(self.io);
         reaped = true;
 
-        if (!term.success()) return error.GitFailed;
+        if (!term.success()) return self.fail(stderr);
     }
 };
