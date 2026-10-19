@@ -1,6 +1,7 @@
 const std = @import("std");
 const stakrr = @import("stakrr");
 const Git = stakrr.git.Git;
+const Diagnostics = stakrr.git.Diagnostics;
 const stack = stakrr.stack;
 
 pub const Command = union(enum) {
@@ -16,20 +17,22 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
 
-    const command = parseArgs(args) catch |err| fail(init.io, err);
+    const command = parseArgs(args) catch |err| fail(init.io, err, null);
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
+    var diagnostics: Diagnostics = .{};
     const git = Git{
         .allocator = allocator,
         .io = init.io,
+        .diagnostics = &diagnostics,
     };
 
     runCommand(&git, stdout, command) catch |err| {
         stdout.flush() catch {};
-        fail(init.io, err);
+        fail(init.io, err, &diagnostics);
     };
     try stdout.flush();
 }
@@ -120,7 +123,7 @@ fn runCommand(
 
 /// report a failure on stderr and exit; never returns an error from main,
 /// which would make Zig print the error name and a trace as well
-fn fail(io: std.Io, err: anyerror) noreturn {
+fn fail(io: std.Io, err: anyerror, diagnostics: ?*const Diagnostics) noreturn {
     var buffer: [2048]u8 = undefined;
     var stderr_writer = std.Io.File.stderr().writer(io, &buffer);
     const stderr = &stderr_writer.interface;
@@ -129,6 +132,12 @@ fn fail(io: std.Io, err: anyerror) noreturn {
         stderr.print("error: {s}\n", .{message}) catch {};
     } else {
         stderr.print("error: unexpected failure ({s})\n", .{@errorName(err)}) catch {};
+    }
+
+    if (err == error.GitFailed) {
+        if (diagnostics) |diag| {
+            if (diag.len != 0) stderr.print("git: {s}\n", .{diag.stderr()}) catch {};
+        }
     }
 
     stderr.flush() catch {};
@@ -162,7 +171,7 @@ fn userError(err: anyerror) ?[]const u8 {
         error.InvalidLayerName => "invalid layer name",
         error.EmptyCut => "no new commits since previous layer",
         error.InvalidCutBoundary, error.CutOutsideWork => "revision is outside the next unstacked segment",
-        error.GitFailed => "Git operation failed (refs may have changed)",
+        error.GitFailed => "git command failed",
         error.InvalidRefName => "invalid Git branch name",
         error.DetachedHead => "detached HEAD is unsupported",
         else => null,
