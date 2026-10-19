@@ -1,0 +1,75 @@
+# git-cliff config for CHANGELOG.md and GitHub release notes
+# https://git-cliff.org/docs/configuration
+#
+#   git cliff -o CHANGELOG.md                         # full changelog
+#   STAKRR_RELEASE=1 git cliff --latest --strip all   # release notes
+
+[changelog]
+header = """
+# changelog
+
+notable changes to stakrr, generated from conventional commits by
+[git-cliff](https://git-cliff.org).
+
+"""
+# groups sort by name, so each carries a hidden <!-- n --> prefix for order
+body = """
+{%- set repo = "https://github.com/unworried/stakrr" -%}
+{%- set release = get_env(name="STAKRR_RELEASE", default="") -%}
+{%- if not release %}
+{% if version -%}
+## {{ version }}{% if message %} ── {{ message | split(pat=" - ") | last | trim }}{% endif %}
+
+<sub>{{ timestamp | date(format="%Y-%m-%d") }}{% if previous.version %} · [diff]({{ repo }}/compare/{{ previous.version }}...{{ version }}){% endif %}</sub>
+{%- else -%}
+## unreleased
+{%- endif %}
+{%- endif %}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}** {% endif %}{{ commit.message | split(pat="\n") | first | trim }} [`{{ commit.id | truncate(length=7, end="") }}`]({{ repo }}/commit/{{ commit.id }})
+{%- endfor %}
+{% endfor %}
+{%- if release and version %}
+### ▸ install
+
+```sh
+# targets: aarch64-macos  x86_64-macos  aarch64-linux-musl  x86_64-linux-musl
+target=aarch64-macos
+curl -fsSLO {{ repo }}/releases/download/{{ version }}/stakrr-{{ version }}-$target.tar.gz
+curl -fsSLO {{ repo }}/releases/download/{{ version }}/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS   # macos: shasum -a 256 -c --ignore-missing SHA256SUMS
+tar -xzf stakrr-{{ version }}-$target.tar.gz && ./stakrr version
+```
+{% if previous.version %}
+<sub>[full diff]({{ repo }}/compare/{{ previous.version }}...{{ version }})</sub>
+{% endif %}
+{%- endif %}
+"""
+footer = ""
+trim = true
+
+[git]
+conventional_commits = true
+# keep the pre-convention history on main; the parsers below sort it
+filter_unconventional = false
+filter_commits = true
+protect_breaking_commits = true
+tag_pattern = "v[0-9]+\\.[0-9]+\\.[0-9]+"
+sort_commits = "oldest"
+commit_preprocessors = [
+  # link squash-merged PR numbers
+  { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/unworried/stakrr/pull/${1}))" },
+]
+commit_parsers = [
+  { message = "^Merge ", skip = true },
+  { message = "^fixup", skip = true },
+  { message = "^[a-z]+(\\(.+\\))?!:", group = "<!-- 0 -->⚠ breaking" },
+  { body = "BREAKING CHANGE", group = "<!-- 0 -->⚠ breaking" },
+  { message = "^(?i)(feat|add)", group = "<!-- 1 -->▸ features" },
+  { message = "^(?i)fix(\\(.+\\))?:", group = "<!-- 2 -->▸ fixes" },
+  { message = "^perf", group = "<!-- 3 -->▸ perf" },
+  { message = "^(?i)(refactor|test|build|ci|chore|docs|style|clean)", group = "<!-- 4 -->▸ internals" },
+  { message = ".*", group = "<!-- 5 -->▸ other" },
+]
