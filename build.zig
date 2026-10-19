@@ -1,4 +1,5 @@
 const std = @import("std");
+const zon = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -10,6 +11,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", zon.version);
+
     const exe = b.addExecutable(.{
         .name = "stakrr",
         .root_module = b.createModule(.{
@@ -18,6 +22,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "stakrr", .module = mod },
+                .{ .name = "build_options", .module = build_options.createModule() },
             },
         }),
     });

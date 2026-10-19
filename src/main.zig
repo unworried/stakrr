@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const stakrr = @import("stakrr");
 const Git = stakrr.git.Git;
 const Diagnostics = stakrr.git.Diagnostics;
@@ -6,6 +7,7 @@ const stack = stakrr.stack;
 
 pub const Command = union(enum) {
     help,
+    version,
     init: struct { base: []const u8 },
     status,
     cut: struct { name: []const u8, at: ?[]const u8 = null },
@@ -46,6 +48,11 @@ pub fn parseArgs(args: []const []const u8) ParseError!Command {
 
     if (eql(command, "help") or eql(command, "--help") or eql(command, "-h"))
         return .help;
+
+    if (eql(command, "version") or eql(command, "--version")) {
+        if (rest.len != 0) return error.InvalidArguments;
+        return .version;
+    }
 
     if (eql(command, "init")) {
         if (rest.len == 2 and eql(rest[0], "--base"))
@@ -112,6 +119,7 @@ fn runCommand(
 ) !void {
     switch (command) {
         .help => try printHelp(stdout),
+        .version => try stdout.print("stakrr {s}\n", .{build_options.version}),
         .init => |options| {
             try stack.initStack(git, options.base);
             try stdout.print("stack initialized on {s}\n", .{options.base});
@@ -174,6 +182,7 @@ fn printHelp(stdout: *std.Io.Writer) !void {
         "  status                        display layers and unstacked commits\n" ++
         "  cut <name> [--at <rev>]       create the next layer\n" ++
         "  reset [--delete-layers]       forget the stack so it can be re-initialized\n" ++
+        "  version                       print the stakrr version\n" ++
         "  help                          show this message\n");
 }
 
@@ -258,9 +267,10 @@ test "every domain error has a user message" {
     }
 }
 
-test "parseArgs: help" {
+test "parseArgs: help and version" {
     try testing.expectEqual(Command.help, try parseArgs(&.{"stakrr"}));
     try testing.expectEqual(Command.help, try parseArgs(&.{ "stakrr", "--help" }));
+    try testing.expectEqual(Command.version, try parseArgs(&.{ "stakrr", "--version" }));
     try testing.expectError(error.UnknownCommand, parseArgs(&.{ "stakrr", "nope" }));
 }
 
