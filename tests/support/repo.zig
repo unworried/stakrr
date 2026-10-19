@@ -1,5 +1,5 @@
 const std = @import("std");
-const Git = @import("git").Git;
+const Git = @import("stakrr").git.Git;
 
 const testing = std.testing;
 

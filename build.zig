@@ -152,12 +152,6 @@ pub fn build(b: *std.Build) void {
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
 
-    const git_module = b.createModule(.{
-        .root_source_file = b.path("src/git.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
     const git_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/git_test.zig"),
@@ -168,7 +162,20 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-
     const run_git_tests = b.addRunArtifact(git_tests);
+
+    const stack_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/stack_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "stakrr", .module = mod },
+            },
+        }),
+    });
+    const run_stack_tests = b.addRunArtifact(stack_tests);
+
     test_step.dependOn(&run_git_tests.step);
+    test_step.dependOn(&run_stack_tests.step);
 }

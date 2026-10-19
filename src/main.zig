@@ -25,10 +25,8 @@ pub fn main(init: std.process.Init) !void {
         if (args.len != 2)
             return error.InvalidArguments;
 
-        const snapshot = try stack.inspect(
-            &git,
-            allocator,
-        );
+        var snapshot = try stack.inspect(&git, allocator);
+        defer snapshot.deinit();
 
         try printStatus(init.io, allocator, snapshot);
     } else {

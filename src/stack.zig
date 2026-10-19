@@ -5,16 +5,26 @@ pub const Config = struct {
     base_ref: []const u8,
     work_ref: []const u8,
     anchor_oid: []const u8,
+
+    _storage: []u8,
+
+    pub fn deinit(
+        self: *Config,
+        allocator: std.mem.Allocator,
+    ) void {
+        allocator.free(self._storage);
+        self.* = undefined;
+    }
 };
 
 pub const Layer = struct {
     ref_name: []const u8,
     oid: []const u8,
 
-    // Commits between anchor and this layer.
+    // commits between anchor and this layer
     depth: usize,
 
-    // Commits since the previous layer boundary.
+    // commits since the previous layer boundary
     commits: usize = 0,
 };
 
@@ -24,8 +34,22 @@ pub const Snapshot = struct {
 
     work_oid: []const u8,
     unstacked_commits: usize,
-
     base_moved: bool,
+
+    // layer ref_name and oid slices borrow from this buffer
+    _refs_storage: []u8,
+
+    // layers and git command results have different allocators
+    _allocator: std.mem.Allocator,
+    _git_allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *Snapshot) void {
+        self._allocator.free(self.layers);
+        self._git_allocator.free(self._refs_storage);
+        self._git_allocator.free(self.work_oid);
+        self.config.deinit(self._git_allocator);
+        self.* = undefined;
+    }
 };
 
 pub fn initStack(
@@ -53,25 +77,30 @@ pub fn initStack(
 
     // 3. identify rolling branch and base
     const work_ref = try git.currentBranch();
+    defer git.allocator.free(work_ref);
 
     const base_ref = try std.fmt.allocPrint(
         allocator,
         "refs/heads/{s}",
         .{base_name},
     );
+    defer allocator.free(base_ref);
 
     // validate the base as a git branch ref
-    _ = try git.output(&.{
+    const checked = try git.output(&.{
         "check-ref-format",
         base_ref,
     });
+    defer git.allocator.free(checked);
 
     if (std.mem.eql(u8, work_ref, base_ref))
         return error.BaseEqualsWork;
 
     // 4. resolve both branch tips
     const base_oid = try git.resolveCommit(base_ref);
+    defer git.allocator.free(base_oid);
     const work_oid = try git.resolveCommit(work_ref);
+    defer git.allocator.free(work_oid);
 
     // 5. check ancestry
     if (!try git.isAncestor(base_oid, work_oid))
@@ -84,12 +113,14 @@ pub fn initStack(
         "{s}..{s}",
         .{ base_oid, work_oid },
     );
+    defer allocator.free(range);
 
     const merges = try git.output(&.{
         "rev-list",
         "--min-parents=2",
         range,
     });
+    defer git.allocator.free(merges);
 
     if (merges.len != 0)
         return error.MergeCommitsUnsupported;
@@ -100,14 +131,16 @@ pub fn initStack(
         "v1 {s} {s} {s}",
         .{ base_ref, work_ref, base_oid },
     );
+    defer allocator.free(state);
 
-    _ = try git.output(&.{
+    const written = try git.output(&.{
         "config",
         "--local",
         "--add",
         "stakrr.state",
         state,
     });
+    defer git.allocator.free(written);
 
     std.log.info("initialised: {s} -> {s}", .{
         base_ref,
@@ -118,6 +151,7 @@ pub fn initStack(
 pub fn loadConfig(git: *const Git) !Config {
     const raw = (try git.configGet("stakrr.state")) orelse
         return error.NotInitialized;
+    errdefer git.allocator.free(raw);
 
     var tokens = std.mem.tokenizeScalar(u8, raw, ' ');
 
@@ -152,6 +186,7 @@ pub fn loadConfig(git: *const Git) !Config {
         .base_ref = base,
         .work_ref = work,
         .anchor_oid = anchor,
+        ._storage = raw,
     };
 }
 
@@ -161,10 +196,14 @@ pub fn inspect(
 ) !Snapshot {
     try git.ensureWorkTree();
 
-    const config = try loadConfig(git);
+    var config = try loadConfig(git);
+    errdefer config.deinit(git.allocator);
 
     const base_oid = try git.resolveCommit(config.base_ref);
+    defer git.allocator.free(base_oid);
+
     const work_oid = try git.resolveCommit(config.work_ref);
+    errdefer git.allocator.free(work_oid);
 
     // anchor must be reachable from the rolling branch.
     if (!try git.isAncestor(config.anchor_oid, work_oid))
@@ -177,20 +216,24 @@ pub fn inspect(
         "{s}..{s}",
         .{ config.anchor_oid, work_oid },
     );
+    defer allocator.free(range);
 
     const merges = try git.output(&.{
         "rev-list",
         "--min-parents=2",
         range,
     });
+    defer git.allocator.free(merges);
 
     if (merges.len != 0)
         return error.MergeCommitsUnsupported;
 
     // discover branches owned by stakrr
     const raw_refs = try git.listStackRefs();
+    errdefer git.allocator.free(raw_refs);
 
     var layers: std.ArrayList(Layer) = .empty;
+    errdefer layers.deinit(allocator);
     var lines = std.mem.splitScalar(u8, raw_refs, '\n');
 
     while (lines.next()) |line| {
@@ -274,5 +317,8 @@ pub fn inspect(
             base_oid,
             config.anchor_oid,
         ),
+        ._refs_storage = raw_refs,
+        ._allocator = allocator,
+        ._git_allocator = git.allocator,
     };
 }
