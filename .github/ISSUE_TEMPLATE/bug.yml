@@ -1,0 +1,28 @@
+name: bug
+description: something stakrr did that it shouldn't have
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: what happened
+      description: the command you ran and what you expected instead
+      placeholder: |
+        $ stakrr cut api
+        error: ...
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: stakrr status
+      description: output of `stakrr status`, and `git log --oneline --graph --all -20` if the stack looks wrong
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: version
+      description: "`stakrr version`, `git --version` and your os"
+      placeholder: stakrr 0.0.2 · git 2.51.0 · macos 26
+    validations:
+      required: true
