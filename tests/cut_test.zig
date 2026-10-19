@@ -28,7 +28,7 @@ fn expectNoRef(repo: *const Repo, ref_name: []const u8) !void {
     const result = try repo.git.run(&.{
         "show-ref", "--verify", "--quiet", ref_name,
     });
-    defer repo.git.free(result);
+    defer repo.git.freeResult(result);
     try testing.expect(!result.term.success());
 }
 

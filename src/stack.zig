@@ -62,7 +62,7 @@ pub fn initStack(
     const existing = try git.run(&.{
         "config", "--local", "--get", "stakrr.state",
     });
-    defer git.free(existing);
+    defer git.freeResult(existing);
 
     switch (existing.term) {
         .exited => |code| switch (code) {

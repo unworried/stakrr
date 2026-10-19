@@ -27,7 +27,7 @@ pub const Git = struct {
         });
     }
 
-    pub fn free(
+    pub fn freeResult(
         self: *const Git,
         result: std.process.RunResult,
     ) void {
@@ -49,7 +49,7 @@ pub const Git = struct {
         args: []const []const u8,
     ) ![]u8 {
         const result = try self.run(args);
-        defer self.free(result);
+        defer self.freeResult(result);
 
         if ((try exitCode(result)) != 0)
             return error.GitFailed;
@@ -61,13 +61,13 @@ pub const Git = struct {
     /// execute a Git command that must succeed without retaining stdout
     pub fn exec(self: *const Git, args: []const []const u8) !void {
         const result = try self.run(args);
-        defer self.free(result);
+        defer self.freeResult(result);
         if ((try exitCode(result)) != 0) return error.GitFailed;
     }
 
     pub fn checkRefFormat(self: *const Git, ref_name: []const u8) !void {
         const result = try self.run(&.{ "check-ref-format", ref_name });
-        defer self.free(result);
+        defer self.freeResult(result);
         if ((try exitCode(result)) != 0) return error.InvalidRefName;
     }
 
@@ -80,7 +80,7 @@ pub const Git = struct {
             "--end-of-options",
             ref_name,
         });
-        defer self.free(result);
+        defer self.freeResult(result);
         return switch (try exitCode(result)) {
             0 => try self.allocator.dupe(
                 u8,
@@ -120,7 +120,7 @@ pub const Git = struct {
             "rev-parse",
             "--is-inside-work-tree",
         });
-        defer self.free(result);
+        defer self.freeResult(result);
 
         if ((try exitCode(result)) != 0)
             return error.NotGitRepository;
@@ -139,7 +139,7 @@ pub const Git = struct {
             "--quiet",
             "HEAD",
         });
-        defer self.free(result);
+        defer self.freeResult(result);
 
         if ((try exitCode(result)) != 0)
             return error.DetachedHead;
@@ -181,7 +181,7 @@ pub const Git = struct {
             a,
             b,
         });
-        defer self.free(result);
+        defer self.freeResult(result);
 
         return switch (try exitCode(result)) {
             0 => true,
@@ -197,7 +197,7 @@ pub const Git = struct {
         const result = try self.run(&.{
             "config", "--local", "--get-all", key,
         });
-        defer self.free(result);
+        defer self.freeResult(result);
 
         const code = switch (result.term) {
             .exited => |status| status,

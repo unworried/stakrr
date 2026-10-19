@@ -158,7 +158,7 @@ test "run preserves Git's nonzero exit status" {
     const result = try repo.git.run(&.{
         "rev-parse", "--verify", "refs/heads/missing",
     });
-    defer repo.git.free(result);
+    defer repo.git.freeResult(result);
 
     try testing.expect(!result.term.success());
     try testing.expect(result.stderr.len > 0);
