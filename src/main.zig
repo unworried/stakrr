@@ -4,6 +4,8 @@ const stakrr = @import("stakrr");
 const Git = stakrr.git.Git;
 const Diagnostics = stakrr.git.Diagnostics;
 const stack = stakrr.stack;
+const term = @import("term.zig");
+const Terminal = term.Terminal;
 
 pub const Command = union(enum) {
     help,
@@ -20,11 +22,18 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
 
-    const command = parseArgs(args) catch |err| fail(init.io, err, null);
+    const env = init.environ_map;
+
+    const command = parseArgs(args) catch |err| fail(init.io, env, err, null);
 
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    const stdout_file = std.Io.File.stdout();
+    var stdout_writer = stdout_file.writer(init.io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
+    const out: Terminal = .{
+        .writer = stdout,
+        .mode = try term.detect(init.io, stdout_file, env),
+    };
 
     var diagnostics: Diagnostics = .{};
     const git = Git{
@@ -33,9 +42,9 @@ pub fn main(init: std.process.Init) !void {
         .diagnostics = &diagnostics,
     };
 
-    runCommand(&git, stdout, command) catch |err| {
+    runCommand(&git, out, command) catch |err| {
         stdout.flush() catch {};
-        fail(init.io, err, &diagnostics);
+        fail(init.io, env, err, &diagnostics);
     };
     try stdout.flush();
 }
@@ -114,9 +123,10 @@ fn eql(a: []const u8, b: []const u8) bool {
 
 fn runCommand(
     git: *const Git,
-    stdout: *std.Io.Writer,
+    out: Terminal,
     command: Command,
 ) !void {
+    const stdout = out.writer;
     switch (command) {
         .help => try printHelp(stdout),
         .version => try stdout.print("stakrr {s}\n", .{build_options.version}),
@@ -153,20 +163,34 @@ fn runCommand(
 
 /// report a failure on stderr and exit; never returns an error from main,
 /// which would make Zig print the error name and a trace as well
-fn fail(io: std.Io, err: anyerror, diagnostics: ?*const Diagnostics) noreturn {
+fn fail(
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    err: anyerror,
+    diagnostics: ?*const Diagnostics,
+) noreturn {
     var buffer: [2048]u8 = undefined;
-    var stderr_writer = std.Io.File.stderr().writer(io, &buffer);
+    const stderr_file = std.Io.File.stderr();
+    var stderr_writer = stderr_file.writer(io, &buffer);
     const stderr = &stderr_writer.interface;
+    const errout: Terminal = .{
+        .writer = stderr,
+        .mode = term.detect(io, stderr_file, env) catch .no_color,
+    };
 
+    term.styled(errout, .err, "error:", .{}) catch {};
     if (userError(err)) |message| {
-        stderr.print("error: {s}\n", .{message}) catch {};
+        stderr.print(" {s}\n", .{message}) catch {};
     } else {
-        stderr.print("error: unexpected failure ({s})\n", .{@errorName(err)}) catch {};
+        stderr.print(" unexpected failure ({s})\n", .{@errorName(err)}) catch {};
     }
 
     if (err == error.GitFailed) {
         if (diagnostics) |diag| {
-            if (diag.len != 0) stderr.print("git: {s}\n", .{diag.stderr()}) catch {};
+            if (diag.len != 0) {
+                term.styled(errout, .dim, "git:", .{}) catch {};
+                stderr.print(" {s}\n", .{diag.stderr()}) catch {};
+            }
         }
     }
 
@@ -260,6 +284,10 @@ fn printStatus(stdout: *std.Io.Writer, snapshot: stack.Snapshot) !void {
 }
 
 const testing = std.testing;
+
+test {
+    _ = term;
+}
 
 test "every domain error has a user message" {
     inline for (@typeInfo(stack.Error).error_set.error_names.?) |name| {

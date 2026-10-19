@@ -117,6 +117,22 @@ test "cli: git failures include git's stderr" {
     try testing.expect(std.mem.startsWith(u8, cut.stderr, "error: git command failed\ngit: "));
 }
 
+test "cli: CLICOLOR_FORCE colours output unless NO_COLOR is set" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try setup(&repo);
+
+    try repo.env.put("CLICOLOR_FORCE", "1");
+    const forced = try stakrr(&repo, &.{"status"});
+    defer forced.deinit();
+    try testing.expect(std.mem.startsWith(u8, forced.stderr, "\x1b[1m\x1b[31merror:\x1b[0m "));
+
+    try repo.env.put("NO_COLOR", "1");
+    const plain = try stakrr(&repo, &.{"status"});
+    defer plain.deinit();
+    try testing.expect(std.mem.startsWith(u8, plain.stderr, "error: "));
+}
+
 test "cli: version" {
     var repo = try Repo.init();
     defer repo.deinit();
