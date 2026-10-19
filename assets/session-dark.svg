@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="550" viewBox="0 0 1200 550" role="img" aria-label="terminal session: stakrr init, cut and status">
+<rect x="1" y="1" width="1198" height="548" fill="#101018" stroke="#1c1c28" stroke-width="2"/>
+<rect x="1" y="1" width="1198" height="44" fill="#0a0a0f"/>
+<rect x="1" y="44" width="1198" height="1" fill="#1c1c28"/>
+<rect x="18" y="16" width="6" height="12" fill="#00f0ff"/>
+<text x="34" y="27" font-family="ui-monospace, 'SF Mono', SFMono-Regular, 'JetBrains Mono', Menlo, Consolas, monospace" font-size="13" fill="#5c5c70" letter-spacing="1">~/src/app ── zsh</text>
+<g font-family="ui-monospace, 'SF Mono', SFMono-Regular, 'JetBrains Mono', Menlo, Consolas, monospace" font-size="18">
+<text x="40" y="94" xml:space="preserve"><tspan fill="#ff2a6d">›</tspan><tspan fill="#e6e6f0"> stakrr init --base main</tspan></text>
+<text x="40" y="124" xml:space="preserve"><tspan fill="#e6e6f0">stack initialized on </tspan><tspan fill="#00f0ff">main</tspan></text>
+<text x="40" y="154" xml:space="preserve"><tspan fill="#ff2a6d">›</tspan><tspan fill="#e6e6f0"> stakrr cut models --at HEAD~3</tspan></text>
+<text x="40" y="184" xml:space="preserve"><tspan fill="#e6e6f0">created layer: </tspan><tspan fill="#00f0ff">stakrr/models</tspan></text>
+<text x="40" y="214" xml:space="preserve"><tspan fill="#ff2a6d">›</tspan><tspan fill="#e6e6f0"> stakrr cut api-and-ui --at HEAD~1</tspan></text>
+<text x="40" y="244" xml:space="preserve"><tspan fill="#e6e6f0">created layer: </tspan><tspan fill="#00f0ff">stakrr/api-and-ui</tspan></text>
+<text x="40" y="274" xml:space="preserve"><tspan fill="#ff2a6d">›</tspan><tspan fill="#e6e6f0"> stakrr status</tspan></text>
+<text x="40" y="304" xml:space="preserve"><tspan fill="#5c5c70">stack</tspan><tspan fill="#e6e6f0">  main → </tspan><tspan fill="#00f0ff">shipit</tspan></text>
+<text x="40" y="334" xml:space="preserve"></text>
+<text x="40" y="364" xml:space="preserve"><tspan fill="#e6e6f0">  </tspan><tspan fill="#00f0ff">▸ shipit</tspan><tspan fill="#e6e6f0">              </tspan><tspan fill="#5c5c70">1 unstacked</tspan></text>
+<text x="40" y="394" xml:space="preserve"><tspan fill="#e6e6f0">  </tspan><tspan fill="#5c5c70">│</tspan><tspan fill="#e6e6f0"> stakrr/api-and-ui   </tspan><tspan fill="#5c5c70">2 commits</tspan></text>
+<text x="40" y="424" xml:space="preserve"><tspan fill="#e6e6f0">  </tspan><tspan fill="#5c5c70">│</tspan><tspan fill="#e6e6f0"> stakrr/models       </tspan><tspan fill="#5c5c70">1 commit</tspan></text>
+<text x="40" y="454" xml:space="preserve"><tspan fill="#e6e6f0">  </tspan><tspan fill="#5c5c70">└</tspan><tspan fill="#e6e6f0"> main                </tspan><tspan fill="#5c5c70">base</tspan></text>
+<text x="40" y="484" xml:space="preserve"></text>
+<text x="40" y="514" xml:space="preserve"><tspan fill="#e6e6f0">  2 layers</tspan></text>
+</g>
+</svg>
