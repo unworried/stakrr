@@ -48,11 +48,16 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
+    // end-to-end tests drive the built binary
+    const cli_options = b.addOptions();
+    cli_options.addOptionPath("exe_path", exe.getEmittedBin());
+
     const integration_tests = [_][]const u8{
         "tests/git_test.zig",
         "tests/stack_test.zig",
         "tests/cut_test.zig",
         "tests/reset_test.zig",
+        "tests/cli_test.zig",
     };
 
     for (integration_tests) |path| {
@@ -63,6 +68,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .imports = &.{
                     .{ .name = "stakrr", .module = mod },
+                    .{ .name = "cli_options", .module = cli_options.createModule() },
                 },
             }),
         });
