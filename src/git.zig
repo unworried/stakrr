@@ -59,6 +59,8 @@ pub const Git = struct {
     allocator: Allocator,
     io: Io,
     cwd: ?Io.Dir = null,
+    /// replaces the child environment when set (used for hermetic tests)
+    environ_map: ?*const std.process.Environ.Map = null,
     diagnostics: ?*Diagnostics = null,
 
     const stdout_limit = 16 * 1024 * 1024;
@@ -83,6 +85,7 @@ pub const Git = struct {
         return std.process.run(self.allocator, self.io, .{
             .argv = argv,
             .cwd = self.childCwd(),
+            .environ_map = self.environ_map,
             .stdout_limit = .limited(stdout_limit),
             .stderr_limit = .limited(stderr_limit),
         });
@@ -393,6 +396,7 @@ pub const Git = struct {
                 "--stdin",
             },
             .cwd = self.childCwd(),
+            .environ_map = self.environ_map,
             .stdin = .pipe,
             .stdout = .ignore,
             .stderr = .pipe,
