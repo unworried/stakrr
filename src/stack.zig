@@ -19,6 +19,7 @@ pub const Error = git_mod.Error || error{
     BaseMoved,
     NotOnWorkBranch,
     InvalidLayerName,
+    LayerExists,
     EmptyCut,
     InvalidCutBoundary,
     CutOutsideWork,
@@ -317,6 +318,18 @@ pub fn inspect(git: *const Git) !Snapshot {
     };
 }
 
+/// True if two refs are equal or one is a directory of the other
+/// (e.g. stakrr/p1 and stakrr/p1/x), which Git cannot store together.
+fn refsConflict(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b) or isPathPrefix(a, b) or isPathPrefix(b, a);
+}
+
+fn isPathPrefix(prefix: []const u8, full: []const u8) bool {
+    return full.len > prefix.len and
+        std.mem.startsWith(u8, full, prefix) and
+        full[prefix.len] == '/';
+}
+
 /// carve the next stack layer out of the linear rolling branch
 /// head, index, working tree and existing branch refs remain untouched
 pub fn cut(
@@ -353,6 +366,11 @@ pub fn cut(
 
     if (snapshot.base_moved)
         return error.BaseMoved;
+
+    for (snapshot.layers) |layer| {
+        if (refsConflict(layer.ref_name, new_ref))
+            return error.LayerExists;
+    }
 
     const target = if (revision) |rev|
         try git.resolveCommit(rev)

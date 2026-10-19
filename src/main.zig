@@ -171,6 +171,7 @@ fn userError(err: anyerror) ?[]const u8 {
         error.BaseMoved => "base branch moved since initialization",
         error.NotOnWorkBranch => "cut must run on the rolling work branch",
         error.InvalidLayerName => "invalid layer name",
+        error.LayerExists => "a layer with that name already exists or conflicts with one",
         error.EmptyCut => "no new commits since previous layer",
         error.InvalidCutBoundary, error.CutOutsideWork => "revision is outside the next unstacked segment",
         error.GitFailed => "git command failed",

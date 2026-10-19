@@ -208,8 +208,14 @@ test "cut rejects duplicate or invalid layer names" {
     defer testing.allocator.free(c);
 
     try testing.expectError(
-        error.GitFailed,
+        error.LayerExists,
         stack.cut(&repo.git, "p1", null),
+    );
+
+    // directory/file conflicts with an existing layer
+    try testing.expectError(
+        error.LayerExists,
+        stack.cut(&repo.git, "p1/sub", null),
     );
 
     try expectRef(&repo, "refs/heads/stakrr/p1", b);
