@@ -2,6 +2,28 @@ const std = @import("std");
 const git_mod = @import("git.zig");
 const Git = git_mod.Git;
 
+/// Domain errors raised by stack operations. Every member needs a
+/// user-facing message in main.zig; a test there enforces it.
+pub const Error = git_mod.Error || error{
+    AlreadyInitialized,
+    NotInitialized,
+    ExistingStackRefs,
+    ReservedBranchNamespace,
+    BaseEqualsWork,
+    BaseNotAncestor,
+    MergeCommitsUnsupported,
+    InvalidConfig,
+    UnsupportedConfigVersion,
+    InvalidStack,
+    InvalidLayerBoundary,
+    BaseMoved,
+    NotOnWorkBranch,
+    InvalidLayerName,
+    EmptyCut,
+    InvalidCutBoundary,
+    CutOutsideWork,
+};
+
 /// git config key holding "<version> <base_ref> <work_ref> <anchor_oid>"
 pub const state_key = "stakrr.state";
 

@@ -165,6 +165,8 @@ fn userError(err: anyerror) ?[]const u8 {
         error.BaseEqualsWork => "base and work branches must differ",
         error.BaseNotAncestor => "base is not an ancestor of work",
         error.MergeCommitsUnsupported => "merge commits in the stack are unsupported",
+        error.InvalidConfig => "stakrr state in git config is invalid",
+        error.UnsupportedConfigVersion => "stack was created by an incompatible stakrr version",
         error.InvalidStack, error.InvalidLayerBoundary => "stack refs are inconsistent",
         error.BaseMoved => "base branch moved since initialization",
         error.NotOnWorkBranch => "cut must run on the rolling work branch",
@@ -172,8 +174,17 @@ fn userError(err: anyerror) ?[]const u8 {
         error.EmptyCut => "no new commits since previous layer",
         error.InvalidCutBoundary, error.CutOutsideWork => "revision is outside the next unstacked segment",
         error.GitFailed => "git command failed",
+        error.GitTerminated => "git was terminated by a signal",
         error.InvalidRefName => "invalid Git branch name",
+        error.InvalidOid => "invalid Git object id",
+        error.NotGitRepository => "not inside a Git repository",
+        error.NotWorkingTree => "not inside a Git working tree",
         error.DetachedHead => "detached HEAD is unsupported",
+        error.InvalidGitConfig => "stakrr.state has multiple or empty values",
+        error.InvalidGitOutput => "unexpected output from git",
+        error.StreamTooLong => "git output exceeded the size limit",
+        error.FileNotFound => "git executable not found on PATH",
+        error.OutOfMemory => "out of memory",
         else => null,
     };
 }
@@ -215,6 +226,12 @@ fn printStatus(stdout: *std.Io.Writer, snapshot: stack.Snapshot) !void {
 }
 
 const testing = std.testing;
+
+test "every domain error has a user message" {
+    inline for (@typeInfo(stack.Error).error_set.error_names.?) |name| {
+        try testing.expect(userError(@field(anyerror, name)) != null);
+    }
+}
 
 test "parseArgs: help" {
     try testing.expectEqual(Command.help, try parseArgs(&.{"stakrr"}));
