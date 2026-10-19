@@ -4,7 +4,8 @@ const testing = std.testing;
 const stakrr_git = @import("stakrr").git;
 const Git = stakrr_git.Git;
 
-const Repo = @import("support/repo.zig").Repo;
+const support = @import("support/repo.zig");
+const Repo = support.Repo;
 
 test "ensureWorkTree accepts a normal repository" {
     var repo = try Repo.init();
@@ -17,10 +18,14 @@ test "ensureWorkTree rejects a bare repository" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    const env = try support.hermeticEnv();
+    defer support.destroyEnv(env);
+
     const git = Git{
         .allocator = testing.allocator,
         .io = testing.io,
         .cwd = tmp.dir,
+        .environ_map = env,
     };
 
     const output = try git.output(&.{ "init", "--bare", "-q" });
@@ -42,10 +47,14 @@ test "ensureWorkTree rejects an invalid repository" {
         .data = "gitdir: does-not-exist\n",
     });
 
+    const env = try support.hermeticEnv();
+    defer support.destroyEnv(env);
+
     const git = Git{
         .allocator = testing.allocator,
         .io = testing.io,
         .cwd = tmp.dir,
+        .environ_map = env,
     };
 
     try testing.expectError(
