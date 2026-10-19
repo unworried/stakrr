@@ -164,7 +164,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "git", .module = git_module },
+                .{ .name = "stakrr", .module = mod },
             },
         }),
     });

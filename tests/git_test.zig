@@ -1,8 +1,9 @@
 const std = @import("std");
-const Git = @import("git").Git;
-const Repo = @import("support/repo.zig").Repo;
-
 const testing = std.testing;
+
+const Git = @import("stakrr").git.Git;
+
+const Repo = @import("support/repo.zig").Repo;
 
 test "ensureWorkTree accepts a normal repository" {
     var repo = try Repo.init();
