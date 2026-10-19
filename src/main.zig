@@ -128,7 +128,7 @@ fn runCommand(
 ) !void {
     const stdout = out.writer;
     switch (command) {
-        .help => try printHelp(stdout),
+        .help => try printHelp(out),
         .version => try stdout.print("stakrr {s}\n", .{build_options.version}),
         .init => |options| {
             try stack.initStack(git, options.base);
@@ -200,14 +200,33 @@ fn fail(
     std.process.exit(if (usage_error) 2 else 1);
 }
 
-fn printHelp(stdout: *std.Io.Writer) !void {
-    try stdout.writeAll("usage: stakrr <command> [options]\n" ++
-        "  init --base <branch>          adopt current branch as rolling work\n" ++
-        "  status                        display layers and unstacked commits\n" ++
-        "  cut <name> [--at <rev>]       create the next layer\n" ++
-        "  reset [--delete-layers]       forget the stack so it can be re-initialized\n" ++
-        "  version                       print the stakrr version\n" ++
-        "  help                          show this message\n");
+const help_commands = [_]struct { name: []const u8, args: []const u8, about: []const u8 }{
+    .{ .name = "init", .args = "--base <branch>", .about = "adopt current branch as rolling work" },
+    .{ .name = "status", .args = "", .about = "display layers and unstacked commits" },
+    .{ .name = "cut", .args = "<name> [--at <rev>]", .about = "create the next layer" },
+    .{ .name = "reset", .args = "[--delete-layers]", .about = "forget the stack so it can be re-initialized" },
+    .{ .name = "version", .args = "", .about = "print the stakrr version" },
+    .{ .name = "help", .args = "", .about = "show this message" },
+};
+
+fn printHelp(out: Terminal) !void {
+    const w = out.writer;
+    try term.styled(out, .bold, "stakrr", .{});
+    try term.styled(out, .dim, " {s} // ", .{build_options.version});
+    try w.writeAll("downstack from a rolling branch\n\n");
+
+    try term.styled(out, .dim, "usage:", .{});
+    try w.writeAll(" stakrr <command> [options]\n\n");
+
+    for (help_commands) |cmd| {
+        const width = cmd.name.len + @as(usize, if (cmd.args.len != 0) 1 else 0) + cmd.args.len;
+        try w.writeAll("  ");
+        try term.styled(out, .accent, "{s}", .{cmd.name});
+        if (cmd.args.len != 0) try w.print(" {s}", .{cmd.args});
+        try w.splatByteAll(' ', 30 - width);
+        try term.styled(out, .dim, "{s}", .{cmd.about});
+        try w.writeByte('\n');
+    }
 }
 
 fn userError(err: anyerror) ?[]const u8 {

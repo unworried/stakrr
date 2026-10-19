@@ -133,6 +133,26 @@ test "cli: CLICOLOR_FORCE colours output unless NO_COLOR is set" {
     try testing.expect(std.mem.startsWith(u8, plain.stderr, "error: "));
 }
 
+test "cli: help aligns the command list" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const help = try stakrr(&repo, &.{"help"});
+    defer help.deinit();
+    try testing.expectEqual(@as(u8, 0), help.code);
+    try testing.expect(std.mem.startsWith(u8, help.stdout, "stakrr "));
+    try testing.expect(std.mem.indexOf(
+        u8,
+        help.stdout,
+        "\n  cut <name> [--at <rev>]       create the next layer\n",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        help.stdout,
+        "\n  status                        display layers and unstacked commits\n",
+    ) != null);
+}
+
 test "cli: version" {
     var repo = try Repo.init();
     defer repo.deinit();
