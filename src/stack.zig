@@ -1,5 +1,6 @@
 const std = @import("std");
-const Git = @import("git.zig").Git;
+const git_mod = @import("git.zig");
+const Git = git_mod.Git;
 
 pub const Config = struct {
     base_ref: []const u8,
@@ -77,7 +78,7 @@ pub fn initStack(
     const existing_layers = try git.listStackRefs();
     defer allocator.free(existing_layers);
     if (existing_layers.len != 0) return error.ExistingStackRefs;
-    const existing_tip = try git.readRef("refs/stakrr/tip");
+    const existing_tip = try git.readRef(git_mod.tip_ref);
     defer if (existing_tip) |oid| allocator.free(oid);
     if (existing_tip != null) return error.ExistingStackRefs;
 
@@ -93,8 +94,8 @@ pub fn initStack(
     defer allocator.free(base_ref);
 
     // layer names live exclusively under refs/heads/stakrr/
-    if (std.mem.startsWith(u8, work_ref, "refs/heads/stakrr/") or
-        std.mem.startsWith(u8, base_ref, "refs/heads/stakrr/"))
+    if (std.mem.startsWith(u8, work_ref, git_mod.layer_prefix) or
+        std.mem.startsWith(u8, base_ref, git_mod.layer_prefix))
         return error.ReservedBranchNamespace;
 
     try git.checkRefFormat(base_ref);
@@ -278,7 +279,7 @@ pub fn inspect(git: *const Git) !Snapshot {
     }
 
     // the private tip guard must match the highest committed layer
-    const tip = try git.readRef("refs/stakrr/tip");
+    const tip = try git.readRef(git_mod.tip_ref);
     defer if (tip) |oid| allocator.free(oid);
     if (layers.items.len == 0) {
         if (tip != null) return error.InvalidStack;
@@ -332,7 +333,7 @@ pub fn cut(
 
     const new_ref = try std.fmt.allocPrint(
         allocator,
-        "refs/heads/stakrr/{s}",
+        git_mod.layer_prefix ++ "{s}",
         .{name},
     );
     defer allocator.free(new_ref);
