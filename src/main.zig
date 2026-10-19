@@ -29,6 +29,17 @@ pub fn main(init: std.process.Init) !void {
         defer snapshot.deinit();
 
         try printStatus(init.io, allocator, snapshot);
+    } else if (std.mem.eql(u8, args[1], "cut")) {
+        if (args.len != 3 and
+            !(args.len == 5 and std.mem.eql(u8, args[3], "--at")))
+        {
+            return error.InvalidArguments;
+        }
+
+        const revision: ?[]const u8 =
+            if (args.len == 5) args[4] else null;
+
+        try stack.cut(&git, allocator, args[2], revision);
     } else {
         return error.UnknownCommand;
     }

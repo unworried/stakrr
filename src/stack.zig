@@ -322,3 +322,88 @@ pub fn inspect(
         ._git_allocator = git.allocator,
     };
 }
+
+/// carve the next stack layer out of the linear rolling branch
+/// head, index, working tree and existing branch refs remain untouched
+pub fn cut(
+    git: *const Git,
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    revision: ?[]const u8,
+) !void {
+    var snapshot = try inspect(git, allocator);
+    defer snapshot.deinit();
+
+    const current_ref = try git.currentBranch();
+    defer git.allocator.free(current_ref);
+
+    if (!std.mem.eql(u8, current_ref, snapshot.config.work_ref))
+        return error.NotOnWorkBranch;
+
+    if (snapshot.base_moved)
+        return error.BaseMoved;
+
+    if (name.len == 0)
+        return error.InvalidLayerName;
+
+    const new_ref = try std.fmt.allocPrint(
+        allocator,
+        "refs/heads/stakrr/{s}",
+        .{name},
+    );
+    defer allocator.free(new_ref);
+
+    const checked = git.output(&.{
+        "check-ref-format",
+        new_ref,
+    }) catch |err| switch (err) {
+        error.GitFailed => return error.InvalidLayerName,
+        else => return err,
+    };
+    defer git.allocator.free(checked);
+
+    const target = if (revision) |rev|
+        try git.resolveCommit(rev)
+    else
+        try git.allocator.dupe(u8, snapshot.work_oid);
+    defer git.allocator.free(target);
+
+    const last_layer: ?Layer = if (snapshot.layers.len != 0)
+        snapshot.layers[snapshot.layers.len - 1]
+    else
+        null;
+
+    const lower = if (last_layer) |layer|
+        layer.oid
+    else
+        snapshot.config.anchor_oid;
+
+    if (std.mem.eql(u8, lower, target))
+        return error.EmptyCut;
+
+    if (!try git.isAncestor(lower, target))
+        return error.InvalidCutBoundary;
+
+    if (!try git.isAncestor(target, snapshot.work_oid))
+        return error.CutOutsideWork;
+
+    try git.createLayerRef(
+        new_ref,
+        target,
+        .{
+            .name = snapshot.config.base_ref,
+            .oid = snapshot.config.anchor_oid,
+        },
+        .{
+            .name = snapshot.config.work_ref,
+            .oid = snapshot.work_oid,
+        },
+        if (last_layer) |layer|
+            .{
+                .name = layer.ref_name,
+                .oid = layer.oid,
+            }
+        else
+            null,
+    );
+}
