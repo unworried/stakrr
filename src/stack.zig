@@ -178,11 +178,12 @@ pub fn loadConfig(git: *const Git) !Config {
     if (!std.mem.eql(u8, version, "v1"))
         return error.UnsupportedConfigVersion;
 
-    if (!std.mem.startsWith(u8, base, "refs/heads/") or
-        !std.mem.startsWith(u8, work, "refs/heads/"))
-    {
+    // config is user-editable: validate before values reach argv or update-ref
+    if (!git_mod.isSafeBranchRef(base) or !git_mod.isSafeBranchRef(work))
         return error.InvalidConfig;
-    }
+
+    if (!git_mod.isOid(anchor))
+        return error.InvalidConfig;
 
     if (std.mem.eql(u8, base, work))
         return error.InvalidConfig;

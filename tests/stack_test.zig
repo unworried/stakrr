@@ -110,6 +110,14 @@ test "loadConfig rejects malformed state" {
             .expected = error.InvalidConfig,
         },
         .{
+            .value = "v1 --output=x refs/heads/work abc",
+            .expected = error.InvalidConfig,
+        },
+        .{
+            .value = "v1 refs/heads/main refs/heads/work --output=x",
+            .expected = error.InvalidConfig,
+        },
+        .{
             .value = "v1 refs/heads/main refs/heads/main abc",
             .expected = error.InvalidConfig,
         },
