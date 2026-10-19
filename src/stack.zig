@@ -213,10 +213,33 @@ pub fn inspect(git: *const Git) !Snapshot {
     if (!try git.isAncestor(config.anchor_oid, work_oid))
         return error.InvalidStack;
 
-    // only supports linear history
-    // FIXME: m1
-    if (try git.hasMergeCommits(config.anchor_oid, work_oid))
-        return error.MergeCommitsUnsupported;
+    // With no merges, anchor..work is a single chain. Index it once so
+    // every layer resolves to a depth without spawning more git processes.
+    const history = try git.revListParents(config.anchor_oid, work_oid);
+    defer allocator.free(history);
+
+    var depths: std.StringHashMapUnmanaged(usize) = .empty;
+    defer depths.deinit(allocator);
+
+    var chain_len: usize = 0;
+    var commits = std.mem.splitScalar(u8, history, '\n');
+    while (commits.next()) |line| {
+        if (line.len == 0) continue;
+
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        const oid = fields.next() orelse return error.InvalidGitOutput;
+
+        var parents: usize = 0;
+        while (fields.next()) |_| parents += 1;
+
+        // only supports linear history
+        // FIXME: m2
+        if (parents > 1) return error.MergeCommitsUnsupported;
+        if (parents == 0) return error.InvalidStack;
+
+        chain_len += 1;
+        try depths.put(allocator, oid, chain_len);
+    }
 
     // discover branches owned by stakrr
     const raw_refs = try git.listStackRefs();
@@ -241,17 +264,9 @@ pub fn inspect(git: *const Git) !Snapshot {
         if (oid.len == 0)
             return error.InvalidGitOutput;
 
-        // every layer must be between the anchor and work
-        if (!try git.isAncestor(config.anchor_oid, oid))
+        // every layer must sit on the chain between the anchor and work
+        const depth = depths.get(oid) orelse
             return error.InvalidStack;
-
-        if (!try git.isAncestor(oid, work_oid))
-            return error.InvalidStack;
-
-        const depth = try git.countCommits(
-            config.anchor_oid,
-            oid,
-        );
 
         try layers.append(allocator, .{
             .ref_name = ref_name,
@@ -271,7 +286,7 @@ pub fn inspect(git: *const Git) !Snapshot {
         }
     }.lessThan);
 
-    // validate each successive boundary
+    // on a single chain, depth order is ancestry order
     var previous_oid = config.anchor_oid;
     var previous_depth: usize = 0;
 
@@ -280,13 +295,7 @@ pub fn inspect(git: *const Git) !Snapshot {
         if (layer.depth <= previous_depth)
             return error.InvalidLayerBoundary;
 
-        if (!try git.isAncestor(previous_oid, layer.oid))
-            return error.InvalidStack;
-
-        layer.commits = try git.countCommits(
-            previous_oid,
-            layer.oid,
-        );
+        layer.commits = layer.depth - previous_depth;
 
         previous_oid = layer.oid;
         previous_depth = layer.depth;
@@ -302,16 +311,11 @@ pub fn inspect(git: *const Git) !Snapshot {
         if (!std.mem.eql(u8, tip_oid, previous_oid)) return error.InvalidStack;
     }
 
-    const unstacked = try git.countCommits(
-        previous_oid,
-        work_oid,
-    );
-
     return .{
         .config = config,
         .layers = try layers.toOwnedSlice(allocator),
         .work_oid = work_oid,
-        .unstacked_commits = unstacked,
+        .unstacked_commits = chain_len - previous_depth,
         .base_moved = !std.mem.eql(
             u8,
             base_oid,

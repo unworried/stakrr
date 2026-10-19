@@ -185,6 +185,14 @@ pub const Git = struct {
         return merges.len != 0;
     }
 
+    /// Commits in `older..newer`, oldest first, one "<oid> <parents...>"
+    /// line per commit. The caller owns the returned buffer.
+    pub fn revListParents(self: *const Git, older: []const u8, newer: []const u8) ![]u8 {
+        const range = try std.fmt.allocPrint(self.allocator, "{s}..{s}", .{ older, newer });
+        defer self.allocator.free(range);
+        return self.output(&.{ "rev-list", "--parents", "--reverse", "--end-of-options", range });
+    }
+
     /// require an ordinary git working tree
     pub fn ensureWorkTree(self: *const Git) !void {
         const result = try self.run(&.{

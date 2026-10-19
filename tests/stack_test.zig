@@ -243,3 +243,30 @@ test "initStack rejects merge commits" {
 
     try expectNoState(&repo);
 }
+
+test "inspect reports layers, depths and unstacked commits" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+
+    for ([_][]const u8{ "B", "C", "D", "E" }) |message| {
+        const oid = try repo.commit(message);
+        testing.allocator.free(oid);
+    }
+
+    try stack.cut(&repo.git, "p1", "HEAD~3");
+    try stack.cut(&repo.git, "p2", "HEAD~1");
+
+    var snapshot = try stack.inspect(&repo.git);
+    defer snapshot.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 2), snapshot.layers.len);
+    try testing.expectEqual(@as(usize, 1), snapshot.layers[0].depth);
+    try testing.expectEqual(@as(usize, 1), snapshot.layers[0].commits);
+    try testing.expectEqual(@as(usize, 3), snapshot.layers[1].depth);
+    try testing.expectEqual(@as(usize, 2), snapshot.layers[1].commits);
+    try testing.expectEqual(@as(usize, 1), snapshot.unstacked_commits);
+    try testing.expect(!snapshot.base_moved);
+}
