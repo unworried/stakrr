@@ -7,6 +7,10 @@ pub const Git = struct {
     io: Io,
     cwd: ?Io.Dir = null,
 
+    fn childCwd(self: *const Git) std.process.Child.Cwd {
+        return if (self.cwd) |dir| .{ .dir = dir } else .inherit;
+    }
+
     /// execute git and return its raw result
     /// the caller owns stdout and stderr
     pub fn run(
@@ -21,7 +25,7 @@ pub const Git = struct {
 
         return std.process.run(self.allocator, self.io, .{
             .argv = argv,
-            .cwd = if (self.cwd) |dir| .{ .dir = dir } else .inherit,
+            .cwd = self.childCwd(),
             .stdout_limit = .limited(64 * 1024),
             .stderr_limit = .limited(64 * 1024),
         });
@@ -330,10 +334,7 @@ pub const Git = struct {
                 "stakrr: cut",
                 "--stdin",
             },
-            .cwd = if (self.cwd) |dir|
-                .{ .dir = dir }
-            else
-                .inherit,
+            .cwd = self.childCwd(),
             .stdin = .pipe,
             .stdout = .ignore,
             .stderr = .pipe,
