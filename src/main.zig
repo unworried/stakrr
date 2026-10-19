@@ -138,7 +138,7 @@ fn runCommand(
             var snapshot = try stack.inspect(git);
             defer snapshot.deinit(git.allocator);
 
-            try printStatus(stdout, snapshot);
+            try printStatus(out, snapshot);
         },
         .cut => |options| {
             try stack.cut(git, options.name, options.at);
@@ -275,31 +275,70 @@ fn shortRef(ref_name: []const u8) []const u8 {
     return ref_name;
 }
 
-fn printStatus(stdout: *std.Io.Writer, snapshot: stack.Snapshot) !void {
-    try stdout.print("stack: {s} → {s}\n\n", .{
-        shortRef(snapshot.config.base_ref),
-        shortRef(snapshot.config.work_ref),
-    });
+fn plural(n: usize, one: []const u8, many: []const u8) []const u8 {
+    return if (n == 1) one else many;
+}
+
+/// draw the stack top-down: rolling work, layers from highest to lowest,
+/// then the base they were cut from
+fn printStatus(out: Terminal, snapshot: stack.Snapshot) !void {
+    const w = out.writer;
+    const base = shortRef(snapshot.config.base_ref);
+    const work = shortRef(snapshot.config.work_ref);
+
+    var width = @max(base.len, work.len);
+    for (snapshot.layers) |layer| width = @max(width, shortRef(layer.ref_name).len);
+    width += 3;
+
+    try term.styled(out, .dim, "stack", .{});
+    try w.print("  {s} → ", .{base});
+    try term.styled(out, .accent, "{s}", .{work});
+    try w.writeAll("\n\n");
 
     if (snapshot.base_moved) {
-        try stdout.writeAll(
-            "  warning: base moved since initialization; layers stay cut from the original base\n\n",
+        try w.writeAll("  ");
+        try term.styled(
+            out,
+            .warn,
+            "warning: base moved since initialization; layers stay cut from the original base",
+            .{},
         );
+        try w.writeAll("\n\n");
     }
 
-    for (snapshot.layers) |layer| {
-        try stdout.print("  {s}: {d} commit(s)\n", .{
-            shortRef(layer.ref_name),
+    try w.writeAll("  ");
+    try term.styled(out, .accent, "▸ {s}", .{work});
+    try w.splatByteAll(' ', width - work.len);
+    try term.styled(out, .dim, "{d} unstacked", .{snapshot.unstacked_commits});
+    try w.writeByte('\n');
+
+    var i = snapshot.layers.len;
+    while (i > 0) {
+        i -= 1;
+        const layer = snapshot.layers[i];
+        const name = shortRef(layer.ref_name);
+        try w.writeAll("  ");
+        try term.styled(out, .dim, "│", .{});
+        try w.print(" {s}", .{name});
+        try w.splatByteAll(' ', width - name.len);
+        try term.styled(out, .dim, "{d} {s}", .{
             layer.commits,
+            plural(layer.commits, "commit", "commits"),
         });
+        try w.writeByte('\n');
     }
 
-    try stdout.print("  {s}: {d} unstacked commit(s)\n", .{
-        shortRef(snapshot.config.work_ref),
-        snapshot.unstacked_commits,
-    });
+    try w.writeAll("  ");
+    try term.styled(out, .dim, "└", .{});
+    try w.print(" {s}", .{base});
+    try w.splatByteAll(' ', width - base.len);
+    try term.styled(out, .dim, "base", .{});
+    try w.writeByte('\n');
 
-    try stdout.print("\n  {d} layer(s)\n", .{snapshot.layers.len});
+    try w.print("\n  {d} {s}\n", .{
+        snapshot.layers.len,
+        plural(snapshot.layers.len, "layer", "layers"),
+    });
 }
 
 const testing = std.testing;

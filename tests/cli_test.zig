@@ -69,8 +69,16 @@ test "cli: full init, cut, status, reset flow" {
     const status = try stakrr(&repo, &.{"status"});
     defer status.deinit();
     try testing.expectEqual(@as(u8, 0), status.code);
-    try testing.expect(std.mem.indexOf(u8, status.stdout, "stakrr/p1: 1 commit(s)") != null);
-    try testing.expect(std.mem.indexOf(u8, status.stdout, "1 layer(s)") != null);
+    try testing.expectEqualStrings(
+        \\stack  main → work
+        \\
+        \\  ▸ work        0 unstacked
+        \\  │ stakrr/p1   1 commit
+        \\  └ main        base
+        \\
+        \\  1 layer
+        \\
+    , status.stdout);
 
     const reset = try stakrr(&repo, &.{ "reset", "--delete-layers" });
     defer reset.deinit();
