@@ -17,7 +17,6 @@ pub const Error = git_mod.Error || error{
     UnsupportedConfigVersion,
     InvalidStack,
     InvalidLayerBoundary,
-    BaseMoved,
     NotOnWorkBranch,
     InvalidLayerName,
     LayerExists,
@@ -376,9 +375,6 @@ pub fn cut(
     if (!std.mem.eql(u8, current_ref, snapshot.config.work_ref))
         return error.NotOnWorkBranch;
 
-    if (snapshot.base_moved)
-        return error.BaseMoved;
-
     for (snapshot.layers) |layer| {
         if (refsConflict(layer.ref_name, new_ref))
             return error.LayerExists;
@@ -409,6 +405,8 @@ pub fn cut(
     if (!try git.isAncestor(target, snapshot.work_oid))
         return error.CutOutsideWork;
 
+    // The base may have moved since init; layers are carved relative to
+    // the anchor, which the transaction pins instead of the base branch.
     try git.createLayerRef(
         new_ref,
         target,

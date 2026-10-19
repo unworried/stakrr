@@ -237,7 +237,7 @@ test "cut rejects duplicate or invalid layer names" {
     );
 }
 
-test "cut rejects non-work branch and moved base" {
+test "cut rejects a non-work branch" {
     var repo = try Repo.init();
     defer repo.deinit();
 
@@ -254,17 +254,32 @@ test "cut rejects non-work branch and moved base" {
         stack.cut(&repo.git, "p1", null),
     );
 
-    const new_base = try repo.commit("moved main");
-    defer testing.allocator.free(new_base);
+    try expectNoRef(&repo, "refs/heads/stakrr/p1");
+}
 
+test "cut still works after the base moves" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+
+    const b = try repo.commit("B");
+    defer testing.allocator.free(b);
+
+    try repo.exec(&.{ "switch", "-q", "main" });
+    const moved = try repo.commit("moved main");
+    defer testing.allocator.free(moved);
     try repo.exec(&.{ "switch", "-q", "work" });
 
-    try testing.expectError(
-        error.BaseMoved,
-        stack.cut(&repo.git, "p1", null),
-    );
+    try stack.cut(&repo.git, "p1", null);
+    try expectRef(&repo, "refs/heads/stakrr/p1", b);
 
-    try expectNoRef(&repo, "refs/heads/stakrr/p1");
+    var snapshot = try stack.inspect(&repo.git);
+    defer snapshot.deinit(testing.allocator);
+
+    try testing.expect(snapshot.base_moved);
+    try testing.expectEqual(@as(usize, 1), snapshot.layers[0].commits);
 }
 
 test "cut allows staged changes without changing the index" {

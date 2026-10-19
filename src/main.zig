@@ -169,7 +169,6 @@ fn userError(err: anyerror) ?[]const u8 {
         error.InvalidConfig => "stakrr state in git config is invalid",
         error.UnsupportedConfigVersion => "stack was created by an incompatible stakrr version",
         error.InvalidStack, error.InvalidLayerBoundary => "stack refs are inconsistent",
-        error.BaseMoved => "base branch moved since initialization",
         error.NotOnWorkBranch => "cut must run on the rolling work branch",
         error.InvalidLayerName => "invalid layer name",
         error.LayerExists => "a layer with that name already exists or conflicts with one",
@@ -208,7 +207,7 @@ fn printStatus(stdout: *std.Io.Writer, snapshot: stack.Snapshot) !void {
 
     if (snapshot.base_moved) {
         try stdout.writeAll(
-            "  warning: base moved since initialization\n\n",
+            "  warning: base moved since initialization; layers stay cut from the original base\n\n",
         );
     }
 
