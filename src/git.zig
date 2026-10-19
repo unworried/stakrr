@@ -254,7 +254,8 @@ pub const Git = struct {
         });
         defer self.allocator.free(text);
 
-        return std.fmt.parseInt(usize, text, 10);
+        return std.fmt.parseInt(usize, text, 10) catch
+            error.InvalidGitOutput;
     }
 
     pub const ExpectedRef = struct {
