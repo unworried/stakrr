@@ -125,7 +125,7 @@ test "initStack refuses repeated initialization" {
     defer testing.allocator.free(base);
 
     try testing.expectError(
-        error.AlreadyInitialised,
+        error.AlreadyInitialized,
         stack.initStack(&repo.git, "main"),
     );
 

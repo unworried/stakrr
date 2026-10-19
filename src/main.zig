@@ -89,7 +89,7 @@ fn userError(err: anyerror) ?[]const u8 {
         error.InvalidArguments => "error: invalid arguments (run 'stakrr help')\n",
         error.UnknownCommand => "error: unknown command (run 'stakrr help')\n",
         error.NotInitialized => "error: stack not initialized\n",
-        error.AlreadyInitialised => "error: stack already initialized\n",
+        error.AlreadyInitialized => "error: stack already initialized\n",
         error.ExistingStackRefs => "error: stale or existing stakrr refs found\n",
         error.ReservedBranchNamespace => "error: base and work branches cannot use stakrr/\n",
         error.BaseEqualsWork => "error: base and work branches must differ\n",

@@ -65,7 +65,7 @@ pub fn initStack(
     // 2. refuse existing initialisation
     if (try git.configGet(state_key)) |existing| {
         allocator.free(existing);
-        return error.AlreadyInitialised;
+        return error.AlreadyInitialized;
     }
 
     // reserve stakrr's branch namespace and internal tip for managed layers
