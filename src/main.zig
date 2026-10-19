@@ -51,7 +51,7 @@ fn runCommand(
             return error.InvalidArguments;
 
         var snapshot = try stack.inspect(git);
-        defer snapshot.deinit();
+        defer snapshot.deinit(git.allocator);
 
         try printStatus(io, allocator, snapshot);
     } else if (std.mem.eql(u8, args[1], "cut")) {

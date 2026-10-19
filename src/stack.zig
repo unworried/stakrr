@@ -43,13 +43,11 @@ pub const Snapshot = struct {
     // layer ref_name and oid slices borrow from this buffer
     _refs_storage: []u8,
 
-    _allocator: std.mem.Allocator,
-
-    pub fn deinit(self: *Snapshot) void {
-        self._allocator.free(self.layers);
-        self._allocator.free(self._refs_storage);
-        self._allocator.free(self.work_oid);
-        self.config.deinit(self._allocator);
+    pub fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.layers);
+        allocator.free(self._refs_storage);
+        allocator.free(self.work_oid);
+        self.config.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -294,7 +292,6 @@ pub fn inspect(git: *const Git) !Snapshot {
             config.anchor_oid,
         ),
         ._refs_storage = raw_refs,
-        ._allocator = allocator,
     };
 }
 
@@ -307,7 +304,7 @@ pub fn cut(
 ) !void {
     const allocator = git.allocator;
     var snapshot = try inspect(git);
-    defer snapshot.deinit();
+    defer snapshot.deinit(allocator);
 
     const current_ref = try git.currentBranch();
     defer allocator.free(current_ref);
