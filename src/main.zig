@@ -9,6 +9,7 @@ pub const Command = union(enum) {
     init: struct { base: []const u8 },
     status,
     cut: struct { name: []const u8, at: ?[]const u8 = null },
+    reset: struct { delete_layers: bool = false },
 };
 
 pub const ParseError = error{ InvalidArguments, UnknownCommand };
@@ -84,6 +85,13 @@ pub fn parseArgs(args: []const []const u8) ParseError!Command {
         } };
     }
 
+    if (eql(command, "reset")) {
+        if (rest.len == 0) return .{ .reset = .{} };
+        if (rest.len == 1 and eql(rest[0], "--delete-layers"))
+            return .{ .reset = .{ .delete_layers = true } };
+        return error.InvalidArguments;
+    }
+
     return error.UnknownCommand;
 }
 
@@ -118,6 +126,20 @@ fn runCommand(
             try stack.cut(git, options.name, options.at);
             try stdout.print("created layer: stakrr/{s}\n", .{options.name});
         },
+        .reset => |options| {
+            const result = try stack.reset(git, options.delete_layers);
+            try stdout.writeAll("stack reset\n");
+            if (result.deleted_layers != 0)
+                try stdout.print(
+                    "deleted {d} layer branch(es)\n",
+                    .{result.deleted_layers},
+                );
+            if (result.kept_layers != 0)
+                try stdout.print(
+                    "kept {d} layer branch(es) under stakrr/; remove them or run 'stakrr reset --delete-layers' before re-initializing\n",
+                    .{result.kept_layers},
+                );
+        },
     }
 }
 
@@ -148,10 +170,11 @@ fn fail(io: std.Io, err: anyerror, diagnostics: ?*const Diagnostics) noreturn {
 
 fn printHelp(stdout: *std.Io.Writer) !void {
     try stdout.writeAll("usage: stakrr <command> [options]\n" ++
-        "  init --base <branch>  adopt current branch as rolling work\n" ++
-        "  status                display layers and unstacked commits\n" ++
-        "  cut <name> [--at <rev>]  create the next layer\n" ++
-        "  help                  show this message\n");
+        "  init --base <branch>          adopt current branch as rolling work\n" ++
+        "  status                        display layers and unstacked commits\n" ++
+        "  cut <name> [--at <rev>]       create the next layer\n" ++
+        "  reset [--delete-layers]       forget the stack so it can be re-initialized\n" ++
+        "  help                          show this message\n");
 }
 
 fn userError(err: anyerror) ?[]const u8 {
@@ -159,16 +182,16 @@ fn userError(err: anyerror) ?[]const u8 {
         error.InvalidArguments => "invalid arguments (run 'stakrr help')",
         error.UnknownCommand => "unknown command (run 'stakrr help')",
         error.NotInitialized => "stack not initialized (run 'stakrr init --base <branch>')",
-        error.AlreadyInitialized => "stack already initialized",
-        error.ExistingStackRefs => "stale or existing stakrr refs found",
+        error.AlreadyInitialized => "stack already initialized (run 'stakrr reset' to start over)",
+        error.ExistingStackRefs => "existing stakrr refs found (run 'stakrr reset --delete-layers' to remove them)",
         error.ReservedBranchNamespace => "base and work branches cannot use stakrr/",
         error.BaseEqualsWork => "base and work branches must differ",
         error.BaseNotFound => "base branch not found (it must be a local branch)",
         error.BaseNotAncestor => "base is not an ancestor of work",
         error.MergeCommitsUnsupported => "merge commits in the stack are unsupported",
-        error.InvalidConfig => "stakrr state in git config is invalid",
-        error.UnsupportedConfigVersion => "stack was created by an incompatible stakrr version",
-        error.InvalidStack, error.InvalidLayerBoundary => "stack refs are inconsistent",
+        error.InvalidConfig => "stakrr state in git config is invalid (run 'stakrr reset')",
+        error.UnsupportedConfigVersion => "stack was created by an incompatible stakrr version (run 'stakrr reset')",
+        error.InvalidStack, error.InvalidLayerBoundary => "stack refs are inconsistent with the rolling branch (run 'stakrr reset' to start over)",
         error.NotOnWorkBranch => "cut must run on the rolling work branch",
         error.InvalidLayerName => "invalid layer name",
         error.LayerExists => "a layer with that name already exists or conflicts with one",
@@ -182,7 +205,7 @@ fn userError(err: anyerror) ?[]const u8 {
         error.NotGitRepository => "not inside a Git repository",
         error.NotWorkingTree => "not inside a Git working tree",
         error.DetachedHead => "detached HEAD is unsupported",
-        error.InvalidGitConfig => "stakrr.state has multiple or empty values",
+        error.InvalidGitConfig => "stakrr.state has multiple or empty values (run 'stakrr reset')",
         error.InvalidGitOutput => "unexpected output from git",
         error.StreamTooLong => "git output exceeded the size limit",
         error.FileNotFound => "git executable not found on PATH",
@@ -271,7 +294,11 @@ test "parseArgs: cut accepts --at in any position" {
     try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "cut", "--bad" }));
 }
 
-test "parseArgs: status" {
+test "parseArgs: status and reset" {
     try testing.expectEqual(Command.status, try parseArgs(&.{ "stakrr", "status" }));
     try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "status", "x" }));
+
+    try testing.expect(!(try parseArgs(&.{ "stakrr", "reset" })).reset.delete_layers);
+    try testing.expect((try parseArgs(&.{ "stakrr", "reset", "--delete-layers" })).reset.delete_layers);
+    try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "reset", "--force" }));
 }
