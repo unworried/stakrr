@@ -224,6 +224,11 @@ test "cut rejects duplicate or invalid layer names" {
         error.InvalidLayerName,
         stack.cut(&repo.git, "", null),
     );
+
+    try testing.expectError(
+        error.InvalidLayerName,
+        stack.cut(&repo.git, "-x", null),
+    );
 }
 
 test "cut rejects non-work branch and moved base" {

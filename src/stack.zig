@@ -325,19 +325,9 @@ pub fn cut(
     revision: ?[]const u8,
 ) !void {
     const allocator = git.allocator;
-    var snapshot = try inspect(git);
-    defer snapshot.deinit(allocator);
 
-    const current_ref = try git.currentBranch();
-    defer allocator.free(current_ref);
-
-    if (!std.mem.eql(u8, current_ref, snapshot.config.work_ref))
-        return error.NotOnWorkBranch;
-
-    if (snapshot.base_moved)
-        return error.BaseMoved;
-
-    if (name.len == 0)
+    // validate the name before inspecting the stack
+    if (name.len == 0 or name[0] == '-')
         return error.InvalidLayerName;
 
     const new_ref = try std.fmt.allocPrint(
@@ -351,6 +341,18 @@ pub fn cut(
         error.InvalidRefName => return error.InvalidLayerName,
         else => return err,
     };
+
+    var snapshot = try inspect(git);
+    defer snapshot.deinit(allocator);
+
+    const current_ref = try git.currentBranch();
+    defer allocator.free(current_ref);
+
+    if (!std.mem.eql(u8, current_ref, snapshot.config.work_ref))
+        return error.NotOnWorkBranch;
+
+    if (snapshot.base_moved)
+        return error.BaseMoved;
 
     const target = if (revision) |rev|
         try git.resolveCommit(rev)
