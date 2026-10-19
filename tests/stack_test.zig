@@ -317,3 +317,114 @@ test "inspect reports layers, depths and unstacked commits" {
     try testing.expectEqual(@as(usize, 1), snapshot.unstacked_commits);
     try testing.expect(!snapshot.base_moved);
 }
+
+test "inspect rejects a merge committed after init" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+
+    try addMerge(&repo);
+
+    try testing.expectError(
+        error.MergeCommitsUnsupported,
+        stack.inspect(&repo.git),
+    );
+}
+
+test "inspect rejects a tip guard without layers" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+
+    try repo.exec(&.{ "update-ref", "refs/stakrr/tip", base });
+
+    try testing.expectError(
+        error.InvalidStack,
+        stack.inspect(&repo.git),
+    );
+}
+
+test "inspect rejects a deleted layer (tip mismatch)" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+
+    const b = try repo.commit("B");
+    defer testing.allocator.free(b);
+    try stack.cut(&repo.git, "p1", null);
+
+    const c = try repo.commit("C");
+    defer testing.allocator.free(c);
+    try stack.cut(&repo.git, "p2", null);
+
+    try repo.exec(&.{ "branch", "-D", "stakrr/p2" });
+
+    try testing.expectError(
+        error.InvalidStack,
+        stack.inspect(&repo.git),
+    );
+}
+
+test "inspect rejects a foreign stakrr branch outside the rolling history" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+
+    try repo.exec(&.{ "switch", "-q", "-c", "side", "main" });
+    const side = try repo.commit("side");
+    defer testing.allocator.free(side);
+    try repo.exec(&.{ "branch", "stakrr/foreign", side });
+    try repo.exec(&.{ "switch", "-q", "work" });
+
+    try testing.expectError(
+        error.InvalidStack,
+        stack.inspect(&repo.git),
+    );
+}
+
+test "inspect rejects two layers on the same commit" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+
+    const b = try repo.commit("B");
+    defer testing.allocator.free(b);
+    try stack.cut(&repo.git, "p1", null);
+    try repo.exec(&.{ "branch", "stakrr/dup", b });
+
+    try testing.expectError(
+        error.InvalidLayerBoundary,
+        stack.inspect(&repo.git),
+    );
+}
+
+test "inspect rejects work rebased past the anchor" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+
+    const b = try repo.commit("B");
+    defer testing.allocator.free(b);
+
+    try repo.exec(&.{ "switch", "-q", "main" });
+    try repo.exec(&.{ "commit", "-q", "--amend", "--allow-empty", "-m", "rewritten base" });
+    try repo.exec(&.{ "switch", "-q", "work" });
+    try repo.exec(&.{ "rebase", "-q", "--onto", "main", base });
+
+    try testing.expectError(
+        error.InvalidStack,
+        stack.inspect(&repo.git),
+    );
+}
