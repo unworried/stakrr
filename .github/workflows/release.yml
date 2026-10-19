@@ -27,13 +27,22 @@ jobs:
         run: |
           version="${TAG#v}"
 
-          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::Invalid release tag: $TAG"
+            exit 1
+          }
 
-          grep -Fq ".version = \"$version\"" build.zig.zon
+          grep -Fq ".version = \"$version\"" build.zig.zon || {
+            echo "::error::build.zig.zon must contain version $version"
+            exit 1
+          }
 
           git fetch origin main
           git merge-base --is-ancestor \
-            "$GITHUB_SHA" FETCH_HEAD
+            "$GITHUB_SHA" FETCH_HEAD || {
+            echo "::error::Release tag is not on main"
+            exit 1
+          }
 
       - name: Test
         run: zig build test -Doptimize=ReleaseSafe
@@ -112,5 +121,6 @@ jobs:
 
           gh release create "$GITHUB_REF_NAME" \
             dist/*.tar.gz dist/SHA256SUMS \
+            --prerelease \
             --verify-tag \
             --generate-notes
