@@ -428,3 +428,23 @@ test "inspect rejects work rebased past the anchor" {
         stack.inspect(&repo.git),
     );
 }
+
+test "stacks work in SHA-256 repositories" {
+    var repo = try Repo.initOptions(.{ .object_format = "sha256" });
+    defer repo.deinit();
+
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+    try testing.expectEqual(@as(usize, 64), base.len);
+
+    const b = try repo.commit("B");
+    defer testing.allocator.free(b);
+
+    try stack.cut(&repo.git, "p1", null);
+
+    var snapshot = try stack.inspect(&repo.git);
+    defer snapshot.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), snapshot.layers.len);
+    try testing.expectEqualStrings(b, snapshot.layers[0].oid);
+}

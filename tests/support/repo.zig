@@ -3,6 +3,10 @@ const Git = @import("stakrr").git.Git;
 
 const testing = std.testing;
 
+pub const Options = struct {
+    object_format: []const u8 = "sha1",
+};
+
 pub const Repo = struct {
     tmp: testing.TmpDir,
     // heap-allocated so git.environ_map stays valid when Repo is moved
@@ -10,6 +14,10 @@ pub const Repo = struct {
     git: Git,
 
     pub fn init() !Repo {
+        return initOptions(.{});
+    }
+
+    pub fn initOptions(options: Options) !Repo {
         var tmp = testing.tmpDir(.{});
         errdefer tmp.cleanup();
 
@@ -27,7 +35,9 @@ pub const Repo = struct {
             },
         };
 
-        try repo.exec(&.{ "init", "-q", "-b", "main" });
+        try repo.exec(&.{
+            "init", "-q", "-b", "main", "--object-format", options.object_format,
+        });
 
         // never depend on identity/signing settings.
         try repo.exec(&.{
