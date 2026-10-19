@@ -58,6 +58,39 @@ pub const Git = struct {
         return self.allocator.dupe(u8, trimmed);
     }
 
+    /// execute a Git command that must succeed without retaining stdout.
+    pub fn exec(self: *const Git, args: []const []const u8) !void {
+        const result = try self.run(args);
+        defer self.free(result);
+        if ((try exitCode(result)) != 0) return error.GitFailed;
+    }
+
+    pub fn checkRefFormat(self: *const Git, ref_name: []const u8) !void {
+        const result = try self.run(&.{ "check-ref-format", ref_name });
+        defer self.free(result);
+        if ((try exitCode(result)) != 0) return error.InvalidRefName;
+    }
+
+    /// Read the exact ref OID. A missing ref is distinct from a Git failure.
+    pub fn readRef(self: *const Git, ref_name: []const u8) !?[]u8 {
+        const result = try self.run(&.{ "rev-parse", "--verify", "--quiet", "--end-of-options", ref_name });
+        defer self.free(result);
+        return switch (try exitCode(result)) {
+            0 => try self.allocator.dupe(u8, std.mem.trimEnd(u8, result.stdout, "\r\n")),
+            1 => null,
+            else => error.GitFailed,
+        };
+    }
+
+    /// True if the range contains a merge commit (linear stacks only).
+    pub fn hasMergeCommits(self: *const Git, older: []const u8, newer: []const u8) !bool {
+        const range = try std.fmt.allocPrint(self.allocator, "{s}..{s}", .{ older, newer });
+        defer self.allocator.free(range);
+        const merges = try self.output(&.{ "rev-list", "--min-parents=2", "--max-count=1", range });
+        defer self.allocator.free(merges);
+        return merges.len != 0;
+    }
+
     /// require an ordinary git working tree
     pub fn ensureWorkTree(self: *const Git) !void {
         const result = try self.run(&.{
