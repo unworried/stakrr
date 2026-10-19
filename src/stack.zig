@@ -39,24 +39,22 @@ pub const Snapshot = struct {
     // layer ref_name and oid slices borrow from this buffer
     _refs_storage: []u8,
 
-    // layers and git command results have different allocators
     _allocator: std.mem.Allocator,
-    _git_allocator: std.mem.Allocator,
 
     pub fn deinit(self: *Snapshot) void {
         self._allocator.free(self.layers);
-        self._git_allocator.free(self._refs_storage);
-        self._git_allocator.free(self.work_oid);
-        self.config.deinit(self._git_allocator);
+        self._allocator.free(self._refs_storage);
+        self._allocator.free(self.work_oid);
+        self.config.deinit(self._allocator);
         self.* = undefined;
     }
 };
 
 pub fn initStack(
     git: *const Git,
-    allocator: std.mem.Allocator,
     base_name: []const u8,
 ) !void {
+    const allocator = git.allocator;
     // 1. require standard working tree
     try git.ensureWorkTree();
 
@@ -75,6 +73,14 @@ pub fn initStack(
         else => return error.GitTerminated,
     }
 
+    // Reserve stakrr's branch namespace and internal tip for managed layers.
+    const existing_layers = try git.listStackRefs();
+    defer allocator.free(existing_layers);
+    if (existing_layers.len != 0) return error.ExistingStackRefs;
+    const existing_tip = try git.readRef("refs/stakrr/tip");
+    defer if (existing_tip) |oid| allocator.free(oid);
+    if (existing_tip != null) return error.ExistingStackRefs;
+
     // 3. identify rolling branch and base
     const work_ref = try git.currentBranch();
     defer git.allocator.free(work_ref);
@@ -86,12 +92,12 @@ pub fn initStack(
     );
     defer allocator.free(base_ref);
 
-    // validate the base as a git branch ref
-    const checked = try git.output(&.{
-        "check-ref-format",
-        base_ref,
-    });
-    defer git.allocator.free(checked);
+    // layer names live exclusively under refs/heads/stakrr/
+    if (std.mem.startsWith(u8, work_ref, "refs/heads/stakrr/") or
+        std.mem.startsWith(u8, base_ref, "refs/heads/stakrr/"))
+        return error.ReservedBranchNamespace;
+
+    try git.checkRefFormat(base_ref);
 
     if (std.mem.eql(u8, work_ref, base_ref))
         return error.BaseEqualsWork;
@@ -108,21 +114,7 @@ pub fn initStack(
 
     // 6. reject merge commits
     // FIXME: m1
-    const range = try std.fmt.allocPrint(
-        allocator,
-        "{s}..{s}",
-        .{ base_oid, work_oid },
-    );
-    defer allocator.free(range);
-
-    const merges = try git.output(&.{
-        "rev-list",
-        "--min-parents=2",
-        range,
-    });
-    defer git.allocator.free(merges);
-
-    if (merges.len != 0)
+    if (try git.hasMergeCommits(base_oid, work_oid))
         return error.MergeCommitsUnsupported;
 
     // 7. persist the initialisation metadata
@@ -133,14 +125,13 @@ pub fn initStack(
     );
     defer allocator.free(state);
 
-    const written = try git.output(&.{
+    try git.exec(&.{
         "config",
         "--local",
         "--add",
         "stakrr.state",
         state,
     });
-    defer git.allocator.free(written);
 
     std.log.info("initialised: {s} -> {s}", .{
         base_ref,
@@ -190,10 +181,8 @@ pub fn loadConfig(git: *const Git) !Config {
     };
 }
 
-pub fn inspect(
-    git: *const Git,
-    allocator: std.mem.Allocator,
-) !Snapshot {
+pub fn inspect(git: *const Git) !Snapshot {
+    const allocator = git.allocator;
     try git.ensureWorkTree();
 
     var config = try loadConfig(git);
@@ -211,21 +200,7 @@ pub fn inspect(
 
     // only supports linear history
     // FIXME: m1
-    const range = try std.fmt.allocPrint(
-        allocator,
-        "{s}..{s}",
-        .{ config.anchor_oid, work_oid },
-    );
-    defer allocator.free(range);
-
-    const merges = try git.output(&.{
-        "rev-list",
-        "--min-parents=2",
-        range,
-    });
-    defer git.allocator.free(merges);
-
-    if (merges.len != 0)
+    if (try git.hasMergeCommits(config.anchor_oid, work_oid))
         return error.MergeCommitsUnsupported;
 
     // discover branches owned by stakrr
@@ -302,6 +277,16 @@ pub fn inspect(
         previous_depth = layer.depth;
     }
 
+    // The private tip guard must match the highest committed layer.
+    const tip = try git.readRef("refs/stakrr/tip");
+    defer if (tip) |oid| allocator.free(oid);
+    if (layers.items.len == 0) {
+        if (tip != null) return error.InvalidStack;
+    } else {
+        const tip_oid = tip orelse return error.InvalidStack;
+        if (!std.mem.eql(u8, tip_oid, previous_oid)) return error.InvalidStack;
+    }
+
     const unstacked = try git.countCommits(
         previous_oid,
         work_oid,
@@ -319,7 +304,6 @@ pub fn inspect(
         ),
         ._refs_storage = raw_refs,
         ._allocator = allocator,
-        ._git_allocator = git.allocator,
     };
 }
 
@@ -327,11 +311,11 @@ pub fn inspect(
 /// head, index, working tree and existing branch refs remain untouched
 pub fn cut(
     git: *const Git,
-    allocator: std.mem.Allocator,
     name: []const u8,
     revision: ?[]const u8,
 ) !void {
-    var snapshot = try inspect(git, allocator);
+    const allocator = git.allocator;
+    var snapshot = try inspect(git);
     defer snapshot.deinit();
 
     const current_ref = try git.currentBranch();
@@ -353,14 +337,10 @@ pub fn cut(
     );
     defer allocator.free(new_ref);
 
-    const checked = git.output(&.{
-        "check-ref-format",
-        new_ref,
-    }) catch |err| switch (err) {
-        error.GitFailed => return error.InvalidLayerName,
+    git.checkRefFormat(new_ref) catch |err| switch (err) {
+        error.InvalidRefName => return error.InvalidLayerName,
         else => return err,
     };
-    defer git.allocator.free(checked);
 
     const target = if (revision) |rev|
         try git.resolveCommit(rev)
