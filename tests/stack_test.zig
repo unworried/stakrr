@@ -21,7 +21,7 @@ fn initialize(repo: *const Repo) ![]u8 {
     errdefer testing.allocator.free(base);
 
     try repo.exec(&.{ "switch", "-q", "-c", "work" });
-    try stack.initStack(&repo.git, testing.allocator, "main");
+    try stack.initStack(&repo.git, "main");
 
     return base;
 }
@@ -126,7 +126,7 @@ test "initStack refuses repeated initialization" {
 
     try testing.expectError(
         error.AlreadyInitialised,
-        stack.initStack(&repo.git, testing.allocator, "main"),
+        stack.initStack(&repo.git, "main"),
     );
 
     // failed initialization must leave state intact
@@ -148,7 +148,7 @@ test "initStack refuses to use work as base" {
 
     try testing.expectError(
         error.BaseEqualsWork,
-        stack.initStack(&repo.git, testing.allocator, "main"),
+        stack.initStack(&repo.git, "main"),
     );
 }
 
@@ -173,7 +173,7 @@ test "initStack refuses a non-ancestor base" {
 
     try testing.expectError(
         error.BaseNotAncestor,
-        stack.initStack(&repo.git, testing.allocator, "main"),
+        stack.initStack(&repo.git, "main"),
     );
 
     try testing.expect(
@@ -193,7 +193,7 @@ test "initStack rejects merge commits" {
 
     try testing.expectError(
         error.MergeCommitsUnsupported,
-        stack.initStack(&repo.git, testing.allocator, "main"),
+        stack.initStack(&repo.git, "main"),
     );
 
     try testing.expect(
