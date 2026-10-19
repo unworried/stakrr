@@ -7,15 +7,19 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
 
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
     if (args.len < 2) {
-        try printHelp(init.io);
-        return;
+        try printHelp(stdout);
+        return stdout.flush();
     }
     if (std.mem.eql(u8, args[1], "--help") or
         std.mem.eql(u8, args[1], "help"))
     {
-        try printHelp(init.io);
-        return;
+        try printHelp(stdout);
+        return stdout.flush();
     }
 
     const git = Git{
@@ -23,19 +27,20 @@ pub fn main(init: std.process.Init) !void {
         .io = init.io,
     };
 
-    runCommand(&git, init.io, allocator, args) catch |err| {
+    runCommand(&git, stdout, args) catch |err| {
+        stdout.flush() catch {};
         if (userError(err)) |message| {
             try std.Io.File.stderr().writeStreamingAll(init.io, message);
             return error.CommandFailed;
         }
         return err;
     };
+    try stdout.flush();
 }
 
 fn runCommand(
     git: *const Git,
-    io: std.Io,
-    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
     args: []const []const u8,
 ) !void {
     if (std.mem.eql(u8, args[1], "init")) {
@@ -46,7 +51,7 @@ fn runCommand(
         }
 
         try stack.initStack(git, args[3]);
-        try std.Io.File.stdout().writeStreamingAll(io, "stack initialized\n");
+        try stdout.writeAll("stack initialized\n");
     } else if (std.mem.eql(u8, args[1], "status")) {
         if (args.len != 2)
             return error.InvalidArguments;
@@ -54,7 +59,7 @@ fn runCommand(
         var snapshot = try stack.inspect(git);
         defer snapshot.deinit(git.allocator);
 
-        try printStatus(io, allocator, snapshot);
+        try printStatus(stdout, snapshot);
     } else if (std.mem.eql(u8, args[1], "cut")) {
         if (args.len != 3 and
             !(args.len == 5 and std.mem.eql(u8, args[3], "--at")))
@@ -66,19 +71,14 @@ fn runCommand(
             if (args.len == 5) args[4] else null;
 
         try stack.cut(git, args[2], revision);
-        const message = try std.fmt.allocPrint(
-            allocator,
-            "created layer: stakrr/{s}\n",
-            .{args[2]},
-        );
-        try std.Io.File.stdout().writeStreamingAll(io, message);
+        try stdout.print("created layer: stakrr/{s}\n", .{args[2]});
     } else {
         return error.UnknownCommand;
     }
 }
 
-fn printHelp(io: std.Io) !void {
-    try std.Io.File.stdout().writeStreamingAll(io, "usage: stakrr <command> [options]\n" ++
+fn printHelp(stdout: *std.Io.Writer) !void {
+    try stdout.writeAll("usage: stakrr <command> [options]\n" ++
         "  init --base <branch>  adopt current branch as rolling work\n" ++
         "  status                display layers and unstacked commits\n" ++
         "  cut <name> [--at <rev>]  create the next layer\n" ++
@@ -118,54 +118,29 @@ fn shortRef(ref_name: []const u8) []const u8 {
     return ref_name;
 }
 
-fn printStatus(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    snapshot: stack.Snapshot,
-) !void {
-    const stdout = std.Io.File.stdout();
-
-    const header = try std.fmt.allocPrint(
-        allocator,
-        "stack: {s} → {s}\n\n",
-        .{
-            shortRef(snapshot.config.base_ref),
-            shortRef(snapshot.config.work_ref),
-        },
-    );
-    try stdout.writeStreamingAll(io, header);
+fn printStatus(stdout: *std.Io.Writer, snapshot: stack.Snapshot) !void {
+    try stdout.print("stack: {s} → {s}\n\n", .{
+        shortRef(snapshot.config.base_ref),
+        shortRef(snapshot.config.work_ref),
+    });
 
     if (snapshot.base_moved) {
-        try stdout.writeStreamingAll(
-            io,
+        try stdout.writeAll(
             "  warning: base moved since initialization\n\n",
         );
     }
 
     for (snapshot.layers) |layer| {
-        const line = try std.fmt.allocPrint(
-            allocator,
-            "  {s}: {d} commit(s)\n",
-            .{ shortRef(layer.ref_name), layer.commits },
-        );
-
-        try stdout.writeStreamingAll(io, line);
+        try stdout.print("  {s}: {d} commit(s)\n", .{
+            shortRef(layer.ref_name),
+            layer.commits,
+        });
     }
 
-    const work_line = try std.fmt.allocPrint(
-        allocator,
-        "  {s}: {d} unstacked commit(s)\n",
-        .{
-            shortRef(snapshot.config.work_ref),
-            snapshot.unstacked_commits,
-        },
-    );
-    try stdout.writeStreamingAll(io, work_line);
+    try stdout.print("  {s}: {d} unstacked commit(s)\n", .{
+        shortRef(snapshot.config.work_ref),
+        snapshot.unstacked_commits,
+    });
 
-    const footer = try std.fmt.allocPrint(
-        allocator,
-        "\n  {d} layer(s)\n",
-        .{snapshot.layers.len},
-    );
-    try stdout.writeStreamingAll(io, footer);
+    try stdout.print("\n  {d} layer(s)\n", .{snapshot.layers.len});
 }
