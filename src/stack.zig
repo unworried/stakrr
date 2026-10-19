@@ -2,6 +2,9 @@ const std = @import("std");
 const git_mod = @import("git.zig");
 const Git = git_mod.Git;
 
+/// git config key holding "<version> <base_ref> <work_ref> <anchor_oid>"
+pub const state_key = "stakrr.state";
+
 pub const Config = struct {
     base_ref: []const u8,
     work_ref: []const u8,
@@ -61,7 +64,7 @@ pub fn initStack(
 
     // 2. refuse existing initialisation
     const existing = try git.run(&.{
-        "config", "--local", "--get", "stakrr.state",
+        "config", "--local", "--get", state_key,
     });
     defer git.freeResult(existing);
 
@@ -130,7 +133,7 @@ pub fn initStack(
         "config",
         "--local",
         "--add",
-        "stakrr.state",
+        state_key,
         state,
     });
 
@@ -142,7 +145,7 @@ pub fn initStack(
 
 pub fn loadConfig(git: *const Git) !Config {
     const allocator = git.allocator;
-    const raw = (try git.configGet("stakrr.state")) orelse
+    const raw = (try git.configGet(state_key)) orelse
         return error.NotInitialized;
     errdefer allocator.free(raw);
 
