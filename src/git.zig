@@ -103,9 +103,13 @@ pub const Git = struct {
             .{ older, newer },
         );
         defer self.allocator.free(range);
-        const merges = try self.output(
-            &.{ "rev-list", "--min-parents=2", "--max-count=1", range },
-        );
+        const merges = try self.output(&.{
+            "rev-list",
+            "--min-parents=2",
+            "--max-count=1",
+            "--end-of-options",
+            range,
+        });
         defer self.allocator.free(merges);
         return merges.len != 0;
     }
@@ -173,6 +177,7 @@ pub const Git = struct {
         const result = try self.run(&.{
             "merge-base",
             "--is-ancestor",
+            "--end-of-options",
             a,
             b,
         });
@@ -244,6 +249,7 @@ pub const Git = struct {
         const text = try self.output(&.{
             "rev-list",
             "--count",
+            "--end-of-options",
             range,
         });
         defer self.allocator.free(text);
