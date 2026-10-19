@@ -5,6 +5,16 @@ pub const Config = struct {
     base_ref: []const u8,
     work_ref: []const u8,
     anchor_oid: []const u8,
+
+    _storage: []u8,
+
+    pub fn deinit(
+        self: *Config,
+        allocator: std.mem.Allocator,
+    ) void {
+        allocator.free(self._storage);
+        self.* = undefined;
+    }
 };
 
 pub const Layer = struct {
@@ -115,9 +125,11 @@ pub fn initStack(
     });
 }
 
+
 pub fn loadConfig(git: *const Git) !Config {
     const raw = (try git.configGet("stakrr.state")) orelse
         return error.NotInitialized;
+    errdefer git.allocator.free(raw);
 
     var tokens = std.mem.tokenizeScalar(u8, raw, ' ');
 
@@ -152,6 +164,7 @@ pub fn loadConfig(git: *const Git) !Config {
         .base_ref = base,
         .work_ref = work,
         .anchor_oid = anchor,
+        ._storage = raw,
     };
 }
 
