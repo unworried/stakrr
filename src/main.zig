@@ -1,6 +1,7 @@
 const std = @import("std");
-const Git = @import("git.zig").Git;
-const stack = @import("stack.zig");
+const stakrr = @import("stakrr");
+const Git = stakrr.git.Git;
+const stack = stakrr.stack;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
