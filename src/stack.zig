@@ -77,25 +77,30 @@ pub fn initStack(
 
     // 3. identify rolling branch and base
     const work_ref = try git.currentBranch();
+    defer git.allocator.free(work_ref);
 
     const base_ref = try std.fmt.allocPrint(
         allocator,
         "refs/heads/{s}",
         .{base_name},
     );
+    defer allocator.free(base_ref);
 
     // validate the base as a git branch ref
-    _ = try git.output(&.{
+    const checked = try git.output(&.{
         "check-ref-format",
         base_ref,
     });
+    defer git.allocator.free(checked);
 
     if (std.mem.eql(u8, work_ref, base_ref))
         return error.BaseEqualsWork;
 
     // 4. resolve both branch tips
     const base_oid = try git.resolveCommit(base_ref);
+    defer git.allocator.free(base_oid);
     const work_oid = try git.resolveCommit(work_ref);
+    defer git.allocator.free(work_oid);
 
     // 5. check ancestry
     if (!try git.isAncestor(base_oid, work_oid))
@@ -108,12 +113,14 @@ pub fn initStack(
         "{s}..{s}",
         .{ base_oid, work_oid },
     );
+    defer allocator.free(range);
 
     const merges = try git.output(&.{
         "rev-list",
         "--min-parents=2",
         range,
     });
+    defer git.allocator.free(merges);
 
     if (merges.len != 0)
         return error.MergeCommitsUnsupported;
@@ -124,14 +131,16 @@ pub fn initStack(
         "v1 {s} {s} {s}",
         .{ base_ref, work_ref, base_oid },
     );
+    defer allocator.free(state);
 
-    _ = try git.output(&.{
+    const written = try git.output(&.{
         "config",
         "--local",
         "--add",
         "stakrr.state",
         state,
     });
+    defer git.allocator.free(written);
 
     std.log.info("initialised: {s} -> {s}", .{
         base_ref,
