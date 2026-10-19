@@ -11,7 +11,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (std.mem.eql(u8, args[1], "--help") or
-        std.mem.eql(u8, args[1], "help")) {
+        std.mem.eql(u8, args[1], "help"))
+    {
         try printHelp(init.io);
         return;
     }
@@ -67,8 +68,7 @@ fn runCommand(git: *const Git, io: std.Io, allocator: std.mem.Allocator, args: [
 }
 
 fn printHelp(io: std.Io) !void {
-    try std.Io.File.stdout().writeStreamingAll(io,
-        "usage: stakrr <command> [options]\n" ++
+    try std.Io.File.stdout().writeStreamingAll(io, "usage: stakrr <command> [options]\n" ++
         "  init --base <branch>  adopt current branch as rolling work\n" ++
         "  status                display layers and unstacked commits\n" ++
         "  cut <name> [--at <rev>]  create the next layer\n" ++
