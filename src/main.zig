@@ -31,7 +31,12 @@ pub fn main(init: std.process.Init) !void {
     };
 }
 
-fn runCommand(git: *const Git, io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runCommand(
+    git: *const Git,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+) !void {
     if (std.mem.eql(u8, args[1], "init")) {
         if (args.len != 4 or
             !std.mem.eql(u8, args[2], "--base"))
@@ -60,7 +65,11 @@ fn runCommand(git: *const Git, io: std.Io, allocator: std.mem.Allocator, args: [
             if (args.len == 5) args[4] else null;
 
         try stack.cut(git, args[2], revision);
-        const message = try std.fmt.allocPrint(allocator, "created layer: stakrr/{s}\n", .{args[2]});
+        const message = try std.fmt.allocPrint(
+            allocator,
+            "created layer: stakrr/{s}\n",
+            .{args[2]},
+        );
         try std.Io.File.stdout().writeStreamingAll(io, message);
     } else {
         return error.UnknownCommand;

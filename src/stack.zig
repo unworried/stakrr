@@ -73,7 +73,7 @@ pub fn initStack(
         else => return error.GitTerminated,
     }
 
-    // Reserve stakrr's branch namespace and internal tip for managed layers.
+    // reserve stakrr's branch namespace and internal tip for managed layers
     const existing_layers = try git.listStackRefs();
     defer allocator.free(existing_layers);
     if (existing_layers.len != 0) return error.ExistingStackRefs;
@@ -194,7 +194,7 @@ pub fn inspect(git: *const Git) !Snapshot {
     const work_oid = try git.resolveCommit(config.work_ref);
     errdefer git.allocator.free(work_oid);
 
-    // anchor must be reachable from the rolling branch.
+    // anchor must be reachable from the rolling branch
     if (!try git.isAncestor(config.anchor_oid, work_oid))
         return error.InvalidStack;
 
@@ -277,7 +277,7 @@ pub fn inspect(git: *const Git) !Snapshot {
         previous_depth = layer.depth;
     }
 
-    // The private tip guard must match the highest committed layer.
+    // the private tip guard must match the highest committed layer
     const tip = try git.readRef("refs/stakrr/tip");
     defer if (tip) |oid| allocator.free(oid);
     if (layers.items.len == 0) {

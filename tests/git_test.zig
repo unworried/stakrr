@@ -35,7 +35,7 @@ test "ensureWorkTree rejects an invalid repository" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Prevent Git from discovering an enclosing repository.
+    // prevent git from discovering an enclosing repository
     try tmp.dir.writeFile(testing.io, .{
         .sub_path = ".git",
         .data = "gitdir: does-not-exist\n",

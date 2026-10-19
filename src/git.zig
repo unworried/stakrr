@@ -7,8 +7,8 @@ pub const Git = struct {
     io: Io,
     cwd: ?Io.Dir = null,
 
-    /// execute git and return its raw result.
-    /// the caller owns stdout and stderr.
+    /// execute git and return its raw result
+    /// the caller owns stdout and stderr
     pub fn run(
         self: *const Git,
         args: []const []const u8,
@@ -58,7 +58,7 @@ pub const Git = struct {
         return self.allocator.dupe(u8, trimmed);
     }
 
-    /// execute a Git command that must succeed without retaining stdout.
+    /// execute a Git command that must succeed without retaining stdout
     pub fn exec(self: *const Git, args: []const []const u8) !void {
         const result = try self.run(args);
         defer self.free(result);
@@ -71,22 +71,41 @@ pub const Git = struct {
         if ((try exitCode(result)) != 0) return error.InvalidRefName;
     }
 
-    /// Read the exact ref OID. A missing ref is distinct from a Git failure.
+    /// read the exact ref oid. a missing ref is distinct from a git failure
     pub fn readRef(self: *const Git, ref_name: []const u8) !?[]u8 {
-        const result = try self.run(&.{ "rev-parse", "--verify", "--quiet", "--end-of-options", ref_name });
+        const result = try self.run(&.{
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            ref_name,
+        });
         defer self.free(result);
         return switch (try exitCode(result)) {
-            0 => try self.allocator.dupe(u8, std.mem.trimEnd(u8, result.stdout, "\r\n")),
+            0 => try self.allocator.dupe(
+                u8,
+                std.mem.trimEnd(u8, result.stdout, "\r\n"),
+            ),
             1 => null,
             else => error.GitFailed,
         };
     }
 
-    /// True if the range contains a merge commit (linear stacks only).
-    pub fn hasMergeCommits(self: *const Git, older: []const u8, newer: []const u8) !bool {
-        const range = try std.fmt.allocPrint(self.allocator, "{s}..{s}", .{ older, newer });
+    /// true if the range contains a merge commit (linear stacks only)
+    pub fn hasMergeCommits(
+        self: *const Git,
+        older: []const u8,
+        newer: []const u8,
+    ) !bool {
+        const range = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}..{s}",
+            .{ older, newer },
+        );
         defer self.allocator.free(range);
-        const merges = try self.output(&.{ "rev-list", "--min-parents=2", "--max-count=1", range });
+        const merges = try self.output(
+            &.{ "rev-list", "--min-parents=2", "--max-count=1", range },
+        );
         defer self.allocator.free(merges);
         return merges.len != 0;
     }
