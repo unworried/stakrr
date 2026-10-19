@@ -24,14 +24,15 @@ feature-p1 => feature-p2 => feature-p3 => HEAD
 - integration with `gh stack` allowing for third-party stack to be linked to githubs system
 
 ## CLI API
-| command | purpose |
-| --- | --- |
-| sk init | adopt current branch as stack head |
-| sk cut | extract existing commit boundary into a lower layer |
-| sk status | display stack, ancestry and outstanding commits |
-| sk amend | amend a lower layer and restack the descendants |
-| sk submit | publish review branches, excluding rolling work |
-| sk undo | restore previous stakrr operation |
+| command | purpose | status |
+| --- | --- | --- |
+| stakrr init --base \<branch\> | adopt current branch as stack head | m1 |
+| stakrr cut \<name\> [--at \<rev\>] | extract existing commit boundary into a lower layer | m1 |
+| stakrr status | display stack, ancestry and outstanding commits | m1 |
+| stakrr reset [--delete-layers] | forget the stack so it can be re-initialised | m1 |
+| stakrr amend | amend a lower layer and restack the descendants | planned |
+| stakrr submit | publish review branches, excluding rolling work | planned |
+| stakrr undo | restore previous stakrr operation | planned |
 
 
 ## cut
