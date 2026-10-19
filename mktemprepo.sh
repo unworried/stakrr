@@ -58,21 +58,29 @@ export STAKRR_TEST_REPO="$repo"
 
 cd "$repo"
 
+# colour only on a terminal, matching the cli
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    accent=$'\e[36m' dim=$'\e[2m' reset=$'\e[0m'
+else
+    accent="" dim="" reset=""
+fi
+
 echo
-echo "Stakrr manual testing environment"
-echo "---------------------------------"
-echo "Repository: $repo"
-echo "Branch:     $rollbranch"
-echo "Binary:     $bin"
+echo "${accent}stakrr${reset} ${dim}// sandbox${reset}"
+echo "${dim}──────────────────────────────────────────${reset}"
+echo "${dim}repo  ${reset} $repo"
+echo "${dim}branch${reset} $rollbranch"
+echo "${dim}binary${reset} $bin"
 echo
 git log --oneline --graph --decorate --all
 echo
-echo "Try:"
+echo "${dim}try${reset}"
 echo "  stakrr init --base main"
+echo "  stakrr cut models --at HEAD~3"
+echo "  stakrr status"
 echo "  git config --local --get stakrr.state"
-echo "  stakrr init --base main   # Should fail"
 echo
-echo "Exit the shell with 'exit' or Ctrl-D."
+echo "${dim}exit the shell with 'exit' or ctrl-d${reset}"
 echo
 
 "${SHELL:-/bin/bash}" -i
