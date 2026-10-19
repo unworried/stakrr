@@ -21,10 +21,10 @@ pub const Layer = struct {
     ref_name: []const u8,
     oid: []const u8,
 
-    // Commits between anchor and this layer.
+    // commits between anchor and this layer
     depth: usize,
 
-    // Commits since the previous layer boundary.
+    // commits since the previous layer boundary
     commits: usize = 0,
 };
 
@@ -34,8 +34,22 @@ pub const Snapshot = struct {
 
     work_oid: []const u8,
     unstacked_commits: usize,
-
     base_moved: bool,
+
+    // layer ref_name and oid slices borrow from this buffer
+    _refs_storage: []u8,
+
+    // layers and git command results have different allocators
+    _allocator: std.mem.Allocator,
+    _git_allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *Snapshot) void {
+        self._allocator.free(self.layers);
+        self._git_allocator.free(self._refs_storage);
+        self._git_allocator.free(self.work_oid);
+        self.config.deinit(self._git_allocator);
+        self.* = undefined;
+    }
 };
 
 pub fn initStack(
@@ -124,7 +138,6 @@ pub fn initStack(
         work_ref,
     });
 }
-
 
 pub fn loadConfig(git: *const Git) !Config {
     const raw = (try git.configGet("stakrr.state")) orelse
