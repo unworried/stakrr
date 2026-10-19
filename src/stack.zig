@@ -187,10 +187,14 @@ pub fn inspect(
 ) !Snapshot {
     try git.ensureWorkTree();
 
-    const config = try loadConfig(git);
+    var config = try loadConfig(git);
+    errdefer config.deinit(git.allocator);
 
     const base_oid = try git.resolveCommit(config.base_ref);
+    defer git.allocator.free(base_oid);
+
     const work_oid = try git.resolveCommit(config.work_ref);
+    errdefer git.allocator.free(work_oid);
 
     // anchor must be reachable from the rolling branch.
     if (!try git.isAncestor(config.anchor_oid, work_oid))
@@ -203,20 +207,24 @@ pub fn inspect(
         "{s}..{s}",
         .{ config.anchor_oid, work_oid },
     );
+    defer allocator.free(range);
 
     const merges = try git.output(&.{
         "rev-list",
         "--min-parents=2",
         range,
     });
+    defer git.allocator.free(merges);
 
     if (merges.len != 0)
         return error.MergeCommitsUnsupported;
 
     // discover branches owned by stakrr
     const raw_refs = try git.listStackRefs();
+    errdefer git.allocator.free(raw_refs);
 
     var layers: std.ArrayList(Layer) = .empty;
+    errdefer layers.deinit(allocator);
     var lines = std.mem.splitScalar(u8, raw_refs, '\n');
 
     while (lines.next()) |line| {
@@ -300,5 +308,8 @@ pub fn inspect(
             base_oid,
             config.anchor_oid,
         ),
+        ._refs_storage = raw_refs,
+        ._allocator = allocator,
+        ._git_allocator = git.allocator,
     };
 }
