@@ -63,18 +63,9 @@ pub fn initStack(
     try git.ensureWorkTree();
 
     // 2. refuse existing initialisation
-    const existing = try git.run(&.{
-        "config", "--local", "--get", state_key,
-    });
-    defer git.freeResult(existing);
-
-    switch (existing.term) {
-        .exited => |code| switch (code) {
-            0 => return error.AlreadyInitialised,
-            1 => {},
-            else => return error.GitFailed,
-        },
-        else => return error.GitTerminated,
+    if (try git.configGet(state_key)) |existing| {
+        allocator.free(existing);
+        return error.AlreadyInitialised;
     }
 
     // reserve stakrr's branch namespace and internal tip for managed layers
