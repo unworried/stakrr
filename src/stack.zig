@@ -10,6 +10,7 @@ pub const Error = git_mod.Error || error{
     ExistingStackRefs,
     ReservedBranchNamespace,
     BaseEqualsWork,
+    BaseNotFound,
     BaseNotAncestor,
     MergeCommitsUnsupported,
     InvalidConfig,
@@ -101,11 +102,11 @@ pub fn initStack(
     const work_ref = try git.currentBranch();
     defer allocator.free(work_ref);
 
-    const base_ref = try std.fmt.allocPrint(
-        allocator,
-        "refs/heads/{s}",
-        .{base_name},
-    );
+    // accept either a branch name or its full refs/heads/ ref
+    const base_ref = if (std.mem.startsWith(u8, base_name, "refs/heads/"))
+        try allocator.dupe(u8, base_name)
+    else
+        try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{base_name});
     defer allocator.free(base_ref);
 
     // layer names live exclusively under refs/heads/stakrr/
@@ -119,7 +120,8 @@ pub fn initStack(
         return error.BaseEqualsWork;
 
     // 4. resolve both branch tips
-    const base_oid = try git.resolveCommit(base_ref);
+    const base_oid = (try git.readRef(base_ref)) orelse
+        return error.BaseNotFound;
     defer allocator.free(base_oid);
     const work_oid = try git.resolveCommit(work_ref);
     defer allocator.free(work_oid);

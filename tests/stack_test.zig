@@ -3,7 +3,8 @@ const testing = std.testing;
 
 const stack = @import("stakrr").stack;
 
-const Repo = @import("support/repo.zig").Repo;
+const support = @import("support/repo.zig");
+const Repo = support.Repo;
 
 fn setState(repo: *const Repo, state: []const u8) !void {
     try repo.exec(&.{
@@ -42,6 +43,12 @@ fn addMerge(repo: *const Repo) !void {
         "merge", "--no-ff",    "-s",   "ours",
         "-m",    "merge side", "side",
     });
+}
+
+fn expectNoState(repo: *const Repo) !void {
+    const state = try repo.git.configGet("stakrr.state");
+    defer if (state) |value| testing.allocator.free(value);
+    try testing.expect(state == null);
 }
 
 test "loadConfig rejects missing state" {
@@ -117,6 +124,38 @@ test "loadConfig rejects malformed state" {
     }
 }
 
+test "initStack accepts a full base ref" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try repo.commit("base");
+    defer testing.allocator.free(base);
+
+    try repo.exec(&.{ "switch", "-q", "-c", "work" });
+    try stack.initStack(&repo.git, "refs/heads/main");
+
+    var config = try stack.loadConfig(&repo.git);
+    defer config.deinit(repo.git.allocator);
+
+    try testing.expectEqualStrings("refs/heads/main", config.base_ref);
+}
+
+test "initStack rejects a missing base" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try repo.commit("base");
+    defer testing.allocator.free(base);
+
+    try repo.exec(&.{ "switch", "-q", "-c", "work" });
+
+    try testing.expectError(
+        error.BaseNotFound,
+        stack.initStack(&repo.git, "origin/main"),
+    );
+    try expectNoState(&repo);
+}
+
 test "initStack refuses repeated initialization" {
     var repo = try Repo.init();
     defer repo.deinit();
@@ -176,9 +215,7 @@ test "initStack refuses a non-ancestor base" {
         stack.initStack(&repo.git, "main"),
     );
 
-    try testing.expect(
-        (try repo.git.configGet("stakrr.state")) == null,
-    );
+    try expectNoState(&repo);
 }
 
 test "initStack rejects merge commits" {
@@ -196,7 +233,5 @@ test "initStack rejects merge commits" {
         stack.initStack(&repo.git, "main"),
     );
 
-    try testing.expect(
-        (try repo.git.configGet("stakrr.state")) == null,
-    );
+    try expectNoState(&repo);
 }

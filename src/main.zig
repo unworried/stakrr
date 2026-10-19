@@ -163,6 +163,7 @@ fn userError(err: anyerror) ?[]const u8 {
         error.ExistingStackRefs => "stale or existing stakrr refs found",
         error.ReservedBranchNamespace => "base and work branches cannot use stakrr/",
         error.BaseEqualsWork => "base and work branches must differ",
+        error.BaseNotFound => "base branch not found (it must be a local branch)",
         error.BaseNotAncestor => "base is not an ancestor of work",
         error.MergeCommitsUnsupported => "merge commits in the stack are unsupported",
         error.InvalidConfig => "stakrr state in git config is invalid",
