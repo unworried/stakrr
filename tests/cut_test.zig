@@ -317,7 +317,7 @@ test "ref transaction aborts if work changes after inspection" {
         repo.git.createLayerRef(
             "refs/heads/stakrr/race",
             b,
-            .{ .name = "refs/heads/main", .oid = base },
+            .{ .name = "refs/stakrr/anchor", .oid = base },
             .{ .name = "refs/heads/work", .oid = b },
             null,
         ),
@@ -341,7 +341,7 @@ test "ref transaction rejects two cuts from the same old tip" {
     defer testing.allocator.free(c);
 
     const expected_base = Git.ExpectedRef{
-        .name = "refs/heads/main",
+        .name = "refs/stakrr/anchor",
         .oid = base,
     };
 

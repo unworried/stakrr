@@ -26,14 +26,16 @@ pub const Error = git_mod.Error || error{
     CutOutsideWork,
 };
 
-/// git config key holding "<version> <base_ref> <work_ref> <anchor_oid>"
+/// git config key holding "<version> <base_ref> <work_ref>"
 pub const state_key = "stakrr.state";
+pub const state_version = "v1";
 
 pub const Config = struct {
     base_ref: []const u8,
     work_ref: []const u8,
     anchor_oid: []const u8,
 
+    // base_ref and work_ref borrow from this buffer
     _storage: []u8,
 
     pub fn deinit(
@@ -41,6 +43,7 @@ pub const Config = struct {
         allocator: std.mem.Allocator,
     ) void {
         allocator.free(self._storage);
+        allocator.free(self.anchor_oid);
         self.* = undefined;
     }
 };
@@ -90,13 +93,15 @@ pub fn initStack(
         return error.AlreadyInitialized;
     }
 
-    // reserve stakrr's branch namespace and internal tip for managed layers
+    // reserve stakrr's branch namespace and internal refs for managed layers
     const existing_layers = try git.listStackRefs();
     defer allocator.free(existing_layers);
     if (existing_layers.len != 0) return error.ExistingStackRefs;
-    const existing_tip = try git.readRef(git_mod.tip_ref);
-    defer if (existing_tip) |oid| allocator.free(oid);
-    if (existing_tip != null) return error.ExistingStackRefs;
+    for ([_][]const u8{ git_mod.tip_ref, git_mod.anchor_ref }) |ref_name| {
+        const existing = try git.readRef(ref_name);
+        defer if (existing) |oid| allocator.free(oid);
+        if (existing != null) return error.ExistingStackRefs;
+    }
 
     // 3. identify rolling branch and base
     const work_ref = try git.currentBranch();
@@ -135,21 +140,20 @@ pub fn initStack(
     if (try git.hasMergeCommits(base_oid, work_oid))
         return error.MergeCommitsUnsupported;
 
-    // 7. persist the initialisation metadata
+    // 7. claim the anchor; `create` fails if a concurrent init won the race
+    const anchor: Git.ExpectedRef = .{ .name = git_mod.anchor_ref, .oid = base_oid };
+    try git.transact("stakrr: init", &.{.{ .create = anchor }});
+    errdefer git.transact("stakrr: init rollback", &.{.{ .delete = anchor }}) catch {};
+
+    // 8. persist the branch pair
     const state = try std.fmt.allocPrint(
         allocator,
-        "v1 {s} {s} {s}",
-        .{ base_ref, work_ref, base_oid },
+        state_version ++ " {s} {s}",
+        .{ base_ref, work_ref },
     );
     defer allocator.free(state);
 
-    try git.exec(&.{
-        "config",
-        "--local",
-        "--add",
-        state_key,
-        state,
-    });
+    try git.exec(&.{ "config", "--local", state_key, state });
 }
 
 pub fn loadConfig(git: *const Git) !Config {
@@ -163,30 +167,31 @@ pub fn loadConfig(git: *const Git) !Config {
     const version = tokens.next() orelse
         return error.InvalidConfig;
 
+    if (!std.mem.eql(u8, version, state_version))
+        return error.UnsupportedConfigVersion;
+
     const base = tokens.next() orelse
         return error.InvalidConfig;
 
     const work = tokens.next() orelse
         return error.InvalidConfig;
 
-    const anchor = tokens.next() orelse
-        return error.InvalidConfig;
-
     if (tokens.next() != null)
         return error.InvalidConfig;
 
-    if (!std.mem.eql(u8, version, "v1"))
-        return error.UnsupportedConfigVersion;
-
-    // config is user-editable: validate before values reach argv or update-ref
+    // config is user-editable: validate before refs reach argv or update-ref
     if (!git_mod.isSafeBranchRef(base) or !git_mod.isSafeBranchRef(work))
-        return error.InvalidConfig;
-
-    if (!git_mod.isOid(anchor))
         return error.InvalidConfig;
 
     if (std.mem.eql(u8, base, work))
         return error.InvalidConfig;
+
+    const anchor = (try git.readRef(git_mod.anchor_ref)) orelse
+        return error.InvalidStack;
+    errdefer allocator.free(anchor);
+
+    if (!git_mod.isOid(anchor))
+        return error.InvalidGitOutput;
 
     return .{
         .base_ref = base,
@@ -408,7 +413,7 @@ pub fn cut(
         new_ref,
         target,
         .{
-            .name = snapshot.config.base_ref,
+            .name = git_mod.anchor_ref,
             .oid = snapshot.config.anchor_oid,
         },
         .{

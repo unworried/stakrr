@@ -446,14 +446,14 @@ pub const Git = struct {
         self: *const Git,
         name: []const u8,
         oid: []const u8,
-        base: ExpectedRef,
+        anchor: ExpectedRef,
         work: ExpectedRef,
         previous: ?ExpectedRef,
     ) !void {
         var updates: [5]RefUpdate = undefined;
         var count: usize = 0;
 
-        updates[count] = .{ .verify = base };
+        updates[count] = .{ .verify = anchor };
         count += 1;
         updates[count] = .{ .verify = work };
         count += 1;
@@ -478,6 +478,9 @@ pub const Git = struct {
 
 /// internal guard pointing at the highest layer
 pub const tip_ref = "refs/stakrr/tip";
+
+/// the stack's starting commit; also keeps it reachable for gc
+pub const anchor_ref = "refs/stakrr/anchor";
 
 /// namespace for stakrr-managed layer branches
 pub const layer_prefix = "refs/heads/stakrr/";

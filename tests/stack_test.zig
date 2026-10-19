@@ -49,6 +49,10 @@ fn expectNoState(repo: *const Repo) !void {
     const state = try repo.git.configGet("stakrr.state");
     defer if (state) |value| testing.allocator.free(value);
     try testing.expect(state == null);
+
+    const anchor = try repo.git.readRef("refs/stakrr/anchor");
+    defer if (anchor) |oid| testing.allocator.free(oid);
+    try testing.expect(anchor == null);
 }
 
 test "loadConfig rejects missing state" {
@@ -89,36 +93,36 @@ test "loadConfig rejects malformed state" {
     var repo = try Repo.init();
     defer repo.deinit();
 
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+
     const cases = [_]struct {
         value: []const u8,
         expected: anyerror,
     }{
         .{
-            .value = "v2 refs/heads/main refs/heads/work abc",
+            .value = "v2 refs/heads/main refs/heads/work",
             .expected = error.UnsupportedConfigVersion,
         },
         .{
-            .value = "v1 refs/heads/main refs/heads/work",
+            .value = "v1 refs/heads/main",
+            .expected = error.InvalidConfig,
+        },
+        // pre-release state stored the anchor inline as a fourth token
+        .{
+            .value = "v1 refs/heads/main refs/heads/work abc",
             .expected = error.InvalidConfig,
         },
         .{
-            .value = "v1 refs/heads/main refs/heads/work abc extra",
+            .value = "v1 main refs/heads/work",
             .expected = error.InvalidConfig,
         },
         .{
-            .value = "v1 main refs/heads/work abc",
+            .value = "v1 --output=x refs/heads/work",
             .expected = error.InvalidConfig,
         },
         .{
-            .value = "v1 --output=x refs/heads/work abc",
-            .expected = error.InvalidConfig,
-        },
-        .{
-            .value = "v1 refs/heads/main refs/heads/work --output=x",
-            .expected = error.InvalidConfig,
-        },
-        .{
-            .value = "v1 refs/heads/main refs/heads/main abc",
+            .value = "v1 refs/heads/main refs/heads/main",
             .expected = error.InvalidConfig,
         },
     };
@@ -130,6 +134,34 @@ test "loadConfig rejects malformed state" {
             stack.loadConfig(&repo.git),
         );
     }
+}
+
+test "loadConfig reports a missing anchor ref as an inconsistent stack" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+
+    try repo.exec(&.{ "update-ref", "-d", "refs/stakrr/anchor" });
+
+    try testing.expectError(
+        error.InvalidStack,
+        stack.loadConfig(&repo.git),
+    );
+}
+
+test "initStack records the anchor as a ref" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+
+    const anchor = (try repo.git.readRef("refs/stakrr/anchor")).?;
+    defer testing.allocator.free(anchor);
+
+    try testing.expectEqualStrings(base, anchor);
 }
 
 test "initStack accepts a full base ref" {
@@ -183,6 +215,21 @@ test "initStack refuses repeated initialization" {
     try testing.expectEqualStrings(
         base,
         config.anchor_oid,
+    );
+}
+
+test "initStack refuses a leftover anchor ref" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+
+    try repo.exec(&.{ "config", "--local", "--unset-all", "stakrr.state" });
+
+    try testing.expectError(
+        error.ExistingStackRefs,
+        stack.initStack(&repo.git, "main"),
     );
 }
 
