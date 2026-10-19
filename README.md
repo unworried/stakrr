@@ -12,16 +12,16 @@ you can only relax when the agents are sleeping. also, its fast and I like using
 - working at the development HEAD
 - make a cut at the current HEAD or specified commit-like
 - branch is created for the cut and is stacked below the dev branch
-- new branch is stacked ontop of pre existing cuts
+- new branch is stacked on top of pre-existing cuts
 - e.g.
 feature-p1 => feature-p2 => HEAD
 ```sh
-$ sk cut feature-p3
+$ stakrr cut feature-p3
 ```
 feature-p1 => feature-p2 => feature-p3 => HEAD
 - feature-p3 contains all the commits feature-p2..HEAD by default can be adjusted
 - allow for commits to be edited as usual allowing for standard branch actions
-- intergration with `gh stack` allowing for third-party stack to be linked to githubs system
+- integration with `gh stack` allowing for third-party stack to be linked to githubs system
 
 ## CLI API
 | command | purpose |
@@ -70,5 +70,5 @@ select individual hunks from a commit, extract them into a lower layer, replay d
 - use compare-and-swap ref updates
 - create recovery points
 - treat conflicts as resolvable failures not hidden problems
-- keep remote operations seperate
+- keep remote operations separate
 - validate git worktrees
