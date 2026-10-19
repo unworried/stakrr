@@ -277,18 +277,38 @@ pub const Git = struct {
                 .inherit,
             .stdin = .pipe,
             .stdout = .ignore,
-            .stderr = .inherit,
+            .stderr = .pipe,
         });
+
+        var reaped = false;
         errdefer {
-            if (child.stdin) |pipe| pipe.close(self.io);
-            child.kill(self.io);
+            if (!reaped) {
+                if (child.stdin) |pipe| pipe.close(self.io);
+                child.kill(self.io);
+            }
         }
 
         try child.stdin.?.writeStreamingAll(self.io, transaction);
         child.stdin.?.close(self.io);
         child.stdin = null;
 
+        // drain git's stderr instead of forwarding it to the
+        // test runner. preserve the subprocess exit status
+        var stderr_buffer: [4096]u8 = undefined;
+        var stderr_reader = child.stderr.?.reader(
+            self.io,
+            &stderr_buffer,
+        );
+
+        const stderr = try stderr_reader.interface.allocRemaining(
+            self.allocator,
+            .limited(64 * 1024),
+        );
+        defer self.allocator.free(stderr);
+
         const term = try child.wait(self.io);
+        reaped = true;
+
         if (!term.success()) return error.GitFailed;
     }
 };

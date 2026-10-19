@@ -66,6 +66,18 @@ pub fn build(b: *std.Build) void {
     });
     const run_stack_tests = b.addRunArtifact(stack_tests);
 
+    const cut_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/cut_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "stakrr", .module = mod },
+            },
+        }),
+    });
+    const run_cut_tests = b.addRunArtifact(cut_tests);
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
@@ -74,4 +86,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_git_tests.step);
     test_step.dependOn(&run_stack_tests.step);
+    test_step.dependOn(&run_cut_tests.step);
 }
