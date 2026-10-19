@@ -5,6 +5,7 @@ const Io = std.Io;
 pub const Git = struct {
     allocator: Allocator,
     io: Io,
+    cwd: ?Io.Dir = null,
 
     /// execute git and return its raw result.
     /// the caller owns stdout and stderr.
@@ -20,6 +21,7 @@ pub const Git = struct {
 
         return std.process.run(self.allocator, self.io, .{
             .argv = argv,
+            .cwd = if (self.cwd) |dir| .{ .dir = dir } else .inherit,
             .stdout_limit = .limited(64 * 1024),
             .stderr_limit = .limited(64 * 1024),
         });
@@ -49,10 +51,8 @@ pub const Git = struct {
         const result = try self.run(args);
         defer self.free(result);
 
-        if ((try exitCode(result)) != 0) {
-            std.log.err("git {s}: {s}", .{ args[0], result.stderr });
+        if ((try exitCode(result)) != 0)
             return error.GitFailed;
-        }
 
         const trimmed = std.mem.trimEnd(u8, result.stdout, "\r\n");
         return self.allocator.dupe(u8, trimmed);
