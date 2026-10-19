@@ -2,6 +2,20 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
+/// Domain errors raised by the Git wrapper. Allocation and process
+/// spawning errors are propagated separately.
+pub const Error = error{
+    GitFailed,
+    GitTerminated,
+    InvalidRefName,
+    NotGitRepository,
+    NotWorkingTree,
+    DetachedHead,
+    InvalidGitConfig,
+    InvalidGitOutput,
+    StreamTooLong,
+};
+
 /// True if `text` is a full hexadecimal SHA-1 or SHA-256 object id.
 pub fn isOid(text: []const u8) bool {
     if (text.len != 40 and text.len != 64) return false;
