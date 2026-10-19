@@ -16,6 +16,8 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
 
+    const command = parseArgs(args) catch |err| fail(init.io, err);
+
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
@@ -25,19 +27,11 @@ pub fn main(init: std.process.Init) !void {
         .io = init.io,
     };
 
-    run(&git, stdout, args) catch |err| {
+    runCommand(&git, stdout, command) catch |err| {
         stdout.flush() catch {};
-        if (userError(err)) |message| {
-            try std.Io.File.stderr().writeStreamingAll(init.io, message);
-            return error.CommandFailed;
-        }
-        return err;
+        fail(init.io, err);
     };
     try stdout.flush();
-}
-
-fn run(git: *const Git, stdout: *std.Io.Writer, args: []const []const u8) !void {
-    try runCommand(git, stdout, try parseArgs(args));
 }
 
 pub fn parseArgs(args: []const []const u8) ParseError!Command {
@@ -124,6 +118,25 @@ fn runCommand(
     }
 }
 
+/// report a failure on stderr and exit; never returns an error from main,
+/// which would make Zig print the error name and a trace as well
+fn fail(io: std.Io, err: anyerror) noreturn {
+    var buffer: [2048]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(io, &buffer);
+    const stderr = &stderr_writer.interface;
+
+    if (userError(err)) |message| {
+        stderr.print("error: {s}\n", .{message}) catch {};
+    } else {
+        stderr.print("error: unexpected failure ({s})\n", .{@errorName(err)}) catch {};
+    }
+
+    stderr.flush() catch {};
+
+    const usage_error = err == error.InvalidArguments or err == error.UnknownCommand;
+    std.process.exit(if (usage_error) 2 else 1);
+}
+
 fn printHelp(stdout: *std.Io.Writer) !void {
     try stdout.writeAll("usage: stakrr <command> [options]\n" ++
         "  init --base <branch>  adopt current branch as rolling work\n" ++
@@ -134,24 +147,24 @@ fn printHelp(stdout: *std.Io.Writer) !void {
 
 fn userError(err: anyerror) ?[]const u8 {
     return switch (err) {
-        error.InvalidArguments => "error: invalid arguments (run 'stakrr help')\n",
-        error.UnknownCommand => "error: unknown command (run 'stakrr help')\n",
-        error.NotInitialized => "error: stack not initialized\n",
-        error.AlreadyInitialized => "error: stack already initialized\n",
-        error.ExistingStackRefs => "error: stale or existing stakrr refs found\n",
-        error.ReservedBranchNamespace => "error: base and work branches cannot use stakrr/\n",
-        error.BaseEqualsWork => "error: base and work branches must differ\n",
-        error.BaseNotAncestor => "error: base is not an ancestor of work\n",
-        error.MergeCommitsUnsupported => "error: merge commits in the stack are unsupported\n",
-        error.InvalidStack, error.InvalidLayerBoundary => "error: stack refs are inconsistent\n",
-        error.BaseMoved => "error: base branch moved since initialization\n",
-        error.EmptyCut => "error: no new commits since previous layer\n",
-        error.NotOnWorkBranch => "error: cut must run on the rolling work branch\n",
-        error.InvalidLayerName => "error: invalid layer name\n",
-        error.InvalidRefName => "error: invalid Git branch name\n",
-        error.InvalidCutBoundary, error.CutOutsideWork => "error: revision is outside the next unstacked segment\n",
-        error.GitFailed => "error: Git operation failed (refs may have changed)\n",
-        error.DetachedHead => "error: detached HEAD is unsupported\n",
+        error.InvalidArguments => "invalid arguments (run 'stakrr help')",
+        error.UnknownCommand => "unknown command (run 'stakrr help')",
+        error.NotInitialized => "stack not initialized (run 'stakrr init --base <branch>')",
+        error.AlreadyInitialized => "stack already initialized",
+        error.ExistingStackRefs => "stale or existing stakrr refs found",
+        error.ReservedBranchNamespace => "base and work branches cannot use stakrr/",
+        error.BaseEqualsWork => "base and work branches must differ",
+        error.BaseNotAncestor => "base is not an ancestor of work",
+        error.MergeCommitsUnsupported => "merge commits in the stack are unsupported",
+        error.InvalidStack, error.InvalidLayerBoundary => "stack refs are inconsistent",
+        error.BaseMoved => "base branch moved since initialization",
+        error.NotOnWorkBranch => "cut must run on the rolling work branch",
+        error.InvalidLayerName => "invalid layer name",
+        error.EmptyCut => "no new commits since previous layer",
+        error.InvalidCutBoundary, error.CutOutsideWork => "revision is outside the next unstacked segment",
+        error.GitFailed => "Git operation failed (refs may have changed)",
+        error.InvalidRefName => "invalid Git branch name",
+        error.DetachedHead => "detached HEAD is unsupported",
         else => null,
     };
 }
