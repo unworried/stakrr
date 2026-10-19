@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: "0.17.0"
+
+      - name: Verify release
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+          grep -Fq ".version = \"$version\"" build.zig.zon
+
+          git fetch origin main
+          git merge-base --is-ancestor \
+            "$GITHUB_SHA" FETCH_HEAD
+
+      - name: Test
+        run: zig build test -Doptimize=ReleaseSafe
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-linux-musl
+          - os: macos-latest
+            target: x86_64-macos
+          - os: macos-latest
+            target: aarch64-macos
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: "0.17.0"
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          zig build \
+            -Dtarget="$TARGET" \
+            -Doptimize=ReleaseSafe
+
+          mkdir -p stage
+          cp zig-out/bin/stakrr stage/
+          cp LICENSE stage/
+
+          tar -czf \
+            "stakrr-${GITHUB_REF_NAME}-${TARGET}.tar.gz" \
+            -C stage stakrr LICENSE
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: stakrr-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          (
+            cd dist
+            sha256sum *.tar.gz > SHA256SUMS
+          )
+
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.tar.gz dist/SHA256SUMS \
+            --verify-tag \
+            --generate-notes
