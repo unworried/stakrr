@@ -48,10 +48,40 @@ stakrr status
 `HEAD`, working files, the index, or existing layer branches. Each cut must
 advance beyond the previous boundary and be reachable from the rolling branch.
 
-`refs/stakrr/tip` is an internal concurrency guard. Do not manually edit or
-delete it. The first cut creates it; subsequent cuts compare-and-swap it in the
-same Git ref transaction as the new layer. Aborted cuts leave existing refs
-unchanged. This M1 implementation does not rewrite commits or extract hunks.
+If the base branch moves after `init` (e.g. `git pull` on main), `cut` keeps
+working: layers are carved relative to the original base commit, and
+`status` warns that the base moved. Restacking onto the new base is planned.
+
+## state
+- `git config stakrr.state`: `v1 <base_ref> <work_ref>`. One stack per
+  repository, shared by all worktrees.
+- `refs/stakrr/anchor`: the base commit at `init`. It also keeps that
+  commit reachable for gc.
+- `refs/stakrr/tip`: an internal concurrency guard pointing at the highest
+  layer. The first cut creates it, and later cuts compare-and-swap it in the
+  same Git ref transaction as the new layer and a check of the anchor and work
+  branch. An aborted cut leaves existing refs unchanged.
+- `refs/heads/stakrr/*`: layer branches.
+
+Do not edit the internal refs by hand. This M1 implementation does not rewrite
+commits or extract hunks.
+
+## recovery
+`status` and `cut` refuse to run when the stack no longer matches the rolling
+branch. That happens after rebasing work past the base, deleting a layer
+branch, or upgrading from an incompatible state version. To start over:
+
+```sh
+stakrr reset                  # drop stakrr state; keep stakrr/* branches
+stakrr reset --delete-layers  # also delete the stakrr/* layer branches
+stakrr init --base main
+```
+
+`reset` never touches the rolling branch, HEAD, the index or the working tree.
+It refuses to delete layers while one of them is checked out.
+
+stakrr runs the `git` found on `PATH` and inherits the environment
+(`GIT_DIR` and so on).
 
 ## why not just use `gh stack`?
 - it is slow
