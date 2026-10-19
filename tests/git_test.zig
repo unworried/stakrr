@@ -209,6 +209,26 @@ test "isSafeBranchRef rejects options and protocol injection" {
     try testing.expect(!stakrr_git.isSafeBranchRef("refs/heads/a b"));
 }
 
+test "transact rejects malformed oids before writing to git" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    try testing.expectError(
+        error.InvalidOid,
+        repo.git.transact("test", &.{.{ .create = .{
+            .name = "refs/stakrr/tip",
+            .oid = "HEAD",
+        } }}),
+    );
+    try testing.expectError(
+        error.InvalidRefName,
+        repo.git.transact("test", &.{.{ .create = .{
+            .name = "refs/heads/x\ndelete refs/heads/main",
+            .oid = &@as([40]u8, @splat('a')),
+        } }}),
+    );
+}
+
 test "configGet returns null when key is missing" {
     var repo = try Repo.init();
     defer repo.deinit();

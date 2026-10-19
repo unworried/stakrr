@@ -8,6 +8,7 @@ pub const Error = error{
     GitFailed,
     GitTerminated,
     InvalidRefName,
+    InvalidOid,
     NotGitRepository,
     NotWorkingTree,
     DetachedHead,
@@ -328,71 +329,69 @@ pub const Git = struct {
         oid: []const u8,
     };
 
-    /// atomically create a layer and advance the internal tip guard
-    /// verifies all observed refs and fails if the stack changed meanwhile
-    /// the passed names and oids must be trusted, validated git refs/commit ids
-    pub fn createLayerRef(
+    /// One line of an `update-ref --stdin` transaction.
+    pub const RefUpdate = union(enum) {
+        verify: ExpectedRef,
+        create: ExpectedRef,
+        /// compare-and-swap `name` from `old` to `new`
+        update: struct { name: []const u8, new: []const u8, old: []const u8 },
+        delete: ExpectedRef,
+    };
+
+    /// Atomically apply `updates` in one ref transaction; either every
+    /// update lands or none do. Names must be Git-valid refs and every oid
+    /// a full object id, since both are written into the stdin protocol.
+    pub fn transact(
         self: *const Git,
-        name: []const u8,
-        oid: []const u8,
-        base: ExpectedRef,
-        work: ExpectedRef,
-        previous: ?ExpectedRef,
+        message: []const u8,
+        updates: []const RefUpdate,
     ) !void {
-        const previous_verify = if (previous) |ref|
-            try std.fmt.allocPrint(
-                self.allocator,
-                "verify {s} {s}\n",
-                .{ ref.name, ref.oid },
-            )
-        else
-            try self.allocator.dupe(u8, "");
-        defer self.allocator.free(previous_verify);
+        var transaction: Io.Writer.Allocating = .init(self.allocator);
+        defer transaction.deinit();
+        const w = &transaction.writer;
 
-        const tip_change = if (previous) |ref|
-            try std.fmt.allocPrint(
-                self.allocator,
-                "update refs/stakrr/tip {s} {s}\n",
-                .{ oid, ref.oid },
-            )
-        else
-            try std.fmt.allocPrint(
-                self.allocator,
-                "create refs/stakrr/tip {s}\n",
-                .{oid},
-            );
-        defer self.allocator.free(tip_change);
-
-        const transaction = try std.fmt.allocPrint(
-            self.allocator,
-            "start\n" ++
-                "verify {s} {s}\n" ++
-                "verify {s} {s}\n" ++
-                "{s}" ++
-                "create {s} {s}\n" ++
-                "{s}" ++
-                "prepare\n" ++
-                "commit\n",
-            .{
-                base.name,
-                base.oid,
-                work.name,
-                work.oid,
-                previous_verify,
-                name,
-                oid,
-                tip_change,
+        try w.writeAll("start\n");
+        for (updates) |update| switch (update) {
+            .verify => |ref| {
+                try checkUpdate(ref.name, &.{ref.oid});
+                try w.print("verify {s} {s}\n", .{ ref.name, ref.oid });
             },
-        );
-        defer self.allocator.free(transaction);
+            .create => |ref| {
+                try checkUpdate(ref.name, &.{ref.oid});
+                try w.print("create {s} {s}\n", .{ ref.name, ref.oid });
+            },
+            .update => |ref| {
+                try checkUpdate(ref.name, &.{ ref.new, ref.old });
+                try w.print("update {s} {s} {s}\n", .{ ref.name, ref.new, ref.old });
+            },
+            .delete => |ref| {
+                try checkUpdate(ref.name, &.{ref.oid});
+                try w.print("delete {s} {s}\n", .{ ref.name, ref.oid });
+            },
+        };
+        try w.writeAll("prepare\ncommit\n");
 
+        try self.updateRefStdin(message, transaction.written());
+    }
+
+    fn checkUpdate(name: []const u8, oids: []const []const u8) Error!void {
+        if (!std.mem.startsWith(u8, name, "refs/")) return error.InvalidRefName;
+        for (name) |c| {
+            if (c <= ' ' or c == 0x7f) return error.InvalidRefName;
+        }
+        for (oids) |oid| {
+            if (!isOid(oid)) return error.InvalidOid;
+        }
+    }
+
+    fn updateRefStdin(self: *const Git, message: []const u8, transaction: []const u8) !void {
         var child = try std.process.spawn(self.io, .{
             .argv = &.{
                 "git",
                 "update-ref",
                 "--create-reflog",
                 "-m",
-                "stakrr: cut",
+                message,
                 "--stdin",
             },
             .cwd = self.childCwd(),
@@ -432,4 +431,45 @@ pub const Git = struct {
 
         if (!term.success()) return self.fail(stderr);
     }
+
+    /// atomically create a layer and advance the internal tip guard
+    /// verifies all observed refs and fails if the stack changed meanwhile
+    pub fn createLayerRef(
+        self: *const Git,
+        name: []const u8,
+        oid: []const u8,
+        base: ExpectedRef,
+        work: ExpectedRef,
+        previous: ?ExpectedRef,
+    ) !void {
+        var updates: [5]RefUpdate = undefined;
+        var count: usize = 0;
+
+        updates[count] = .{ .verify = base };
+        count += 1;
+        updates[count] = .{ .verify = work };
+        count += 1;
+
+        if (previous) |ref| {
+            updates[count] = .{ .verify = ref };
+            count += 1;
+        }
+
+        updates[count] = .{ .create = .{ .name = name, .oid = oid } };
+        count += 1;
+
+        updates[count] = if (previous) |ref|
+            .{ .update = .{ .name = tip_ref, .new = oid, .old = ref.oid } }
+        else
+            .{ .create = .{ .name = tip_ref, .oid = oid } };
+        count += 1;
+
+        try self.transact("stakrr: cut", updates[0..count]);
+    }
 };
+
+/// internal guard pointing at the highest layer
+pub const tip_ref = "refs/stakrr/tip";
+
+/// namespace for stakrr-managed layer branches
+pub const layer_prefix = "refs/heads/stakrr/";
