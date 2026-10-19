@@ -33,6 +33,25 @@ feature-p1 => feature-p2 => feature-p3 => HEAD
 | sk submit | publish review branches, excluding rolling work |
 | sk undo | restore previous stakrr operation |
 
+
+## cut
+after `stakrr init --base main`, keep committing to your rolling branch
+
+```sh
+stakrr cut feature-p1 --at HEAD~1  # create a layer at an earlier commit
+stakrr cut feature-p2              # cut at the rolling branch tip
+stakrr status
+```
+
+`cut` creates a `stakrr/<name>` branch at a commit boundary; it never changes
+`HEAD`, working files, the index, or existing layer branches. Each cut must
+advance beyond the previous boundary and be reachable from the rolling branch.
+
+`refs/stakrr/tip` is an internal concurrency guard. Do not manually edit or
+delete it. The first cut creates it; subsequent cuts compare-and-swap it in the
+same Git ref transaction as the new layer. Aborted cuts leave existing refs
+unchanged. This M1 implementation does not rewrite commits or extract hunks.
+
 ## why not just use `gh stack`?
 - it is slow
 - find myself building stacks as an afterthought instead of as I develop

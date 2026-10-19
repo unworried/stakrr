@@ -198,4 +198,97 @@ pub const Git = struct {
 
         return std.fmt.parseInt(usize, text, 10);
     }
+
+    pub const ExpectedRef = struct {
+        name: []const u8,
+        oid: []const u8,
+    };
+
+    /// atomically create a layer and advance the internal tip guard
+    /// verifies all observed refs and fails if the stack changed meanwhile
+    /// the passed names and oids must be trusted, validated git refs/commit ids
+    pub fn createLayerRef(
+        self: *const Git,
+        name: []const u8,
+        oid: []const u8,
+        base: ExpectedRef,
+        work: ExpectedRef,
+        previous: ?ExpectedRef,
+    ) !void {
+        const previous_verify = if (previous) |ref|
+            try std.fmt.allocPrint(
+                self.allocator,
+                "verify {s} {s}\n",
+                .{ ref.name, ref.oid },
+            )
+        else
+            try self.allocator.dupe(u8, "");
+        defer self.allocator.free(previous_verify);
+
+        const tip_change = if (previous) |ref|
+            try std.fmt.allocPrint(
+                self.allocator,
+                "update refs/stakrr/tip {s} {s}\n",
+                .{ oid, ref.oid },
+            )
+        else
+            try std.fmt.allocPrint(
+                self.allocator,
+                "create refs/stakrr/tip {s}\n",
+                .{oid},
+            );
+        defer self.allocator.free(tip_change);
+
+        const transaction = try std.fmt.allocPrint(
+            self.allocator,
+            "start\n" ++
+                "verify {s} {s}\n" ++
+                "verify {s} {s}\n" ++
+                "{s}" ++
+                "create {s} {s}\n" ++
+                "{s}" ++
+                "prepare\n" ++
+                "commit\n",
+            .{
+                base.name,
+                base.oid,
+                work.name,
+                work.oid,
+                previous_verify,
+                name,
+                oid,
+                tip_change,
+            },
+        );
+        defer self.allocator.free(transaction);
+
+        var child = try std.process.spawn(self.io, .{
+            .argv = &.{
+                "git",
+                "update-ref",
+                "--create-reflog",
+                "-m",
+                "stakrr: cut",
+                "--stdin",
+            },
+            .cwd = if (self.cwd) |dir|
+                .{ .dir = dir }
+            else
+                .inherit,
+            .stdin = .pipe,
+            .stdout = .ignore,
+            .stderr = .inherit,
+        });
+        errdefer {
+            if (child.stdin) |pipe| pipe.close(self.io);
+            child.kill(self.io);
+        }
+
+        try child.stdin.?.writeStreamingAll(self.io, transaction);
+        child.stdin.?.close(self.io);
+        child.stdin = null;
+
+        const term = try child.wait(self.io);
+        if (!term.success()) return error.GitFailed;
+    }
 };
