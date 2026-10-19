@@ -7,6 +7,9 @@ pub const Git = struct {
     io: Io,
     cwd: ?Io.Dir = null,
 
+    const stdout_limit = 16 * 1024 * 1024;
+    const stderr_limit = 64 * 1024;
+
     fn childCwd(self: *const Git) std.process.Child.Cwd {
         return if (self.cwd) |dir| .{ .dir = dir } else .inherit;
     }
@@ -26,8 +29,8 @@ pub const Git = struct {
         return std.process.run(self.allocator, self.io, .{
             .argv = argv,
             .cwd = self.childCwd(),
-            .stdout_limit = .limited(64 * 1024),
-            .stderr_limit = .limited(64 * 1024),
+            .stdout_limit = .limited(stdout_limit),
+            .stderr_limit = .limited(stderr_limit),
         });
     }
 
@@ -362,7 +365,7 @@ pub const Git = struct {
 
         const stderr = try stderr_reader.interface.allocRemaining(
             self.allocator,
-            .limited(64 * 1024),
+            .limited(stderr_limit),
         );
         defer self.allocator.free(stderr);
 
