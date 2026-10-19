@@ -127,11 +127,6 @@ pub fn initStack(
         state_key,
         state,
     });
-
-    std.log.info("initialised: {s} -> {s}", .{
-        base_ref,
-        work_ref,
-    });
 }
 
 pub fn loadConfig(git: *const Git) !Config {
