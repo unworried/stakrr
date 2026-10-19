@@ -342,6 +342,32 @@ test "ref transaction aborts if work changes after inspection" {
     try expectNoRef(&repo, "refs/stakrr/tip");
 }
 
+test "ref transaction aborts if the stack is reset after inspection" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+
+    const b = try repo.commit("B");
+    defer testing.allocator.free(b);
+
+    _ = try stack.reset(&repo.git, false);
+
+    try testing.expectError(
+        error.GitFailed,
+        repo.git.createLayerRef(
+            "refs/heads/stakrr/race",
+            b,
+            .{ .name = "refs/stakrr/anchor", .oid = base },
+            .{ .name = "refs/heads/work", .oid = b },
+            null,
+        ),
+    );
+
+    try expectNoRef(&repo, "refs/heads/stakrr/race");
+}
+
 test "ref transaction rejects two cuts from the same old tip" {
     var repo = try Repo.init();
     defer repo.deinit();

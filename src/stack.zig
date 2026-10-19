@@ -20,6 +20,7 @@ pub const Error = git_mod.Error || error{
     NotOnWorkBranch,
     InvalidLayerName,
     LayerExists,
+    LayerCheckedOut,
     EmptyCut,
     InvalidCutBoundary,
     CutOutsideWork,
@@ -426,4 +427,78 @@ pub fn cut(
         else
             null,
     );
+}
+
+pub const ResetResult = struct {
+    deleted_layers: usize,
+    kept_layers: usize,
+};
+
+/// Remove stakrr's state and internal refs so the stack can be
+/// re-initialised. Layer branches are kept unless `delete_layers` is set.
+/// Works on corrupt or outdated state, so it never parses the config.
+pub fn reset(git: *const Git, delete_layers: bool) !ResetResult {
+    const allocator = git.allocator;
+    try git.ensureWorkTree();
+
+    const raw_refs = try git.listStackRefs();
+    defer allocator.free(raw_refs);
+
+    var updates: std.ArrayList(Git.RefUpdate) = .empty;
+    defer updates.deinit(allocator);
+
+    const internal = [_][]const u8{ git_mod.tip_ref, git_mod.anchor_ref };
+    var internal_oids: [internal.len]?[]u8 = @splat(null);
+    defer for (internal_oids) |maybe| if (maybe) |oid| allocator.free(oid);
+
+    for (internal, &internal_oids) |ref_name, *slot| {
+        slot.* = try git.readRef(ref_name);
+        if (slot.*) |oid|
+            try updates.append(
+                allocator,
+                .{ .delete = .{ .name = ref_name, .oid = oid } },
+            );
+    }
+
+    var layer_count: usize = 0;
+    var lines = std.mem.splitScalar(u8, raw_refs, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        layer_count += 1;
+        if (!delete_layers) continue;
+
+        const separator = std.mem.indexOfScalar(u8, line, '\t') orelse
+            return error.InvalidGitOutput;
+        try updates.append(allocator, .{ .delete = .{
+            .name = line[0..separator],
+            .oid = line[separator + 1 ..],
+        } });
+    }
+
+    // deleting a checked-out branch would leave HEAD pointing nowhere
+    if (delete_layers and layer_count != 0) {
+        const head: ?[]u8 = git.currentBranch() catch |err| switch (err) {
+            error.DetachedHead => null,
+            else => return err,
+        };
+        defer if (head) |ref_name| allocator.free(ref_name);
+        if (head) |ref_name| {
+            if (std.mem.startsWith(u8, ref_name, git_mod.layer_prefix))
+                return error.LayerCheckedOut;
+        }
+    }
+
+    // refs first: if unsetting config fails, reset can simply be re-run
+    if (updates.items.len != 0)
+        try git.transact("stakrr: reset", updates.items);
+
+    const had_state = try git.configUnset(state_key);
+
+    if (!had_state and updates.items.len == 0 and layer_count == 0)
+        return error.NotInitialized;
+
+    return .{
+        .deleted_layers = if (delete_layers) layer_count else 0,
+        .kept_layers = if (delete_layers) 0 else layer_count,
+    };
 }

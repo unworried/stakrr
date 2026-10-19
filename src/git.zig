@@ -300,6 +300,20 @@ pub const Git = struct {
         return try self.allocator.dupe(u8, value);
     }
 
+    /// remove every value of a local config key; returns false if unset
+    pub fn configUnset(self: *const Git, key: []const u8) !bool {
+        const result = try self.run(&.{
+            "config", "--local", "--unset-all", key,
+        });
+        defer self.freeResult(result);
+
+        return switch (try exitCode(result)) {
+            0 => true,
+            5 => false,
+            else => self.fail(result.stderr),
+        };
+    }
+
     pub fn listStackRefs(self: *const Git) ![]u8 {
         return self.output(&.{
             "for-each-ref",
