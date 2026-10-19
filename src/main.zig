@@ -106,7 +106,7 @@ fn runCommand(
         .help => try printHelp(stdout),
         .init => |options| {
             try stack.initStack(git, options.base);
-            try stdout.writeAll("stack initialized\n");
+            try stdout.print("stack initialized on {s}\n", .{options.base});
         },
         .status => {
             var snapshot = try stack.inspect(git);
