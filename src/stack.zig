@@ -136,7 +136,7 @@ pub fn initStack(
         return error.BaseNotAncestor;
 
     // 6. reject merge commits
-    // FIXME: m1
+    // FIXME: m2
     if (try git.hasMergeCommits(base_oid, work_oid))
         return error.MergeCommitsUnsupported;
 
