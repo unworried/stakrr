@@ -14,6 +14,8 @@ pub const Command = union(enum) {
     status,
     cut: struct { name: []const u8, at: ?[]const u8 = null },
     reset: struct { delete_layers: bool = false },
+    up,
+    down,
 };
 
 pub const ParseError = error{ InvalidArguments, UnknownCommand };
@@ -108,6 +110,16 @@ pub fn parseArgs(args: []const []const u8) ParseError!Command {
         return error.InvalidArguments;
     }
 
+    if (eql(command, "up")) {
+        if (rest.len != 0) return error.InvalidArguments;
+        return .up;
+    }
+
+    if (eql(command, "down")) {
+        if (rest.len != 0) return error.InvalidArguments;
+        return .down;
+    }
+
     return error.UnknownCommand;
 }
 
@@ -140,7 +152,13 @@ fn runCommand(
             var snapshot = try stack.inspect(git);
             defer snapshot.deinit(git.allocator);
 
-            try printStatus(out, snapshot);
+            const current: ?[]u8 = git.currentBranch() catch |err| switch (err) {
+                error.DetachedHead => null,
+                else => return err,
+            };
+            defer if (current) |ref| git.allocator.free(ref);
+
+            try printStatus(out, snapshot, current);
         },
         .cut => |options| {
             try stack.cut(git, options.name, options.at);
@@ -163,6 +181,14 @@ fn runCommand(
                 });
                 try stdout.writeAll("; remove them or run 'stakrr reset --delete-layers' before re-initializing\n");
             }
+        },
+        .up => {
+            if (!try stack.navigate(git, .up))
+                try stdout.writeAll("already at top\n");
+        },
+        .down => {
+            if (!try stack.navigate(git, .down))
+                try stdout.writeAll("already at base\n");
         },
     }
 }
@@ -211,6 +237,8 @@ const help_commands = [_]struct { name: []const u8, args: []const u8, about: []c
     .{ .name = "status", .args = "", .about = "display layers and unstacked commits" },
     .{ .name = "cut", .args = "<name> [--at <rev>]", .about = "create the next layer" },
     .{ .name = "reset", .args = "[--delete-layers]", .about = "forget the stack so it can be re-initialized" },
+    .{ .name = "up", .args = "", .about = "switch toward rolling work" },
+    .{ .name = "down", .args = "", .about = "switch toward the base" },
     .{ .name = "version", .args = "", .about = "print the stakrr version" },
     .{ .name = "help", .args = "", .about = "show this message" },
 };
@@ -268,6 +296,7 @@ fn userError(err: anyerror) ?[]const u8 {
         error.StreamTooLong => "git output exceeded the size limit",
         error.FileNotFound => "git executable not found on PATH",
         error.OutOfMemory => "out of memory",
+        error.NotOnStackBranch => "current branch is outside the configured stack",
         else => null,
     };
 }
@@ -287,13 +316,19 @@ fn plural(n: usize, one: []const u8, many: []const u8) []const u8 {
 
 /// draw the stack top-down: rolling work, layers from highest to lowest,
 /// then the base they were cut from
-fn printStatus(out: Terminal, snapshot: stack.Snapshot) !void {
+/// Draw the stack top-down, marking the checked-out branch with ▸.
+fn printStatus(
+    out: Terminal,
+    snapshot: stack.Snapshot,
+    current: ?[]const u8,
+) !void {
     const w = out.writer;
     const base = shortRef(snapshot.config.base_ref);
     const work = shortRef(snapshot.config.work_ref);
 
     var width = @max(base.len, work.len);
-    for (snapshot.layers) |layer| width = @max(width, shortRef(layer.ref_name).len);
+    for (snapshot.layers) |layer|
+        width = @max(width, shortRef(layer.ref_name).len);
     width += 3;
 
     try term.styled(out, .dim, "stack", .{});
@@ -313,7 +348,10 @@ fn printStatus(out: Terminal, snapshot: stack.Snapshot) !void {
     }
 
     try w.writeAll("  ");
-    try term.styled(out, .accent, "▸ {s}", .{work});
+    try term.styled(out, .accent, "{s} {s}", .{
+        if (isCurrent(current, snapshot.config.work_ref)) "▸" else "│",
+        work,
+    });
     try w.splatByteAll(' ', width - work.len);
     try term.styled(out, .dim, "{d} unstacked", .{snapshot.unstacked_commits});
     try w.writeByte('\n');
@@ -323,8 +361,12 @@ fn printStatus(out: Terminal, snapshot: stack.Snapshot) !void {
         i -= 1;
         const layer = snapshot.layers[i];
         const name = shortRef(layer.ref_name);
+        const selected = isCurrent(current, layer.ref_name);
+
         try w.writeAll("  ");
-        try term.styled(out, .dim, "│", .{});
+        try term.styled(out, if (selected) .accent else .dim, "{s}", .{
+            if (selected) "▸" else "│",
+        });
         try w.print(" {s}", .{name});
         try w.splatByteAll(' ', width - name.len);
         try term.styled(out, .dim, "{d} {s}", .{
@@ -334,8 +376,12 @@ fn printStatus(out: Terminal, snapshot: stack.Snapshot) !void {
         try w.writeByte('\n');
     }
 
+    const base_selected = isCurrent(current, snapshot.config.base_ref);
+
     try w.writeAll("  ");
-    try term.styled(out, .dim, "└", .{});
+    try term.styled(out, if (base_selected) .accent else .dim, "{s}", .{
+        if (base_selected) "▸" else "└",
+    });
     try w.print(" {s}", .{base});
     try w.splatByteAll(' ', width - base.len);
     try term.styled(out, .dim, "base", .{});
@@ -345,6 +391,10 @@ fn printStatus(out: Terminal, snapshot: stack.Snapshot) !void {
         snapshot.layers.len,
         plural(snapshot.layers.len, "layer", "layers"),
     });
+}
+
+fn isCurrent(current: ?[]const u8, ref_name: []const u8) bool {
+    return if (current) |ref| eql(ref, ref_name) else false;
 }
 
 const testing = std.testing;
