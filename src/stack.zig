@@ -24,6 +24,7 @@ pub const Error = git_mod.Error || error{
     EmptyCut,
     InvalidCutBoundary,
     CutOutsideWork,
+    NotOnStackBranch,
 };
 
 /// git config key holding "<version> <base_ref> <work_ref>"
@@ -501,4 +502,37 @@ pub fn reset(git: *const Git, delete_layers: bool) !ResetResult {
         .deleted_layers = if (delete_layers) layer_count else 0,
         .kept_layers = if (delete_layers) 0 else layer_count,
     };
+}
+
+pub const Direction = enum { up, down };
+
+/// Navigation positions: base, ordered layers, rolling work.
+fn navigationRef(snapshot: *const Snapshot, index: usize) []const u8 {
+    if (index == 0) return snapshot.config.base_ref;
+    if (index == snapshot.layers.len + 1)
+        return snapshot.config.work_ref;
+    return snapshot.layers[index - 1].ref_name;
+}
+
+/// Returns false when already at the requested end of the stack.
+pub fn navigate(git: *const Git, direction: Direction) !bool {
+    var snapshot = try inspect(git);
+    defer snapshot.deinit(git.allocator);
+
+    const current = try git.currentBranch();
+    defer git.allocator.free(current);
+
+    const top = snapshot.layers.len + 1;
+    const index = for (0..(top + 1)) |i| {
+        if (std.mem.eql(u8, current, navigationRef(&snapshot, i)))
+            break i;
+    } else return error.NotOnStackBranch;
+
+    const target_index = switch (direction) {
+        .up => if (index == top) return false else index + 1,
+        .down => if (index == 0) return false else index - 1,
+    };
+
+    try git.switchBranch(navigationRef(&snapshot, target_index));
+    return true;
 }
