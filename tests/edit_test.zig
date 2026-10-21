@@ -753,7 +753,7 @@ test "continue and abort reject an inconsistent replay plan before changing Git 
     defer t.allocator.free(raw);
     var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, raw, .{});
     defer parsed.deinit();
-    parsed.value.object.getPtr("queue_len").?.integer += 1;
+    parsed.value.object.getPtr("plan_len").?.integer += 1;
     const invalid = try std.json.Stringify.valueAlloc(t.allocator, parsed.value, .{});
     defer t.allocator.free(invalid);
     const invalid_oid = try repo.git.writeBlob(invalid);
@@ -837,21 +837,21 @@ test "every checkpoint phase rejects inconsistent state before changing Git" {
         if (std.mem.eql(u8, phase, "switching")) {
             object.getPtr("destination").?.* = .{ .integer = 999 };
         } else if (std.mem.eql(u8, phase, "editing")) {
-            object.getPtr("queue_oid").?.* = .null;
-            object.getPtr("queue_len").?.* = .{ .integer = 0 };
+            object.getPtr("plan_oid").?.* = .null;
+            object.getPtr("plan_len").?.* = .{ .integer = 0 };
             // Finishing was requested; editing must instead target its active cut.
             object.getPtr("destination").?.* = .null;
         } else if (std.mem.eql(u8, phase, "detaching")) {
             object.getPtr("next").?.* = .{ .integer = 1 };
         } else if (std.mem.eql(u8, phase, "replay")) {
-            object.getPtr("queue_oid").?.* = .null;
-            object.getPtr("queue_len").?.* = .{ .integer = 0 };
+            object.getPtr("plan_oid").?.* = .null;
+            object.getPtr("plan_len").?.* = .{ .integer = 0 };
         } else if (std.mem.eql(u8, phase, "conflict")) {
-            object.getPtr("next").?.* = object.get("queue_len").?;
+            object.getPtr("next").?.* = object.get("plan_len").?;
         } else if (std.mem.eql(u8, phase, "publishing")) {
             object.getPtr("next").?.* = .{ .integer = 0 };
         } else if (std.mem.eql(u8, phase, "aborting")) {
-            object.getPtr("queue_oid").?.* = .null;
+            object.getPtr("plan_oid").?.* = .null;
         } else {
             object.getPtr("id").?.* = .{
                 .string = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -878,7 +878,7 @@ test "invalid replay plans are rejected before detach and before a clean abort" 
         var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, raw, .{});
         defer parsed.deinit();
         if (reverse) {
-            const oid = parsed.value.object.get("queue_oid").?.string;
+            const oid = parsed.value.object.get("plan_oid").?.string;
             const plan = try repo.git.output(&.{ "cat-file", "blob", oid });
             defer t.allocator.free(plan);
             var commits: std.ArrayList([]const u8) = .empty;
@@ -890,12 +890,12 @@ test "invalid replay plans are rejected before detach and before a clean abort" 
             defer t.allocator.free(reversed);
             const bad_plan = try repo.git.writeBlob(reversed);
             defer t.allocator.free(bad_plan);
-            parsed.value.object.getPtr("queue_oid").?.* = .{ .string = bad_plan };
+            parsed.value.object.getPtr("plan_oid").?.* = .{ .string = bad_plan };
             const invalid = try replaceCheckpoint(&repo, parsed.value);
             defer t.allocator.free(invalid);
             try expectInvalidCheckpointUnchanged(&repo, invalid);
         } else {
-            parsed.value.object.getPtr("queue_len").?.integer += 1;
+            parsed.value.object.getPtr("plan_len").?.integer += 1;
             const invalid = try replaceCheckpoint(&repo, parsed.value);
             defer t.allocator.free(invalid);
             try expectInvalidCheckpointUnchanged(&repo, invalid);
@@ -918,15 +918,15 @@ test "replay plans cannot omit a commit between cut boundaries" {
     var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, raw, .{});
     defer parsed.deinit();
     const object = &parsed.value.object;
-    const plan = try repo.git.outputRaw(&.{ "cat-file", "blob", object.get("queue_oid").?.string });
+    const plan = try repo.git.outputRaw(&.{ "cat-file", "blob", object.get("plan_oid").?.string });
     defer t.allocator.free(plan);
     // The first API commit is inside the cut; later commits still include
     // every cut boundary, so boundary-only validation would accept this plan.
     const first_newline = std.mem.indexOfScalar(u8, plan, '\n').?;
     const shortened = try repo.git.writeBlob(plan[first_newline + 1 ..]);
     defer t.allocator.free(shortened);
-    object.getPtr("queue_oid").?.* = .{ .string = shortened };
-    object.getPtr("queue_len").?.integer -= 1;
+    object.getPtr("plan_oid").?.* = .{ .string = shortened };
+    object.getPtr("plan_len").?.integer -= 1;
     const invalid = try replaceCheckpoint(&repo, parsed.value);
     defer t.allocator.free(invalid);
     try expectInvalidCheckpointUnchanged(&repo, invalid);
@@ -1004,9 +1004,9 @@ test "legacy v1 switching checkpoints may retain a completed replay plan" {
     try t.expectEqualStrings("switching", parsed.value.object.get("phase").?.string);
     // Older versions left this completed plan in the switching checkpoint,
     // even though its old boundary OIDs no longer match the published nodes.
-    for ([_][]const u8{ "queue_oid", "queue_len" }) |field|
+    for ([_][]const u8{ "plan_oid", "plan_len" }) |field|
         parsed.value.object.getPtr(field).?.* = original.value.object.get(field).?;
-    parsed.value.object.getPtr("next").?.* = original.value.object.get("queue_len").?;
+    parsed.value.object.getPtr("next").?.* = original.value.object.get("plan_len").?;
     const head = try repo.git.resolveCommit("HEAD");
     defer t.allocator.free(head);
     parsed.value.object.getPtr("before").?.* = .{ .string = head };

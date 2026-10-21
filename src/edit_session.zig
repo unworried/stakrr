@@ -124,14 +124,8 @@ pub const Loaded = struct {
     ignored_checked: bool = false,
 };
 
-// Keep the on-disk representation independent of runtime phase invariants.
-const WireNode = struct {
-    ref_name: []const u8,
-    original: []const u8,
-    oid: []const u8,
-    result: []const u8,
-};
-
+// Flatten the phase union so the on-disk representation is independent of
+// runtime phase invariants; `load` re-establishes them.
 const WireSession = struct {
     version: u8 = 1,
     id: []const u8,
@@ -139,25 +133,17 @@ const WireSession = struct {
     origin: []const u8,
     config: []const u8,
     anchor: []const u8,
-    nodes: []WireNode,
+    nodes: []Node,
     active: usize,
     destination: ?usize,
     phase: PhaseTag,
-    queue_oid: ?[]const u8 = null,
-    queue_len: usize = 0,
+    plan_oid: ?[]const u8 = null,
+    plan_len: usize = 0,
     next: usize = 0,
     before: []const u8,
 };
 
 pub fn encode(allocator: std.mem.Allocator, s: *const Session) ![]u8 {
-    const nodes = try allocator.alloc(WireNode, s.nodes.len);
-    defer allocator.free(nodes);
-    for (s.nodes, nodes) |node, *wire| wire.* = .{
-        .ref_name = node.ref_name,
-        .original = node.original_oid,
-        .oid = node.published_oid,
-        .result = node.pending_oid,
-    };
     const progress = s.replay();
     return std.json.Stringify.valueAlloc(allocator, WireSession{
         .id = s.id,
@@ -165,12 +151,12 @@ pub fn encode(allocator: std.mem.Allocator, s: *const Session) ![]u8 {
         .origin = s.origin,
         .config = s.config,
         .anchor = s.anchor,
-        .nodes = nodes,
+        .nodes = s.nodes,
         .active = s.active,
         .destination = if (s.phase == .editing) s.active else s.destination(),
         .phase = std.meta.activeTag(s.phase),
-        .queue_oid = if (progress) |p| p.plan_oid else null,
-        .queue_len = if (progress) |p| p.plan_len else 0,
+        .plan_oid = if (progress) |p| p.plan_oid else null,
+        .plan_len = if (progress) |p| p.plan_len else 0,
         .next = if (progress) |p| p.next else 0,
         .before = if (progress) |p| p.before else s.anchor,
     }, .{});
@@ -202,7 +188,7 @@ pub fn load(git: *const Git) !?Loaded {
         return error.InvalidEditSession;
     if (wire.nodes.len < 2 or wire.active >= wire.nodes.len - 1)
         return error.InvalidEditSession;
-    if (wire.next > wire.queue_len) return error.InvalidEditSession;
+    if (wire.next > wire.plan_len) return error.InvalidEditSession;
     if (wire.destination) |index| {
         if (index >= wire.nodes.len - 1) return error.InvalidEditSession;
     }
@@ -211,14 +197,14 @@ pub fn load(git: *const Git) !?Loaded {
     if (!std.mem.eql(u8, branches.work_ref, wire.nodes[wire.nodes.len - 1].ref_name))
         return error.InvalidEditSession;
 
-    const nodes = try git.allocator.alloc(Node, wire.nodes.len);
+    const nodes = wire.nodes;
     var names: std.StringHashMapUnmanaged(void) = .empty;
     defer names.deinit(git.allocator);
-    for (wire.nodes, nodes, 0..) |node, *runtime, i| {
+    for (nodes, 0..) |node, i| {
         if (!git_mod.isSafeBranchRef(node.ref_name)) return error.InvalidEditSession;
-        if (!validOid(node.original, oid.len) or
-            !validOid(node.oid, oid.len) or
-            !validOid(node.result, oid.len))
+        if (!validOid(node.original_oid, oid.len) or
+            !validOid(node.published_oid, oid.len) or
+            !validOid(node.pending_oid, oid.len))
             return error.InvalidEditSession;
         if (i < nodes.len - 1) {
             const name = layout.layerName(node.ref_name) orelse
@@ -227,25 +213,19 @@ pub fn load(git: *const Git) !?Loaded {
         }
         if ((try names.getOrPut(git.allocator, node.ref_name)).found_existing)
             return error.InvalidEditSession;
-        runtime.* = .{
-            .ref_name = node.ref_name,
-            .original_oid = node.original,
-            .published_oid = node.oid,
-            .pending_oid = node.result,
-        };
     }
 
     var progress: ?Replay = null;
-    if (wire.queue_oid) |plan| {
+    if (wire.plan_oid) |plan| {
         if (!validOid(plan, oid.len)) return error.InvalidEditSession;
         progress = .{
             .destination = wire.destination,
             .plan_oid = plan,
-            .plan_len = wire.queue_len,
+            .plan_len = wire.plan_len,
             .next = wire.next,
             .before = wire.before,
         };
-    } else if (wire.queue_len != 0 or wire.next != 0) return error.InvalidEditSession;
+    } else if (wire.plan_len != 0 or wire.next != 0) return error.InvalidEditSession;
 
     const phase: Phase = switch (wire.phase) {
         .switching => .{ .switching = wire.destination },
