@@ -2,6 +2,7 @@ const std = @import("std");
 const git_mod = @import("git.zig");
 const Git = git_mod.Git;
 const coordination = @import("coordination.zig");
+const layout = @import("layout.zig");
 
 /// Domain errors raised by stack operations. Every member needs a
 /// user-facing message in main.zig; a test there enforces it.
@@ -28,18 +29,12 @@ pub const Error = git_mod.Error || coordination.Error || error{
     NotOnStackBranch,
 };
 
-/// internal guard pointing at the highest layer
-pub const tip_ref = "refs/stakrr/tip";
-
-/// the stack's starting commit; also keeps it reachable for gc
-pub const anchor_ref = "refs/stakrr/anchor";
-
-/// namespace for stakrr-managed layer branches
-pub const layer_prefix = "refs/heads/stakrr/";
-
-/// git config key holding "<version> <base_ref> <work_ref>"
-pub const state_key = "stakrr.state";
-pub const state_version = "v1";
+// Aliases kept until callers move to `layout` directly.
+pub const tip_ref = layout.tip_ref;
+pub const anchor_ref = layout.anchor_ref;
+pub const layer_prefix = layout.layer_prefix;
+pub const state_key = layout.state_key;
+pub const state_version = layout.state_version;
 
 pub const Config = struct {
     base_ref: []const u8,
@@ -118,10 +113,10 @@ pub fn initStack(
     defer allocator.free(work_ref);
 
     // accept either a branch name or its full refs/heads/ ref
-    const base_ref = if (std.mem.startsWith(u8, base_name, "refs/heads/"))
+    const base_ref = if (std.mem.startsWith(u8, base_name, layout.branch_prefix))
         try allocator.dupe(u8, base_name)
     else
-        try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{base_name});
+        try std.fmt.allocPrint(allocator, layout.branch_prefix ++ "{s}", .{base_name});
     defer allocator.free(base_ref);
 
     // layer names live exclusively under refs/heads/stakrr/

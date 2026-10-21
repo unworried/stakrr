@@ -186,7 +186,7 @@ fn runCommand(
             }
             try stdout.writeByte('\n');
             if (request == .abort)
-                try stdout.writeAll("retained edits: git for-each-ref refs/stakrr/recovery/\n");
+                try stdout.writeAll("retained edits: git for-each-ref " ++ stakrr.layout.recovery_prefix ++ "\n");
         },
         .cut => |options| {
             try stack.cut(git, options.name, options.at);
@@ -418,14 +418,7 @@ fn printStackRow(out: Terminal, ref: []const u8, selected: bool, base: bool, wid
     if (width > name.len) try out.writer.splatByteAll(' ', width - name.len);
 }
 
-fn shortRef(ref_name: []const u8) []const u8 {
-    const prefix = "refs/heads/";
-
-    if (std.mem.startsWith(u8, ref_name, prefix))
-        return ref_name[prefix.len..];
-
-    return ref_name;
-}
+const shortRef = stakrr.layout.shortBranch;
 
 fn plural(n: usize, one: []const u8, many: []const u8) []const u8 {
     return if (n == 1) one else many;

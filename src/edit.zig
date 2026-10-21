@@ -6,6 +6,7 @@ const git_mod = @import("git.zig");
 const Git = git_mod.Git;
 const stack = @import("stack.zig");
 const coordination = @import("coordination.zig");
+const layout = @import("layout.zig");
 
 /// Domain errors raised by edit operations, including shared Git and guards.
 /// Every member has a user-facing message in main.zig.
@@ -151,7 +152,7 @@ fn begin(git: *const Git, name: []const u8) !Loaded {
         .id = "",
         .owner = try owner(git),
         .origin = origin,
-        .config = (try git.configGet(stack.state_key)).?,
+        .config = (try git.configGet(layout.state_key)).?,
         .anchor = try git.allocator.dupe(u8, snapshot.config.anchor_oid),
         .nodes = nodes,
         .active = 0,
@@ -174,7 +175,7 @@ fn begin(git: *const Git, name: []const u8) !Loaded {
     }
     try checks.append(git.allocator, .{
         .verify = .{
-            .name = stack.tip_ref,
+            .name = layout.tip_ref,
             .oid = s.topCut().published_oid,
         },
     });
@@ -389,7 +390,7 @@ fn publishResults(git: *const Git, loaded: *Loaded) !void {
     try changes.append(
         git.allocator,
         .{ .update = .{
-            .name = stack.tip_ref,
+            .name = layout.tip_ref,
             .new = s.topCut().published_oid,
             .old = old_tip,
         } },
@@ -415,7 +416,7 @@ fn switchDestination(git: *const Git, loaded: *Loaded) !void {
             "stakrr: finish edit",
             &.{
                 .{ .delete = .{
-                    .name = coordination.session_ref,
+                    .name = layout.session_ref,
                     .oid = loaded.oid,
                 } },
             },
@@ -468,7 +469,7 @@ fn abortSession(git: *const Git, loaded: *Loaded) !void {
         try changes.append(
             git.allocator,
             .{ .update = .{
-                .name = stack.tip_ref,
+                .name = layout.tip_ref,
                 .new = s.topCut().original_oid,
                 .old = old_tip,
             } },
@@ -482,7 +483,7 @@ fn abortSession(git: *const Git, loaded: *Loaded) !void {
         "stakrr: abort edit",
         &.{
             .{ .delete = .{
-                .name = coordination.session_ref,
+                .name = layout.session_ref,
                 .oid = loaded.oid,
             } },
         },
@@ -494,7 +495,7 @@ fn eql(a: []const u8, b: []const u8) bool {
 }
 
 fn recoveryName(git: *const Git, s: *const Session, oid: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(git.allocator, "refs/stakrr/recovery/{s}/{s}", .{ s.id, oid });
+    return std.fmt.allocPrint(git.allocator, layout.recovery_prefix ++ "{s}/{s}", .{ s.id, oid });
 }
 
 /// Retain every original boundary and every new edit/replay commit. The oid is
@@ -520,15 +521,15 @@ fn save(
         scratch_git.allocator,
         .{
             .verify = .{
-                .name = stack.anchor_ref,
+                .name = layout.anchor_ref,
                 .oid = s.anchor,
             },
         },
     );
     try updates.append(scratch_git.allocator, if (old) |previous|
-        .{ .update = .{ .name = coordination.session_ref, .new = oid, .old = previous } }
+        .{ .update = .{ .name = layout.session_ref, .new = oid, .old = previous } }
     else
-        .{ .create = .{ .name = coordination.session_ref, .oid = oid } });
+        .{ .create = .{ .name = layout.session_ref, .oid = oid } });
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     for (retain) |commit| {
         const entry = try seen.getOrPut(scratch_git.allocator, commit);
@@ -545,7 +546,8 @@ fn save(
 
 fn destination(s: *const Session, name: []const u8) !usize {
     for (s.nodes[0 .. s.nodes.len - 1], 0..) |node, i| {
-        if (eql(node.ref_name[stack.layer_prefix.len..], name)) return i;
+        const short = layout.layerName(node.ref_name) orelse continue;
+        if (eql(short, name)) return i;
     }
     return error.UnknownCut;
 }
@@ -566,21 +568,21 @@ fn available(git: *const Git, s: *const Session) !void {
 }
 
 fn checkRefs(git: *const Git, s: *const Session) !void {
-    const config = (try git.configGet(stack.state_key)) orelse
+    const config = (try git.configGet(layout.state_key)) orelse
         return error.EditStateChanged;
     if (!eql(config, s.config)) return error.EditStateChanged;
 
-    const anchor = (try git.readRef(stack.anchor_ref)) orelse
+    const anchor = (try git.readRef(layout.anchor_ref)) orelse
         return error.EditStateChanged;
     if (!eql(anchor, s.anchor)) return error.EditStateChanged;
 
-    const tip = (try git.readRef(stack.tip_ref)) orelse
+    const tip = (try git.readRef(layout.tip_ref)) orelse
         return error.EditStateChanged;
     if (!eql(tip, s.topCut().published_oid)) return error.EditStateChanged;
 
     var indexes: std.StringHashMapUnmanaged(usize) = .empty;
     for (s.nodes, 0..) |node, i| try indexes.put(git.allocator, node.ref_name, i);
-    const raw = try git.listRefs(stack.layer_prefix);
+    const raw = try git.listRefs(layout.layer_prefix);
     var lines = std.mem.tokenizeScalar(u8, raw, '\n');
     var count: usize = 0;
     while (lines.next()) |line| {

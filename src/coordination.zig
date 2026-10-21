@@ -1,8 +1,8 @@
 //! Coordination shared by every stakrr mutation, including linked worktrees.
 const std = @import("std");
 const Git = @import("git.zig").Git;
+const layout = @import("layout.zig");
 
-pub const session_ref = "refs/stakrr/edit";
 pub const Error = error{
     MutationInProgress,
     EditInProgress,
@@ -30,7 +30,7 @@ pub fn lock(git: *const Git) !std.Io.File {
 }
 
 pub fn requireNoSession(git: *const Git) !void {
-    if (try git.readRef(session_ref)) |oid| {
+    if (try git.readRef(layout.session_ref)) |oid| {
         git.allocator.free(oid);
         return error.EditInProgress;
     }

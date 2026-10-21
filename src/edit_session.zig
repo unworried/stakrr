@@ -4,7 +4,7 @@ const std = @import("std");
 const git_mod = @import("git.zig");
 const Git = git_mod.Git;
 const stack = @import("stack.zig");
-const coordination = @import("coordination.zig");
+const layout = @import("layout.zig");
 
 pub const Node = struct {
     ref_name: []const u8,
@@ -135,7 +135,7 @@ pub fn encode(allocator: std.mem.Allocator, s: *const Session) ![]u8 {
 }
 
 pub fn load(git: *const Git) !?Loaded {
-    const oid = (try git.readRef(coordination.session_ref)) orelse return null;
+    const oid = (try git.readRef(layout.session_ref)) orelse return null;
     const raw = git.outputRaw(&.{ "cat-file", "blob", oid }) catch |err| switch (err) {
         error.GitFailed => return error.InvalidEditSession,
         else => return err,
@@ -179,9 +179,9 @@ pub fn load(git: *const Git) !?Loaded {
             !validOid(node.result, oid.len))
             return error.InvalidEditSession;
         if (i < nodes.len - 1) {
-            if (!std.mem.startsWith(u8, node.ref_name, stack.layer_prefix) or
-                node.ref_name.len == stack.layer_prefix.len)
+            const name = layout.layerName(node.ref_name) orelse
                 return error.InvalidEditSession;
+            if (name.len == 0) return error.InvalidEditSession;
         }
         if ((try names.getOrPut(git.allocator, node.ref_name)).found_existing)
             return error.InvalidEditSession;

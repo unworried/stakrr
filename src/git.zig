@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const layout = @import("layout.zig");
 
 /// Domain errors raised by the Git wrapper. Allocation and process
 /// spawning errors are propagated separately.
@@ -47,7 +48,7 @@ pub fn isOid(text: []const u8) bool {
 /// update-ref protocol: must be under refs/heads/ and contain no whitespace
 /// or control characters. Git applies its full naming rules on use.
 pub fn isSafeBranchRef(text: []const u8) bool {
-    const prefix = "refs/heads/";
+    const prefix = layout.branch_prefix;
     if (!std.mem.startsWith(u8, text, prefix) or text.len == prefix.len)
         return false;
     for (text) |c| {
@@ -543,7 +544,7 @@ pub const Git = struct {
     pub fn switchBranch(self: *const Git, ref_name: []const u8) !void {
         if (!isSafeBranchRef(ref_name)) return error.InvalidRefName;
 
-        const branch = ref_name["refs/heads/".len..];
+        const branch = ref_name[layout.branch_prefix.len..];
 
         // Reject option-like names and Git's "-" previous-branch shorthand.
         if (branch[0] == '-') return error.InvalidRefName;
