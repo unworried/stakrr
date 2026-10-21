@@ -164,6 +164,35 @@ pub const Git = struct {
         if ((try exitCode(result)) != 0) return self.fail(result.stderr);
     }
 
+    /// For commands where exit status `absent` is an expected answer rather
+    /// than a failure. Returns owned, newline-trimmed stdout on success and
+    /// null on `absent`; any other status fails with diagnostics.
+    pub fn query(self: *const Git, args: []const []const u8, absent: u8) !?[]u8 {
+        const result = try self.run(args);
+        defer self.freeResult(result);
+        const code = try exitCode(result);
+        if (code == absent) return null;
+        if (code != 0) return self.fail(result.stderr);
+        return try self.allocator.dupe(u8, std.mem.trimEnd(u8, result.stdout, "\r\n"));
+    }
+
+    /// True on success, false on exit status `no`; any other status fails.
+    pub fn check(self: *const Git, args: []const []const u8, no: u8) !bool {
+        const result = try self.run(args);
+        defer self.freeResult(result);
+        const code = try exitCode(result);
+        if (code == no) return false;
+        if (code != 0) return self.fail(result.stderr);
+        return true;
+    }
+
+    /// A copy that allocates from `allocator`, e.g. a command arena.
+    pub fn withAllocator(self: *const Git, allocator: Allocator) Git {
+        var copy = self.*;
+        copy.allocator = allocator;
+        return copy;
+    }
+
     pub fn checkRefFormat(self: *const Git, ref_name: []const u8) !void {
         const result = try self.run(&.{ "check-ref-format", ref_name });
         defer self.freeResult(result);
@@ -172,22 +201,13 @@ pub const Git = struct {
 
     /// read the exact ref oid. a missing ref is distinct from a git failure
     pub fn readRef(self: *const Git, ref_name: []const u8) !?[]u8 {
-        const result = try self.run(&.{
+        return self.query(&.{
             "rev-parse",
             "--verify",
             "--quiet",
             "--end-of-options",
             ref_name,
-        });
-        defer self.freeResult(result);
-        return switch (try exitCode(result)) {
-            0 => try self.allocator.dupe(
-                u8,
-                std.mem.trimEnd(u8, result.stdout, "\r\n"),
-            ),
-            1 => null,
-            else => self.fail(result.stderr),
-        };
+        }, 1);
     }
 
     /// true if the range contains a merge commit (linear stacks only)
@@ -242,24 +262,15 @@ pub const Git = struct {
             return error.NotWorkingTree;
     }
 
-    /// returns the full current branch ref
-    /// example: refs/heads/work
+    /// the full current branch ref (e.g. refs/heads/work), or null when
+    /// HEAD is detached
+    pub fn head(self: *const Git) !?[]u8 {
+        return self.query(&.{ "symbolic-ref", "--quiet", "HEAD" }, 1);
+    }
+
+    /// like `head`, but a detached HEAD is an error
     pub fn currentBranch(self: *const Git) ![]u8 {
-        const result = try self.run(&.{
-            "symbolic-ref",
-            "--quiet",
-            "HEAD",
-        });
-        defer self.freeResult(result);
-
-        if ((try exitCode(result)) != 0)
-            return error.DetachedHead;
-
-        return self.allocator.dupe(u8, std.mem.trimEnd(
-            u8,
-            result.stdout,
-            "\r\n",
-        ));
+        return (try self.head()) orelse error.DetachedHead;
     }
 
     /// resolve a revision to an actual commit oid
@@ -285,65 +296,27 @@ pub const Git = struct {
         a: []const u8,
         b: []const u8,
     ) !bool {
-        const result = try self.run(&.{
-            "merge-base",
-            "--is-ancestor",
-            "--end-of-options",
-            a,
-            b,
-        });
-        defer self.freeResult(result);
-
-        return switch (try exitCode(result)) {
-            0 => true,
-            1 => false,
-            else => self.fail(result.stderr),
-        };
+        return self.check(&.{ "merge-base", "--is-ancestor", "--end-of-options", a, b }, 1);
     }
 
     pub fn configGet(
         self: *const Git,
         key: []const u8,
     ) !?[]u8 {
-        const result = try self.run(&.{
-            "config", "--local", "--get-all", key,
-        });
-        defer self.freeResult(result);
-
-        switch (try exitCode(result)) {
-            1 => return null,
-            0 => {},
-            else => return self.fail(result.stderr),
-        }
-
-        const value = std.mem.trimEnd(
-            u8,
-            result.stdout,
-            "\r\n",
-        );
+        const value = (try self.query(&.{ "config", "--local", "--get-all", key }, 1)) orelse
+            return null;
+        errdefer self.allocator.free(value);
 
         // stakrr expects exactly one config value
-        if (value.len == 0 or
-            std.mem.indexOfScalar(u8, value, '\n') != null)
-        {
+        if (value.len == 0 or std.mem.indexOfScalar(u8, value, '\n') != null)
             return error.InvalidGitConfig;
-        }
 
-        return try self.allocator.dupe(u8, value);
+        return value;
     }
 
     /// remove every value of a local config key; returns false if unset
     pub fn configUnset(self: *const Git, key: []const u8) !bool {
-        const result = try self.run(&.{
-            "config", "--local", "--unset-all", key,
-        });
-        defer self.freeResult(result);
-
-        return switch (try exitCode(result)) {
-            0 => true,
-            5 => false,
-            else => self.fail(result.stderr),
-        };
+        return self.check(&.{ "config", "--local", "--unset-all", key }, 5);
     }
 
     pub fn listRefs(self: *const Git, prefix: []const u8) ![]u8 {

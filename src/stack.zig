@@ -535,10 +535,7 @@ pub fn reset(git: *const Git, options: ResetOptions) !ResetResult {
             else => {},
         };
         try coordination.requireAvailable(git, refs);
-        const head: ?[]u8 = git.currentBranch() catch |err| switch (err) {
-            error.DetachedHead => null,
-            else => return err,
-        };
+        const head = try git.head();
         defer if (head) |ref_name| allocator.free(ref_name);
         if (head) |ref_name| {
             if (std.mem.startsWith(u8, ref_name, layout.layer_prefix))

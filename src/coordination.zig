@@ -37,10 +37,9 @@ pub fn requireNoSession(git: *const Git) !void {
 }
 
 pub fn requireClean(git: *const Git) !void {
-    const result = try git.run(&.{ "status", "--porcelain=v1", "-z", "--untracked-files=all" });
-    defer git.freeResult(result);
-    if (!result.term.success()) return error.GitFailed;
-    if (result.stdout.len != 0) return error.DirtyWorkTree;
+    const status = try git.outputRaw(&.{ "status", "--porcelain=v1", "-z", "--untracked-files=all" });
+    defer git.allocator.free(status);
+    if (status.len != 0) return error.DirtyWorkTree;
 }
 
 /// Worktree porcelain -z keeps paths containing spaces/newlines unambiguous.
@@ -49,10 +48,9 @@ pub fn requireClean(git: *const Git) !void {
 pub fn requireAvailable(git: *const Git, refs: []const []const u8) !void {
     const here = try git.path(&.{ "rev-parse", "--show-toplevel" });
     defer git.allocator.free(here);
-    const result = try git.run(&.{ "worktree", "list", "--porcelain", "-z" });
-    defer git.freeResult(result);
-    if (!result.term.success()) return error.GitFailed;
-    var fields = std.mem.splitScalar(u8, result.stdout, 0);
+    const worktrees = try git.outputRaw(&.{ "worktree", "list", "--porcelain", "-z" });
+    defer git.allocator.free(worktrees);
+    var fields = std.mem.splitScalar(u8, worktrees, 0);
     var own = false;
     while (fields.next()) |field| {
         if (std.mem.startsWith(u8, field, "worktree ")) {

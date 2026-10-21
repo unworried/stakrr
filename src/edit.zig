@@ -34,8 +34,8 @@ const Context = struct {
     git: Git,
 
     fn init(self: *Context, original: *const Git) void {
-        self.* = .{ .arena = .init(original.allocator), .git = original.* };
-        self.git.allocator = self.arena.allocator();
+        self.arena = .init(original.allocator);
+        self.git = original.withAllocator(self.arena.allocator());
     }
 
     fn deinit(self: *Context) void {
@@ -511,8 +511,7 @@ fn save(
     errdefer git.allocator.free(result);
     var scratch = std.heap.ArenaAllocator.init(git.allocator);
     defer scratch.deinit();
-    var scratch_git = git.*;
-    scratch_git.allocator = scratch.allocator();
+    const scratch_git = git.withAllocator(scratch.allocator());
     const raw = try checkpoint.encode(scratch_git.allocator, s);
     const oid = try scratch_git.writeBlobWithFormat(raw, s.objectFormat());
     var updates: std.ArrayList(Git.RefUpdate) = .empty;
@@ -612,19 +611,12 @@ fn checkNode(s: *const Session, index: usize, actual: []const u8) !void {
 }
 
 fn requireBranch(git: *const Git, ref: []const u8) !void {
-    const current = git.currentBranch() catch |err| switch (err) {
-        error.DetachedHead => return error.EditStateChanged,
-        else => return err,
-    };
+    const current = (try git.head()) orelse return error.EditStateChanged;
     if (!eql(current, ref)) return error.EditStateChanged;
 }
 
 fn requireDetached(git: *const Git) !void {
-    _ = git.currentBranch() catch |err| switch (err) {
-        error.DetachedHead => return,
-        else => return err,
-    };
-    return error.EditStateChanged;
+    if (try git.head() != null) return error.EditStateChanged;
 }
 
 fn detach(git: *const Git, oid: []const u8) !void {
@@ -655,8 +647,7 @@ fn requireNoIgnored(git: *const Git) !void {
 fn requireResolution(git: *const Git) !void {
     const unresolved = try git.output(&.{ "diff", "--name-only", "--diff-filter=U" });
     if (unresolved.len != 0) return error.ReplayConflict;
-    const diff = try git.run(&.{ "diff", "--quiet" });
-    if (!diff.term.success()) return error.DirtyWorkTree;
+    if (!try git.check(&.{ "diff", "--quiet" }, 1)) return error.DirtyWorkTree;
     const untracked = try git.output(
         &.{ "ls-files", "--others", "--exclude-standard", "--full-name", "--", ":/" },
     );
