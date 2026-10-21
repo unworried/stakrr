@@ -295,10 +295,10 @@ test "listRefs returns empty when the prefix has no refs" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const refs = try repo.git.listRefs("refs/heads/stakrr/");
-    defer testing.allocator.free(refs);
+    var refs = try repo.git.listRefs("refs/heads/stakrr/");
+    defer refs.deinit(testing.allocator);
 
-    try testing.expectEqualStrings("", refs);
+    try testing.expectEqual(@as(usize, 0), refs.refs.len);
 }
 
 test "listRefs finds only branches under the requested prefix" {
@@ -312,25 +312,14 @@ test "listRefs finds only branches under the requested prefix" {
     try repo.exec(&.{ "branch", "stakrr/second" });
     try repo.exec(&.{ "branch", "stakrr-other" });
 
-    const refs = try repo.git.listRefs("refs/heads/stakrr/");
-    defer testing.allocator.free(refs);
+    var refs = try repo.git.listRefs("refs/heads/stakrr/");
+    defer refs.deinit(testing.allocator);
 
-    const first = try std.fmt.allocPrint(
-        testing.allocator,
-        "refs/heads/stakrr/first\t{s}",
-        .{oid},
-    );
-    defer testing.allocator.free(first);
-
-    try testing.expect(std.mem.indexOf(u8, refs, first) != null);
-
-    try testing.expect(
-        std.mem.indexOf(u8, refs, "refs/heads/stakrr/second\t") != null,
-    );
-
-    try testing.expect(
-        std.mem.indexOf(u8, refs, "stakrr-other") == null,
-    );
+    try testing.expectEqual(@as(usize, 2), refs.refs.len);
+    try testing.expectEqualStrings("refs/heads/stakrr/first", refs.refs[0].name);
+    try testing.expectEqualStrings(oid, refs.refs[0].oid);
+    try testing.expectEqualStrings("refs/heads/stakrr/second", refs.refs[1].name);
+    try testing.expectEqualStrings(oid, refs.refs[1].oid);
 }
 
 test "countCommits counts a linear range" {

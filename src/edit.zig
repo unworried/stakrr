@@ -581,19 +581,14 @@ fn checkRefs(git: *const Git, s: *const Session) !void {
 
     var indexes: std.StringHashMapUnmanaged(usize) = .empty;
     for (s.nodes, 0..) |node, i| try indexes.put(git.allocator, node.ref_name, i);
-    const raw = try git.listRefs(layout.layer_prefix);
-    var lines = std.mem.tokenizeScalar(u8, raw, '\n');
-    var count: usize = 0;
-    while (lines.next()) |line| {
-        const tab = std.mem.indexOfScalar(u8, line, '\t') orelse
-            return error.InvalidGitOutput;
-        const index = indexes.get(line[0..tab]) orelse
+    const layers = (try git.listRefs(layout.layer_prefix)).refs;
+    for (layers) |ref| {
+        const index = indexes.get(ref.name) orelse
             return error.EditStateChanged;
         if (index == s.nodes.len - 1) return error.InvalidEditSession;
-        try checkNode(s, index, line[tab + 1 ..]);
-        count += 1;
+        try checkNode(s, index, ref.oid);
     }
-    if (count != s.nodes.len - 1) return error.EditStateChanged;
+    if (layers.len != s.nodes.len - 1) return error.EditStateChanged;
 
     const work = (try git.readRef(s.workNode().ref_name)) orelse
         return error.EditStateChanged;

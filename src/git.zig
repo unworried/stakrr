@@ -319,12 +319,38 @@ pub const Git = struct {
         return self.check(&.{ "config", "--local", "--unset-all", key }, 5);
     }
 
-    pub fn listRefs(self: *const Git, prefix: []const u8) ![]u8 {
-        return self.output(&.{
+    /// Refs under a prefix, in refname order. Names and oids borrow from
+    /// `raw`, which is kept for callers comparing whole listings.
+    pub const RefList = struct {
+        raw: []u8,
+        refs: []ExpectedRef,
+
+        pub fn deinit(self: *RefList, allocator: Allocator) void {
+            allocator.free(self.refs);
+            allocator.free(self.raw);
+            self.* = undefined;
+        }
+    };
+
+    pub fn listRefs(self: *const Git, prefix: []const u8) !RefList {
+        const raw = try self.output(&.{
             "for-each-ref",
             "--format=%(refname)%09%(objectname)",
             prefix,
         });
+        errdefer self.allocator.free(raw);
+
+        var refs: std.ArrayList(ExpectedRef) = .empty;
+        errdefer refs.deinit(self.allocator);
+        var lines = std.mem.tokenizeScalar(u8, raw, '\n');
+        while (lines.next()) |line| {
+            const tab = std.mem.indexOfScalar(u8, line, '\t') orelse
+                return error.InvalidGitOutput;
+            const oid = line[tab + 1 ..];
+            if (!isOid(oid)) return error.InvalidGitOutput;
+            try refs.append(self.allocator, .{ .name = line[0..tab], .oid = oid });
+        }
+        return .{ .raw = raw, .refs = try refs.toOwnedSlice(self.allocator) };
     }
 
     pub fn countCommits(self: *const Git, older: []const u8, newer: []const u8) !usize {

@@ -92,9 +92,9 @@ pub fn initStack(
     }
 
     // reserve stakrr's branch namespace and internal refs for managed layers
-    const existing_layers = try git.listRefs(layout.layer_prefix);
-    defer allocator.free(existing_layers);
-    if (existing_layers.len != 0) return error.ExistingStackRefs;
+    var existing_layers = try git.listRefs(layout.layer_prefix);
+    defer existing_layers.deinit(allocator);
+    if (existing_layers.refs.len != 0) return error.ExistingStackRefs;
     for ([_][]const u8{ layout.tip_ref, layout.anchor_ref }) |ref_name| {
         const existing = try git.readRef(ref_name);
         defer if (existing) |oid| allocator.free(oid);
@@ -263,35 +263,21 @@ pub fn inspect(git: *const Git) !Snapshot {
     }
 
     // discover branches owned by stakrr
-    const raw_refs = try git.listRefs(layout.layer_prefix);
-    errdefer allocator.free(raw_refs);
+    const listed = try git.listRefs(layout.layer_prefix);
+    defer allocator.free(listed.refs);
+    errdefer allocator.free(listed.raw);
 
     var layers: std.ArrayList(Boundary) = .empty;
     defer layers.deinit(allocator);
-    var lines = std.mem.splitScalar(u8, raw_refs, '\n');
 
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-
-        const separator = std.mem.indexOfScalar(
-            u8,
-            line,
-            '\t',
-        ) orelse return error.InvalidGitOutput;
-
-        const ref_name = line[0..separator];
-        const oid = line[separator + 1 ..];
-
-        if (oid.len == 0)
-            return error.InvalidGitOutput;
-
+    for (listed.refs) |ref| {
         // every layer must sit on the chain between the anchor and work
-        const depth = depths.get(oid) orelse
+        const depth = depths.get(ref.oid) orelse
             return error.InvalidStack;
 
         try layers.append(allocator, .{
-            .ref_name = ref_name,
-            .oid = oid,
+            .ref_name = ref.name,
+            .oid = ref.oid,
             .depth = depth,
         });
     }
@@ -344,7 +330,7 @@ pub fn inspect(git: *const Git) !Snapshot {
             base_oid,
             config.anchor_oid,
         ),
-        ._refs_storage = raw_refs,
+        ._refs_storage = listed.raw,
     };
 }
 
@@ -488,8 +474,8 @@ pub fn reset(git: *const Git, options: ResetOptions) !ResetResult {
     try coordination.requireNoSession(git);
     const allocator = git.allocator;
 
-    const raw_refs = try git.listRefs(layout.layer_prefix);
-    defer allocator.free(raw_refs);
+    var layers = try git.listRefs(layout.layer_prefix);
+    defer layers.deinit(allocator);
 
     var updates: std.ArrayList(Git.RefUpdate) = .empty;
     defer updates.deinit(allocator);
@@ -507,34 +493,17 @@ pub fn reset(git: *const Git, options: ResetOptions) !ResetResult {
             );
     }
 
-    var layer_count: usize = 0;
-    var lines = std.mem.splitScalar(u8, raw_refs, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        layer_count += 1;
-        if (!delete_layers) continue;
-
-        const separator = std.mem.indexOfScalar(u8, line, '\t') orelse
-            return error.InvalidGitOutput;
-        try updates.append(allocator, .{ .delete = .{
-            .name = line[0..separator],
-            .oid = line[separator + 1 ..],
-        } });
-    }
+    const layer_count = layers.refs.len;
+    if (delete_layers) for (layers.refs) |ref| {
+        try updates.append(allocator, .{ .delete = ref });
+    };
 
     // deleting a checked-out branch would leave HEAD pointing nowhere
     if (delete_layers and layer_count != 0) {
-        const refs = try allocator.alloc([]const u8, layer_count);
-        defer allocator.free(refs);
-        var index: usize = 0;
-        for (updates.items) |update| switch (update) {
-            .delete => |ref| if (std.mem.startsWith(u8, ref.name, layout.layer_prefix)) {
-                refs[index] = ref.name;
-                index += 1;
-            },
-            else => {},
-        };
-        try coordination.requireAvailable(git, refs);
+        const names = try allocator.alloc([]const u8, layer_count);
+        defer allocator.free(names);
+        for (layers.refs, names) |ref, *name| name.* = ref.name;
+        try coordination.requireAvailable(git, names);
         const head = try git.head();
         defer if (head) |ref_name| allocator.free(ref_name);
         if (head) |ref_name| {
