@@ -49,8 +49,14 @@ pub fn isOid(text: []const u8) bool {
 /// or control characters. Git applies its full naming rules on use.
 pub fn isSafeBranchRef(text: []const u8) bool {
     const prefix = layout.branch_prefix;
-    if (!std.mem.startsWith(u8, text, prefix) or text.len == prefix.len)
-        return false;
+    return std.mem.startsWith(u8, text, prefix) and
+        text.len != prefix.len and
+        isProtocolSafe(text);
+}
+
+/// No whitespace or control bytes, which would split argv words or
+/// update-ref stdin lines.
+fn isProtocolSafe(text: []const u8) bool {
     for (text) |c| {
         if (c <= ' ' or c == 0x7f) return false;
     }
@@ -72,17 +78,22 @@ pub const Git = struct {
         return if (self.cwd) |dir| .{ .dir = dir } else .inherit;
     }
 
+    /// `git` followed by `args`; the caller frees the slice, not its items
+    fn argvFor(self: *const Git, args: []const []const u8) ![]const []const u8 {
+        const argv = try self.allocator.alloc([]const u8, args.len + 1);
+        argv[0] = "git";
+        @memcpy(argv[1..], args);
+        return argv;
+    }
+
     /// execute git and return its raw result
     /// the caller owns stdout and stderr
     pub fn run(
         self: *const Git,
         args: []const []const u8,
     ) !std.process.RunResult {
-        const argv = try self.allocator.alloc([]const u8, args.len + 1);
+        const argv = try self.argvFor(args);
         defer self.allocator.free(argv);
-
-        argv[0] = "git";
-        @memcpy(argv[1..], args);
 
         return std.process.run(self.allocator, self.io, .{
             .argv = argv,
@@ -420,10 +431,8 @@ pub const Git = struct {
     }
 
     fn checkUpdate(name: []const u8, oids: []const []const u8) Error!void {
-        if (!std.mem.startsWith(u8, name, "refs/")) return error.InvalidRefName;
-        for (name) |c| {
-            if (c <= ' ' or c == 0x7f) return error.InvalidRefName;
-        }
+        if (!std.mem.startsWith(u8, name, "refs/") or !isProtocolSafe(name))
+            return error.InvalidRefName;
         for (oids) |oid| {
             if (!isOid(oid)) return error.InvalidOid;
         }
@@ -447,10 +456,8 @@ pub const Git = struct {
         args: []const []const u8,
         data: []const u8,
     ) !void {
-        const argv = try self.allocator.alloc([]const u8, args.len + 1);
+        const argv = try self.argvFor(args);
         defer self.allocator.free(argv);
-        argv[0] = "git";
-        @memcpy(argv[1..], args);
         var child = try std.process.spawn(self.io, .{
             .argv = argv,
             .cwd = self.childCwd(),
