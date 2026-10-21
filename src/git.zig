@@ -554,3 +554,48 @@ pub const Git = struct {
         });
     }
 };
+
+const testing = std.testing;
+
+test "isOid accepts only full lowercase sha1/sha256 ids" {
+    const sha1: [40]u8 = @splat('a');
+    const sha256: [64]u8 = @splat('f');
+    const upper: [40]u8 = @splat('A');
+    const option: [40]u8 = ("--output=x" ++ @as([30]u8, @splat('a'))).*;
+
+    try testing.expect(isOid(&sha1));
+    try testing.expect(isOid(&sha256));
+    try testing.expect(!isOid("abc"));
+    try testing.expect(!isOid(&upper));
+    try testing.expect(!isOid(&option));
+}
+
+test "isSafeBranchRef rejects options and protocol injection" {
+    try testing.expect(isSafeBranchRef("refs/heads/main"));
+    try testing.expect(isSafeBranchRef("refs/heads/stakrr/p1"));
+    try testing.expect(!isSafeBranchRef("refs/heads/"));
+    try testing.expect(!isSafeBranchRef("refs/tags/v1"));
+    try testing.expect(!isSafeBranchRef("--output=x"));
+    try testing.expect(!isSafeBranchRef("refs/heads/a\nverify x"));
+    try testing.expect(!isSafeBranchRef("refs/heads/a b"));
+    try testing.expect(!isSafeBranchRef("refs/heads/a\tb"));
+    try testing.expect(!isSafeBranchRef("refs/heads/a\x00b"));
+    try testing.expect(!isSafeBranchRef("refs/heads/a\x7fb"));
+}
+
+test "checkUpdate guards every name and oid written to update-ref" {
+    const oid: [40]u8 = @splat('a');
+    try Git.checkUpdate("refs/stakrr/tip", &.{&oid});
+    try Git.checkUpdate("refs/heads/main", &.{ &oid, &oid });
+    for ([_][]const u8{
+        "heads/main",
+        "-refs/heads/main",
+        "refs/heads/a b",
+        "refs/heads/a\nverify x",
+        "refs/heads/a\x00",
+        "refs/heads/a\x7f",
+    }) |name| {
+        try testing.expectError(error.InvalidRefName, Git.checkUpdate(name, &.{&oid}));
+    }
+    try testing.expectError(error.InvalidOid, Git.checkUpdate("refs/x", &.{ &oid, "HEAD" }));
+}
