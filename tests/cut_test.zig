@@ -1,4 +1,5 @@
 const std = @import("std");
+const layout = @import("stakrr").layout;
 const testing = std.testing;
 const stack = @import("stakrr").stack;
 const Git = @import("stakrr").git.Git;
@@ -47,7 +48,7 @@ test "cut at HEAD creates the first layer without moving work" {
     try expectRef(&repo, "refs/heads/main", base);
     try expectRef(&repo, "refs/heads/work", b);
     try expectRef(&repo, "refs/heads/stakrr/p1", b);
-    try expectRef(&repo, "refs/stakrr/tip", b);
+    try expectRef(&repo, layout.tip_ref, b);
 
     const head = try repo.git.currentBranch();
     defer testing.allocator.free(head);
@@ -107,7 +108,7 @@ test "two sequential cuts create ordered boundaries" {
 
     try expectRef(&repo, "refs/heads/stakrr/p1", c);
     try expectRef(&repo, "refs/heads/stakrr/p2", d);
-    try expectRef(&repo, "refs/stakrr/tip", d);
+    try expectRef(&repo, layout.tip_ref, d);
     try expectRef(&repo, "refs/heads/main", base);
     try expectRef(&repo, "refs/heads/work", d);
 
@@ -219,7 +220,7 @@ test "cut rejects duplicate or invalid layer names" {
     );
 
     try expectRef(&repo, "refs/heads/stakrr/p1", b);
-    try expectRef(&repo, "refs/stakrr/tip", b);
+    try expectRef(&repo, layout.tip_ref, b);
 
     try testing.expectError(
         error.InvalidLayerName,
@@ -331,13 +332,13 @@ test "ref transaction aborts if work changes after inspection" {
         error.GitFailed,
         stack.createLayerRef(&repo.git, .{
             .layer = .{ .name = "refs/heads/stakrr/race", .oid = b },
-            .anchor = .{ .name = "refs/stakrr/anchor", .oid = base },
+            .anchor = .{ .name = layout.anchor_ref, .oid = base },
             .work = .{ .name = "refs/heads/work", .oid = b },
         }),
     );
 
     try expectNoRef(&repo, "refs/heads/stakrr/race");
-    try expectNoRef(&repo, "refs/stakrr/tip");
+    try expectNoRef(&repo, layout.tip_ref);
 }
 
 test "ref transaction aborts if the stack is reset after inspection" {
@@ -356,7 +357,7 @@ test "ref transaction aborts if the stack is reset after inspection" {
         error.GitFailed,
         stack.createLayerRef(&repo.git, .{
             .layer = .{ .name = "refs/heads/stakrr/race", .oid = b },
-            .anchor = .{ .name = "refs/stakrr/anchor", .oid = base },
+            .anchor = .{ .name = layout.anchor_ref, .oid = base },
             .work = .{ .name = "refs/heads/work", .oid = b },
         }),
     );
@@ -378,7 +379,7 @@ test "ref transaction rejects two cuts from the same old tip" {
     defer testing.allocator.free(c);
 
     const expected_base = Git.ExpectedRef{
-        .name = "refs/stakrr/anchor",
+        .name = layout.anchor_ref,
         .oid = base,
     };
 
@@ -404,7 +405,7 @@ test "ref transaction rejects two cuts from the same old tip" {
 
     try expectNoRef(&repo, "refs/heads/stakrr/second");
     try expectRef(&repo, "refs/heads/stakrr/first", b);
-    try expectRef(&repo, "refs/stakrr/tip", b);
+    try expectRef(&repo, layout.tip_ref, b);
 }
 
 test "cut rejects a side branch outside the rolling history" {
@@ -430,5 +431,5 @@ test "cut rejects a side branch outside the rolling history" {
     );
 
     try expectNoRef(&repo, "refs/heads/stakrr/outside");
-    try expectNoRef(&repo, "refs/stakrr/tip");
+    try expectNoRef(&repo, layout.tip_ref);
 }

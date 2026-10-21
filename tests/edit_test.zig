@@ -1,4 +1,5 @@
 const std = @import("std");
+const layout = @import("stakrr").layout;
 const t = std.testing;
 const stakrr = @import("stakrr");
 const stack = stakrr.stack;
@@ -39,13 +40,13 @@ fn refEquals(repo: *const Repo, ref: []const u8, expected: []const u8) !void {
     try outputEquals(repo, &.{ "rev-parse", ref }, expected);
 }
 fn noSession(repo: *const Repo) !void {
-    const session = try repo.git.readRef("refs/stakrr/edit");
+    const session = try repo.git.readRef(layout.session_ref);
     defer if (session) |oid| t.allocator.free(oid);
     try t.expect(session == null);
 }
 fn expectRecoverable(repo: *const Repo, oid: []const u8) !void {
     const refs = try repo.git.output(
-        &.{ "for-each-ref", "--format=%(objectname)", "refs/stakrr/recovery/" },
+        &.{ "for-each-ref", "--format=%(objectname)", layout.recovery_prefix },
     );
     defer t.allocator.free(refs);
     try t.expect(std.mem.indexOf(u8, refs, oid) != null);
@@ -267,7 +268,7 @@ test "external changes to nonactive refs and invalid edited histories are reject
     try edit.run(&repo.git, .{ .jump = "models" });
     try repo.exec(&.{ "branch", "-f", "stakrr/api", "main" });
     try t.expectError(error.EditStateChanged, edit.run(&repo.git, .{ .jump = null }));
-    try repo.exec(&.{ "branch", "-f", "stakrr/api", "refs/stakrr/tip" });
+    try repo.exec(&.{ "branch", "-f", "stakrr/api", layout.tip_ref });
     try repo.exec(&.{ "reset", "--hard", "main" });
     try t.expectError(error.InvalidEditedHistory, edit.run(&repo.git, .{ .jump = null }));
     try edit.run(&repo.git, .abort);
@@ -357,7 +358,7 @@ test "editing a top cut also moves coincident rolling work and returns to a laye
     defer t.allocator.free(amended);
     try edit.run(&repo.git, .{ .jump = null });
     try refEquals(&repo, "work", amended);
-    try refEquals(&repo, "refs/stakrr/tip", amended);
+    try refEquals(&repo, layout.tip_ref, amended);
     try outputEquals(&repo, &.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
     var snapshot = try stack.inspect(&repo.git);
     defer snapshot.deinit(t.allocator);
@@ -696,7 +697,7 @@ test "session validation rejects extra layers and corrupt checkpoints" {
     try edit.run(&repo.git, .abort);
     const bad = try repo.git.writeBlob("{}");
     defer t.allocator.free(bad);
-    try repo.exec(&.{ "update-ref", "refs/stakrr/edit", bad });
+    try repo.exec(&.{ "update-ref", layout.session_ref, bad });
     try t.expectError(error.InvalidEditSession, edit.run(&repo.git, .abort));
     try t.expectError(error.EditInProgress, stack.reset(&repo.git, .{ .delete_layers = true }));
 }
@@ -746,7 +747,7 @@ test "continue and abort reject an inconsistent replay plan before changing Git 
     try repo.exec(&.{ "checkout", "--ours", "shared" });
     try repo.exec(&.{ "add", "shared" });
 
-    const checkpoint = (try repo.git.readRef("refs/stakrr/edit")).?;
+    const checkpoint = (try repo.git.readRef(layout.session_ref)).?;
     defer t.allocator.free(checkpoint);
     const raw = try repo.git.output(&.{ "cat-file", "blob", checkpoint });
     defer t.allocator.free(raw);
@@ -757,7 +758,7 @@ test "continue and abort reject an inconsistent replay plan before changing Git 
     defer t.allocator.free(invalid);
     const invalid_oid = try repo.git.writeBlob(invalid);
     defer t.allocator.free(invalid_oid);
-    try repo.exec(&.{ "update-ref", "refs/stakrr/edit", invalid_oid });
+    try repo.exec(&.{ "update-ref", layout.session_ref, invalid_oid });
 
     const head = try repo.git.resolveCommit("HEAD");
     defer t.allocator.free(head);
@@ -767,9 +768,9 @@ test "continue and abort reject an inconsistent replay plan before changing Git 
         try t.expectError(error.InvalidEditSession, edit.run(&repo.git, request));
         try refEquals(&repo, "HEAD", head);
         try refEquals(&repo, "CHERRY_PICK_HEAD", picking);
-        try refEquals(&repo, "refs/stakrr/edit", invalid_oid);
+        try refEquals(&repo, layout.session_ref, invalid_oid);
     }
-    try repo.exec(&.{ "update-ref", "refs/stakrr/edit", checkpoint });
+    try repo.exec(&.{ "update-ref", layout.session_ref, checkpoint });
     try edit.run(&repo.git, .abort);
     try noSession(&repo);
 }
@@ -779,7 +780,7 @@ fn replaceCheckpoint(repo: *const Repo, value: std.json.Value) ![]u8 {
     defer t.allocator.free(raw);
     const oid = try repo.git.writeBlob(raw);
     errdefer t.allocator.free(oid);
-    try repo.exec(&.{ "update-ref", "refs/stakrr/edit", oid });
+    try repo.exec(&.{ "update-ref", layout.session_ref, oid });
     return oid;
 }
 
@@ -805,7 +806,7 @@ fn expectInvalidCheckpointUnchanged(repo: *const Repo, oid: []const u8) !void {
         try outputEquals(repo, &.{"show-ref"}, refs);
         try outputEquals(repo, &.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
         try outputEquals(repo, &.{ "status", "--porcelain=v1" }, "");
-        try refEquals(repo, "refs/stakrr/edit", oid);
+        try refEquals(repo, layout.session_ref, oid);
         try outputEquals(repo, &.{ "show", "HEAD:model" }, "corrected");
     }
 }
@@ -814,7 +815,7 @@ test "every checkpoint phase rejects inconsistent state before changing Git" {
     var repo = try Repo.init();
     defer repo.deinit();
     try pausedBeforeDetach(&repo);
-    const checkpoint = (try repo.git.readRef("refs/stakrr/edit")).?;
+    const checkpoint = (try repo.git.readRef(layout.session_ref)).?;
     defer t.allocator.free(checkpoint);
     const raw = try repo.git.outputRaw(&.{ "cat-file", "blob", checkpoint });
     defer t.allocator.free(raw);
@@ -860,7 +861,7 @@ test "every checkpoint phase rejects inconsistent state before changing Git" {
         defer t.allocator.free(invalid);
         try expectInvalidCheckpointUnchanged(&repo, invalid);
     }
-    try repo.exec(&.{ "update-ref", "refs/stakrr/edit", checkpoint });
+    try repo.exec(&.{ "update-ref", layout.session_ref, checkpoint });
     try edit.run(&repo.git, .abort);
     try noSession(&repo);
 }
@@ -869,7 +870,7 @@ test "invalid replay plans are rejected before detach and before a clean abort" 
     var repo = try Repo.init();
     defer repo.deinit();
     try pausedBeforeDetach(&repo);
-    const checkpoint = (try repo.git.readRef("refs/stakrr/edit")).?;
+    const checkpoint = (try repo.git.readRef(layout.session_ref)).?;
     defer t.allocator.free(checkpoint);
     const raw = try repo.git.outputRaw(&.{ "cat-file", "blob", checkpoint });
     defer t.allocator.free(raw);
@@ -900,7 +901,7 @@ test "invalid replay plans are rejected before detach and before a clean abort" 
             try expectInvalidCheckpointUnchanged(&repo, invalid);
         }
     }
-    try repo.exec(&.{ "update-ref", "refs/stakrr/edit", checkpoint });
+    try repo.exec(&.{ "update-ref", layout.session_ref, checkpoint });
     try edit.run(&repo.git, .continue_edit);
     try valid(&repo);
     try noSession(&repo);
@@ -910,7 +911,7 @@ test "replay plans cannot omit a commit between cut boundaries" {
     var repo = try Repo.init();
     defer repo.deinit();
     try pausedBeforeDetach(&repo);
-    const checkpoint = (try repo.git.readRef("refs/stakrr/edit")).?;
+    const checkpoint = (try repo.git.readRef(layout.session_ref)).?;
     defer t.allocator.free(checkpoint);
     const raw = try repo.git.outputRaw(&.{ "cat-file", "blob", checkpoint });
     defer t.allocator.free(raw);
@@ -929,7 +930,7 @@ test "replay plans cannot omit a commit between cut boundaries" {
     const invalid = try replaceCheckpoint(&repo, parsed.value);
     defer t.allocator.free(invalid);
     try expectInvalidCheckpointUnchanged(&repo, invalid);
-    try repo.exec(&.{ "update-ref", "refs/stakrr/edit", checkpoint });
+    try repo.exec(&.{ "update-ref", layout.session_ref, checkpoint });
     try edit.run(&repo.git, .continue_edit);
     try valid(&repo);
     try noSession(&repo);
@@ -987,7 +988,7 @@ test "legacy v1 switching checkpoints may retain a completed replay plan" {
     var repo = try Repo.init();
     defer repo.deinit();
     try pausedBeforeDetach(&repo);
-    const before = try repo.git.outputRaw(&.{ "cat-file", "blob", "refs/stakrr/edit" });
+    const before = try repo.git.outputRaw(&.{ "cat-file", "blob", layout.session_ref });
     defer t.allocator.free(before);
     var original = try std.json.parseFromSlice(std.json.Value, t.allocator, before, .{});
     defer original.deinit();
@@ -996,7 +997,7 @@ test "legacy v1 switching checkpoints may retain a completed replay plan" {
     defer repo.git.freeResult(stopped);
     try t.expect(!stopped.term.success());
     _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
-    const raw = try repo.git.outputRaw(&.{ "cat-file", "blob", "refs/stakrr/edit" });
+    const raw = try repo.git.outputRaw(&.{ "cat-file", "blob", layout.session_ref });
     defer t.allocator.free(raw);
     var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, raw, .{});
     defer parsed.deinit();
@@ -1022,7 +1023,7 @@ test "a non-blob edit checkpoint reports invalid session without changing refs" 
     try setup(&repo);
     const commit_oid = try repo.git.resolveCommit("HEAD");
     defer t.allocator.free(commit_oid);
-    try repo.exec(&.{ "update-ref", "refs/stakrr/edit", commit_oid });
+    try repo.exec(&.{ "update-ref", layout.session_ref, commit_oid });
     const refs = try repo.git.output(&.{"show-ref"});
     defer t.allocator.free(refs);
     try t.expectError(error.InvalidEditSession, edit.readStatus(&repo.git));

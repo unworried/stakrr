@@ -1,4 +1,5 @@
 const std = @import("std");
+const layout = @import("stakrr").layout;
 const testing = std.testing;
 const stack = @import("stakrr").stack;
 const Repo = @import("support/repo.zig").Repo;
@@ -47,8 +48,8 @@ test "reset keeps layers by default and blocks re-init until they go" {
     try testing.expectEqual(@as(usize, 0), result.deleted_layers);
 
     try testing.expect(try refExists(&repo, "refs/heads/stakrr/p1"));
-    try testing.expect(!try refExists(&repo, "refs/stakrr/tip"));
-    try testing.expect(!try refExists(&repo, "refs/stakrr/anchor"));
+    try testing.expect(!try refExists(&repo, layout.tip_ref));
+    try testing.expect(!try refExists(&repo, layout.anchor_ref));
 
     try testing.expectError(
         error.NotInitialized,
@@ -124,7 +125,7 @@ test "reset refuses to delete a checked-out layer" {
         error.LayerCheckedOut,
         stack.reset(&repo.git, .{ .delete_layers = true }),
     );
-    try testing.expect(try refExists(&repo, "refs/stakrr/anchor"));
+    try testing.expect(try refExists(&repo, layout.anchor_ref));
 }
 
 test "reset refuses layers occupied in linked worktrees without changing any state" {
@@ -139,9 +140,9 @@ test "reset refuses layers occupied in linked worktrees without changing any sta
     try repo.exec(&.{ "worktree", "add", "-q", path, "stakrr/p1" });
 
     try testing.expectError(error.BranchOccupied, stack.reset(&repo.git, .{ .delete_layers = true }));
-    for ([_][]const u8{ "refs/stakrr/anchor", "refs/stakrr/tip", "refs/heads/stakrr/p1" }) |ref|
+    for ([_][]const u8{ layout.anchor_ref, layout.tip_ref, "refs/heads/stakrr/p1" }) |ref|
         try testing.expect(try refExists(&repo, ref));
-    const config = (try repo.git.configGet(stack.state_key)).?;
+    const config = (try repo.git.configGet(layout.state_key)).?;
     defer testing.allocator.free(config);
     try testing.expectEqualStrings("v1 refs/heads/main refs/heads/work", config);
     const head = try repo.git.output(&.{ "-C", path, "rev-parse", "HEAD" });

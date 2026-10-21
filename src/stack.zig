@@ -29,13 +29,6 @@ pub const Error = git_mod.Error || coordination.Error || error{
     NotOnStackBranch,
 };
 
-// Aliases kept until callers move to `layout` directly.
-pub const tip_ref = layout.tip_ref;
-pub const anchor_ref = layout.anchor_ref;
-pub const layer_prefix = layout.layer_prefix;
-pub const state_key = layout.state_key;
-pub const state_version = layout.state_version;
-
 pub const Config = struct {
     base_ref: []const u8,
     work_ref: []const u8,
@@ -93,16 +86,16 @@ pub fn initStack(
     // lock() also validates the working tree.
 
     // 2. refuse existing initialisation
-    if (try git.configGet(state_key)) |existing| {
+    if (try git.configGet(layout.state_key)) |existing| {
         allocator.free(existing);
         return error.AlreadyInitialized;
     }
 
     // reserve stakrr's branch namespace and internal refs for managed layers
-    const existing_layers = try git.listRefs(layer_prefix);
+    const existing_layers = try git.listRefs(layout.layer_prefix);
     defer allocator.free(existing_layers);
     if (existing_layers.len != 0) return error.ExistingStackRefs;
-    for ([_][]const u8{ tip_ref, anchor_ref }) |ref_name| {
+    for ([_][]const u8{ layout.tip_ref, layout.anchor_ref }) |ref_name| {
         const existing = try git.readRef(ref_name);
         defer if (existing) |oid| allocator.free(oid);
         if (existing != null) return error.ExistingStackRefs;
@@ -120,8 +113,8 @@ pub fn initStack(
     defer allocator.free(base_ref);
 
     // layer names live exclusively under refs/heads/stakrr/
-    if (std.mem.startsWith(u8, work_ref, layer_prefix) or
-        std.mem.startsWith(u8, base_ref, layer_prefix))
+    if (std.mem.startsWith(u8, work_ref, layout.layer_prefix) or
+        std.mem.startsWith(u8, base_ref, layout.layer_prefix))
         return error.ReservedBranchNamespace;
 
     try git.checkRefFormat(base_ref);
@@ -146,19 +139,19 @@ pub fn initStack(
         return error.MergeCommitsUnsupported;
 
     // 7. claim the anchor; `create` fails if a concurrent init won the race
-    const anchor: Git.ExpectedRef = .{ .name = anchor_ref, .oid = base_oid };
+    const anchor: Git.ExpectedRef = .{ .name = layout.anchor_ref, .oid = base_oid };
     try git.transact("stakrr: init", &.{.{ .create = anchor }});
     errdefer git.transact("stakrr: init rollback", &.{.{ .delete = anchor }}) catch {};
 
     // 8. persist the branch pair
     const state = try std.fmt.allocPrint(
         allocator,
-        state_version ++ " {s} {s}",
+        layout.state_version ++ " {s} {s}",
         .{ base_ref, work_ref },
     );
     defer allocator.free(state);
 
-    try git.exec(&.{ "config", "--local", state_key, state });
+    try git.exec(&.{ "config", "--local", layout.state_key, state });
 }
 
 /// Validated config refs borrowing from the supplied persisted value.
@@ -174,7 +167,7 @@ pub fn parseConfig(raw: []const u8) Error!ConfigRefs {
     const version = tokens.next() orelse
         return error.InvalidConfig;
 
-    if (!std.mem.eql(u8, version, state_version))
+    if (!std.mem.eql(u8, version, layout.state_version))
         return error.UnsupportedConfigVersion;
 
     const base = tokens.next() orelse
@@ -191,8 +184,8 @@ pub fn parseConfig(raw: []const u8) Error!ConfigRefs {
         return error.InvalidConfig;
 
     if (std.mem.eql(u8, base, work) or
-        std.mem.startsWith(u8, base, layer_prefix) or
-        std.mem.startsWith(u8, work, layer_prefix))
+        std.mem.startsWith(u8, base, layout.layer_prefix) or
+        std.mem.startsWith(u8, work, layout.layer_prefix))
         return error.InvalidConfig;
 
     return .{ .base_ref = base, .work_ref = work };
@@ -200,13 +193,13 @@ pub fn parseConfig(raw: []const u8) Error!ConfigRefs {
 
 pub fn loadConfig(git: *const Git) !Config {
     const allocator = git.allocator;
-    const raw = (try git.configGet(state_key)) orelse
+    const raw = (try git.configGet(layout.state_key)) orelse
         return error.NotInitialized;
     errdefer allocator.free(raw);
 
     const refs = try parseConfig(raw);
 
-    const anchor = (try git.readRef(anchor_ref)) orelse
+    const anchor = (try git.readRef(layout.anchor_ref)) orelse
         return error.InvalidStack;
     errdefer allocator.free(anchor);
 
@@ -270,7 +263,7 @@ pub fn inspect(git: *const Git) !Snapshot {
     }
 
     // discover branches owned by stakrr
-    const raw_refs = try git.listRefs(layer_prefix);
+    const raw_refs = try git.listRefs(layout.layer_prefix);
     errdefer allocator.free(raw_refs);
 
     var layers: std.ArrayList(Boundary) = .empty;
@@ -332,7 +325,7 @@ pub fn inspect(git: *const Git) !Snapshot {
     }
 
     // the private tip guard must match the highest committed layer
-    const tip = try git.readRef(tip_ref);
+    const tip = try git.readRef(layout.tip_ref);
     defer if (tip) |oid| allocator.free(oid);
     if (layers.items.len == 0) {
         if (tip != null) return error.InvalidStack;
@@ -385,7 +378,7 @@ pub fn cut(
 
     const new_ref = try std.fmt.allocPrint(
         allocator,
-        layer_prefix ++ "{s}",
+        layout.layer_prefix ++ "{s}",
         .{name},
     );
     defer allocator.free(new_ref);
@@ -438,7 +431,7 @@ pub fn cut(
     // the anchor, which the transaction pins instead of the base branch.
     try createLayerRef(git, .{
         .layer = .{ .name = new_ref, .oid = target },
-        .anchor = .{ .name = anchor_ref, .oid = snapshot.config.anchor_oid },
+        .anchor = .{ .name = layout.anchor_ref, .oid = snapshot.config.anchor_oid },
         .work = .{ .name = snapshot.config.work_ref, .oid = snapshot.work_oid },
         .previous = if (last_layer) |layer|
             .{ .name = layer.ref_name, .oid = layer.oid }
@@ -468,12 +461,12 @@ pub fn createLayerRef(git: *const Git, expected: LayerCreation) !void {
     count += 1;
     updates[count] = if (expected.previous) |previous|
         .{ .update = .{
-            .name = tip_ref,
+            .name = layout.tip_ref,
             .new = expected.layer.oid,
             .old = previous.oid,
         } }
     else
-        .{ .create = .{ .name = tip_ref, .oid = expected.layer.oid } };
+        .{ .create = .{ .name = layout.tip_ref, .oid = expected.layer.oid } };
     count += 1;
     try git.transact("stakrr: cut", updates[0..count]);
 }
@@ -495,13 +488,13 @@ pub fn reset(git: *const Git, options: ResetOptions) !ResetResult {
     try coordination.requireNoSession(git);
     const allocator = git.allocator;
 
-    const raw_refs = try git.listRefs(layer_prefix);
+    const raw_refs = try git.listRefs(layout.layer_prefix);
     defer allocator.free(raw_refs);
 
     var updates: std.ArrayList(Git.RefUpdate) = .empty;
     defer updates.deinit(allocator);
 
-    const internal = [_][]const u8{ tip_ref, anchor_ref };
+    const internal = [_][]const u8{ layout.tip_ref, layout.anchor_ref };
     var internal_oids: [internal.len]?[]u8 = @splat(null);
     defer for (internal_oids) |maybe| if (maybe) |oid| allocator.free(oid);
 
@@ -535,7 +528,7 @@ pub fn reset(git: *const Git, options: ResetOptions) !ResetResult {
         defer allocator.free(refs);
         var index: usize = 0;
         for (updates.items) |update| switch (update) {
-            .delete => |ref| if (std.mem.startsWith(u8, ref.name, layer_prefix)) {
+            .delete => |ref| if (std.mem.startsWith(u8, ref.name, layout.layer_prefix)) {
                 refs[index] = ref.name;
                 index += 1;
             },
@@ -548,7 +541,7 @@ pub fn reset(git: *const Git, options: ResetOptions) !ResetResult {
         };
         defer if (head) |ref_name| allocator.free(ref_name);
         if (head) |ref_name| {
-            if (std.mem.startsWith(u8, ref_name, layer_prefix))
+            if (std.mem.startsWith(u8, ref_name, layout.layer_prefix))
                 return error.LayerCheckedOut;
         }
     }
@@ -557,7 +550,7 @@ pub fn reset(git: *const Git, options: ResetOptions) !ResetResult {
     if (updates.items.len != 0)
         try git.transact("stakrr: reset", updates.items);
 
-    const had_state = try git.configUnset(state_key);
+    const had_state = try git.configUnset(layout.state_key);
 
     if (!had_state and updates.items.len == 0 and layer_count == 0)
         return error.NotInitialized;

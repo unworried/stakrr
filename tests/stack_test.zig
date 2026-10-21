@@ -1,4 +1,5 @@
 const std = @import("std");
+const layout = @import("stakrr").layout;
 const testing = std.testing;
 
 const stack = @import("stakrr").stack;
@@ -50,7 +51,7 @@ fn expectNoState(repo: *const Repo) !void {
     defer if (state) |value| testing.allocator.free(value);
     try testing.expect(state == null);
 
-    const anchor = try repo.git.readRef("refs/stakrr/anchor");
+    const anchor = try repo.git.readRef(layout.anchor_ref);
     defer if (anchor) |oid| testing.allocator.free(oid);
     try testing.expect(anchor == null);
 }
@@ -151,7 +152,7 @@ test "loadConfig reports a missing anchor ref as an inconsistent stack" {
     const base = try initialize(&repo);
     defer testing.allocator.free(base);
 
-    try repo.exec(&.{ "update-ref", "-d", "refs/stakrr/anchor" });
+    try repo.exec(&.{ "update-ref", "-d", layout.anchor_ref });
 
     try testing.expectError(
         error.InvalidStack,
@@ -166,7 +167,7 @@ test "initStack records the anchor as a ref" {
     const base = try initialize(&repo);
     defer testing.allocator.free(base);
 
-    const anchor = (try repo.git.readRef("refs/stakrr/anchor")).?;
+    const anchor = (try repo.git.readRef(layout.anchor_ref)).?;
     defer testing.allocator.free(anchor);
 
     try testing.expectEqualStrings(base, anchor);
@@ -346,7 +347,7 @@ test "inspect rejects a tip guard without layers" {
     const base = try initialize(&repo);
     defer testing.allocator.free(base);
 
-    try repo.exec(&.{ "update-ref", "refs/stakrr/tip", base });
+    try repo.exec(&.{ "update-ref", layout.tip_ref, base });
 
     try testing.expectError(
         error.InvalidStack,

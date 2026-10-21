@@ -1,4 +1,5 @@
 const std = @import("std");
+const layout = @import("stakrr").layout;
 const testing = std.testing;
 
 const stakrr_git = @import("stakrr").git;
@@ -240,7 +241,7 @@ test "transact rejects malformed oids before writing to git" {
     try testing.expectError(
         error.InvalidOid,
         repo.git.transact("test", &.{.{ .create = .{
-            .name = "refs/stakrr/tip",
+            .name = layout.tip_ref,
             .oid = "HEAD",
         } }}),
     );
