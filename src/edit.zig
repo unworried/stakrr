@@ -131,7 +131,7 @@ pub fn readStatus(original_git: *const Git) !?Status {
 fn begin(git: *const Git, name: []const u8) !Loaded {
     try coordination.requireQuiescent(git);
     var snapshot = try stack.inspect(git);
-    defer snapshot.deinit(git.allocator);
+    defer snapshot.deinit();
     const origin = try git.currentBranch();
     // Origin may be any existing branch; Git's normal occupancy rules apply.
     const nodes = try git.allocator.alloc(Node, snapshot.layers.len + 1);

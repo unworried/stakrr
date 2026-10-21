@@ -56,7 +56,7 @@ test "cut at HEAD creates the first layer without moving work" {
     try testing.expectEqualStrings("refs/heads/work", head);
 
     var snapshot = try stack.inspect(&repo.git);
-    defer snapshot.deinit(testing.allocator);
+    defer snapshot.deinit();
 
     try testing.expectEqual(@as(usize, 1), snapshot.layers.len);
     try testing.expectEqual(@as(usize, 1), snapshot.layers[0].commits);
@@ -82,7 +82,7 @@ test "cut at an earlier commit leaves rolling work untouched" {
     try expectRef(&repo, "refs/heads/work", c);
 
     var snapshot = try stack.inspect(&repo.git);
-    defer snapshot.deinit(testing.allocator);
+    defer snapshot.deinit();
 
     try testing.expectEqual(@as(usize, 1), snapshot.unstacked_commits);
 }
@@ -113,7 +113,7 @@ test "two sequential cuts create ordered boundaries" {
     try expectRef(&repo, "refs/heads/work", d);
 
     var snapshot = try stack.inspect(&repo.git);
-    defer snapshot.deinit(testing.allocator);
+    defer snapshot.deinit();
 
     try testing.expectEqual(@as(usize, 2), snapshot.layers.len);
 
@@ -277,7 +277,7 @@ test "cut still works after the base moves" {
     try expectRef(&repo, "refs/heads/stakrr/p1", b);
 
     var snapshot = try stack.inspect(&repo.git);
-    defer snapshot.deinit(testing.allocator);
+    defer snapshot.deinit();
 
     try testing.expect(snapshot.base_moved);
     try testing.expectEqual(@as(usize, 1), snapshot.layers[0].commits);

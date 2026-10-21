@@ -29,22 +29,17 @@ pub const Error = git_mod.Error || coordination.Error || error{
     NotOnStackBranch,
 };
 
+/// Validated branch pair from the persisted state, borrowing from it.
+/// Shared by stack loading and edit checkpoint validation.
+pub const Branches = struct {
+    base_ref: []const u8,
+    work_ref: []const u8,
+};
+
 pub const Config = struct {
     base_ref: []const u8,
     work_ref: []const u8,
     anchor_oid: []const u8,
-
-    // base_ref and work_ref borrow from this buffer
-    _storage: []u8,
-
-    pub fn deinit(
-        self: *Config,
-        allocator: std.mem.Allocator,
-    ) void {
-        allocator.free(self._storage);
-        allocator.free(self.anchor_oid);
-        self.* = undefined;
-    }
 };
 
 pub const Layer = struct {
@@ -55,22 +50,19 @@ pub const Layer = struct {
     commits: usize,
 };
 
+/// Owned view of the stack. Every slice stays valid until deinit.
 pub const Snapshot = struct {
     config: Config,
-    layers: []Layer,
+    layers: []const Layer,
 
     work_oid: []const u8,
     unstacked_commits: usize,
     base_moved: bool,
 
-    // layer ref_name and oid slices borrow from this buffer
-    _refs_storage: []u8,
+    _arena: std.heap.ArenaAllocator,
 
-    pub fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
-        allocator.free(self.layers);
-        allocator.free(self._refs_storage);
-        allocator.free(self.work_oid);
-        self.config.deinit(allocator);
+    pub fn deinit(self: *Snapshot) void {
+        self._arena.deinit();
         self.* = undefined;
     }
 };
@@ -154,14 +146,7 @@ pub fn initStack(
     try git.exec(&.{ "config", "--local", layout.state_key, state });
 }
 
-/// Validated config refs borrowing from the supplied persisted value.
-/// Shared by stack loading and edit checkpoint validation.
-pub const ConfigRefs = struct {
-    base_ref: []const u8,
-    work_ref: []const u8,
-};
-
-pub fn parseConfig(raw: []const u8) Error!ConfigRefs {
+pub fn parseConfig(raw: []const u8) Error!Branches {
     var tokens = std.mem.tokenizeScalar(u8, raw, ' ');
 
     const version = tokens.next() orelse
@@ -191,44 +176,41 @@ pub fn parseConfig(raw: []const u8) Error!ConfigRefs {
     return .{ .base_ref = base, .work_ref = work };
 }
 
-pub fn loadConfig(git: *const Git) !Config {
-    const allocator = git.allocator;
+/// Slices are allocated from `git.allocator` and never freed individually;
+/// callers pass an arena-backed Git.
+fn loadConfig(git: *const Git) !Config {
     const raw = (try git.configGet(layout.state_key)) orelse
         return error.NotInitialized;
-    errdefer allocator.free(raw);
-
-    const refs = try parseConfig(raw);
+    const branches = try parseConfig(raw);
 
     const anchor = (try git.readRef(layout.anchor_ref)) orelse
         return error.InvalidStack;
-    errdefer allocator.free(anchor);
-
     if (!git_mod.isOid(anchor))
         return error.InvalidGitOutput;
 
     return .{
-        .base_ref = refs.base_ref,
-        .work_ref = refs.work_ref,
+        .base_ref = branches.base_ref,
+        .work_ref = branches.work_ref,
         .anchor_oid = anchor,
-        ._storage = raw,
     };
 }
 
 // Inspection alone needs cumulative depths to sort boundaries by ancestry.
 const Boundary = struct { ref_name: []const u8, oid: []const u8, depth: usize };
 
-pub fn inspect(git: *const Git) !Snapshot {
+pub fn inspect(parent_git: *const Git) !Snapshot {
+    try parent_git.ensureWorkTree();
+
+    // The snapshot owns everything inspection allocates.
+    var arena: std.heap.ArenaAllocator = .init(parent_git.allocator);
+    errdefer arena.deinit();
+    const scoped = parent_git.withAllocator(arena.allocator());
+    const git = &scoped;
     const allocator = git.allocator;
-    try git.ensureWorkTree();
 
-    var config = try loadConfig(git);
-    errdefer config.deinit(allocator);
-
+    const config = try loadConfig(git);
     const base_oid = try git.resolveCommit(config.base_ref);
-    defer allocator.free(base_oid);
-
     const work_oid = try git.resolveCommit(config.work_ref);
-    errdefer allocator.free(work_oid);
 
     // anchor must be reachable from the rolling branch
     if (!try git.isAncestor(config.anchor_oid, work_oid))
@@ -236,25 +218,20 @@ pub fn inspect(git: *const Git) !Snapshot {
 
     // With no merges, anchor..work is a single chain. Index it once so
     // every layer resolves to a depth without spawning more git processes.
-    var history = try git.history(config.anchor_oid, work_oid);
-    defer history.deinit(allocator);
+    const history = try git.history(config.anchor_oid, work_oid);
 
     // only supports linear history
     // FIXME: m2
     if (!history.linear) return error.MergeCommitsUnsupported;
 
     var depths: std.StringHashMapUnmanaged(usize) = .empty;
-    defer depths.deinit(allocator);
     for (history.commits, 1..) |oid, depth| try depths.put(allocator, oid, depth);
     const chain_len = history.commits.len;
 
     // discover branches owned by stakrr
     const listed = try git.listRefs(layout.layer_prefix);
-    defer allocator.free(listed.refs);
-    errdefer allocator.free(listed.raw);
 
     var layers: std.ArrayList(Boundary) = .empty;
-    defer layers.deinit(allocator);
 
     for (listed.refs) |ref| {
         // every layer must sit on the chain between the anchor and work
@@ -280,7 +257,6 @@ pub fn inspect(git: *const Git) !Snapshot {
     var previous_depth: usize = 0;
 
     const result = try allocator.alloc(Layer, layers.items.len);
-    errdefer allocator.free(result);
     for (layers.items, result) |layer, *out| {
         // each layer must introduce at least one commit
         if (layer.depth <= previous_depth)
@@ -298,7 +274,6 @@ pub fn inspect(git: *const Git) !Snapshot {
 
     // the private tip guard must match the highest committed layer
     const tip = try git.readRef(layout.tip_ref);
-    defer if (tip) |oid| allocator.free(oid);
     if (layers.items.len == 0) {
         if (tip != null) return error.InvalidStack;
     } else {
@@ -316,7 +291,7 @@ pub fn inspect(git: *const Git) !Snapshot {
             base_oid,
             config.anchor_oid,
         ),
-        ._refs_storage = listed.raw,
+        ._arena = arena,
     };
 }
 
@@ -360,7 +335,7 @@ pub fn cut(
     };
 
     var snapshot = try inspect(git);
-    defer snapshot.deinit(allocator);
+    defer snapshot.deinit();
 
     const current_ref = try git.currentBranch();
     defer allocator.free(current_ref);
@@ -526,7 +501,7 @@ pub fn navigate(git: *const Git, direction: Direction) !bool {
     const guard = try coordination.lockStack(git);
     defer guard.close(git.io);
     var snapshot = try inspect(git);
-    defer snapshot.deinit(git.allocator);
+    defer snapshot.deinit();
 
     const current = try git.currentBranch();
     defer git.allocator.free(current);

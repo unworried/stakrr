@@ -53,7 +53,7 @@ fn expectRecoverable(repo: *const Repo, oid: []const u8) !void {
 }
 fn valid(repo: *const Repo) !void {
     var snapshot = try stack.inspect(&repo.git);
-    defer snapshot.deinit(t.allocator);
+    defer snapshot.deinit();
     try t.expectEqual(@as(usize, 2), snapshot.layers.len);
     try t.expectEqualStrings("refs/heads/stakrr/models", snapshot.layers[0].ref_name);
     try t.expectEqualStrings("refs/heads/stakrr/api", snapshot.layers[1].ref_name);
@@ -361,7 +361,7 @@ test "editing a top cut also moves coincident rolling work and returns to a laye
     try refEquals(&repo, layout.tip_ref, amended);
     try outputEquals(&repo, &.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
     var snapshot = try stack.inspect(&repo.git);
-    defer snapshot.deinit(t.allocator);
+    defer snapshot.deinit();
     try t.expectEqual(@as(usize, 0), snapshot.unstacked_commits);
 }
 

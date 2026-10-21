@@ -161,7 +161,7 @@ fn runCommand(
         .status => {
             if (try printEditStatus(git, out)) return;
             var snapshot = try stack.inspect(git);
-            defer snapshot.deinit(git.allocator);
+            defer snapshot.deinit();
 
             const current = try git.head();
             defer if (current) |ref| git.allocator.free(ref);
