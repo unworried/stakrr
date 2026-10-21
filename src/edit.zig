@@ -119,7 +119,7 @@ pub fn readStatus(original_git: *const Git) !?Status {
         .active = s.active,
         .phase = std.meta.activeTag(s.phase),
         .origin = s.origin,
-        .base = (try stack.parseConfig(s.config)).base_ref,
+        .base = s.branches.base_ref,
         .owner = s.owner,
         .destination = if (s.destination()) |i| s.nodes[i].ref_name else s.origin,
         .branches = branches,
@@ -135,23 +135,18 @@ fn begin(git: *const Git, name: []const u8) !Loaded {
     const origin = try git.currentBranch();
     // Origin may be any existing branch; Git's normal occupancy rules apply.
     const nodes = try git.allocator.alloc(Node, snapshot.layers.len + 1);
-    for (snapshot.layers, 0..) |layer, i| nodes[i] = .{
-        .ref_name = try git.allocator.dupe(u8, layer.ref_name),
-        .original_oid = try git.allocator.dupe(u8, layer.oid),
-        .published_oid = try git.allocator.dupe(u8, layer.oid),
-        .pending_oid = try git.allocator.dupe(u8, layer.oid),
-    };
-    nodes[snapshot.layers.len] = .{
-        .ref_name = try git.allocator.dupe(u8, snapshot.config.work_ref),
-        .original_oid = try git.allocator.dupe(u8, snapshot.work_oid),
-        .published_oid = try git.allocator.dupe(u8, snapshot.work_oid),
-        .pending_oid = try git.allocator.dupe(u8, snapshot.work_oid),
-    };
+    for (snapshot.layers, 0..) |layer, i|
+        nodes[i] = try Node.init(git.allocator, layer.ref_name, layer.oid);
+    nodes[snapshot.layers.len] =
+        try Node.init(git.allocator, snapshot.config.work_ref, snapshot.work_oid);
+    const config = (try git.configGet(layout.state_key)) orelse
+        return error.EditStateChanged;
     var s: Session = .{
         .id = "",
         .owner = try owner(git),
         .origin = origin,
-        .config = (try git.configGet(layout.state_key)).?,
+        .config = config,
+        .branches = try stack.parseConfig(config),
         .anchor = try git.allocator.dupe(u8, snapshot.config.anchor_oid),
         .nodes = nodes,
         .active = 0,

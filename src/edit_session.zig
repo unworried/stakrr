@@ -14,6 +14,17 @@ pub const Node = struct {
     published_oid: []const u8,
     /// Replacement boundary produced by the current edit/replay.
     pending_oid: []const u8,
+
+    /// A boundary not yet edited, copied into `allocator`.
+    pub fn init(allocator: std.mem.Allocator, ref_name: []const u8, oid: []const u8) !Node {
+        const copy = try allocator.dupe(u8, oid);
+        return .{
+            .ref_name = try allocator.dupe(u8, ref_name),
+            .original_oid = copy,
+            .published_oid = copy,
+            .pending_oid = copy,
+        };
+    }
 };
 
 pub const Replay = struct {
@@ -40,7 +51,10 @@ pub const Session = struct {
     id: []const u8,
     owner: []const u8,
     origin: []const u8,
+    /// raw persisted state, compared byte-for-byte before each transition
     config: []const u8,
+    /// parsed from `config`
+    branches: stack.Branches,
     anchor: []const u8,
     nodes: []Node, // ordered cuts, then rolling work
     active: usize,
@@ -165,8 +179,8 @@ pub fn load(git: *const Git) !?Loaded {
         if (index >= wire.nodes.len - 1) return error.InvalidEditSession;
     }
 
-    const config = stack.parseConfig(wire.config) catch return error.InvalidEditSession;
-    if (!std.mem.eql(u8, config.work_ref, wire.nodes[wire.nodes.len - 1].ref_name))
+    const branches = stack.parseConfig(wire.config) catch return error.InvalidEditSession;
+    if (!std.mem.eql(u8, branches.work_ref, wire.nodes[wire.nodes.len - 1].ref_name))
         return error.InvalidEditSession;
 
     const nodes = try git.allocator.alloc(Node, wire.nodes.len);
@@ -236,6 +250,7 @@ pub fn load(git: *const Git) !?Loaded {
         .owner = wire.owner,
         .origin = wire.origin,
         .config = wire.config,
+        .branches = branches,
         .anchor = wire.anchor,
         .nodes = nodes,
         .active = wire.active,
