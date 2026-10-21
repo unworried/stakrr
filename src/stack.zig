@@ -135,8 +135,9 @@ pub fn initStack(
 
     // 6. reject merge commits
     // FIXME: m2
-    if (try git.hasMergeCommits(base_oid, work_oid))
-        return error.MergeCommitsUnsupported;
+    var history = try git.history(base_oid, work_oid);
+    defer history.deinit(allocator);
+    if (!history.linear) return error.MergeCommitsUnsupported;
 
     // 7. claim the anchor; `create` fails if a concurrent init won the race
     const anchor: Git.ExpectedRef = .{ .name = layout.anchor_ref, .oid = base_oid };
@@ -236,31 +237,17 @@ pub fn inspect(git: *const Git) !Snapshot {
 
     // With no merges, anchor..work is a single chain. Index it once so
     // every layer resolves to a depth without spawning more git processes.
-    const history = try git.revListParents(config.anchor_oid, work_oid);
-    defer allocator.free(history);
+    var history = try git.history(config.anchor_oid, work_oid);
+    defer history.deinit(allocator);
+
+    // only supports linear history
+    // FIXME: m2
+    if (!history.linear) return error.MergeCommitsUnsupported;
 
     var depths: std.StringHashMapUnmanaged(usize) = .empty;
     defer depths.deinit(allocator);
-
-    var chain_len: usize = 0;
-    var commits = std.mem.splitScalar(u8, history, '\n');
-    while (commits.next()) |line| {
-        if (line.len == 0) continue;
-
-        var fields = std.mem.tokenizeScalar(u8, line, ' ');
-        const oid = fields.next() orelse return error.InvalidGitOutput;
-
-        var parents: usize = 0;
-        while (fields.next()) |_| parents += 1;
-
-        // only supports linear history
-        // FIXME: m2
-        if (parents > 1) return error.MergeCommitsUnsupported;
-        if (parents == 0) return error.InvalidStack;
-
-        chain_len += 1;
-        try depths.put(allocator, oid, chain_len);
-    }
+    for (history.commits, 1..) |oid, depth| try depths.put(allocator, oid, depth);
+    const chain_len = history.commits.len;
 
     // discover branches owned by stakrr
     const listed = try git.listRefs(layout.layer_prefix);

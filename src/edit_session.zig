@@ -272,19 +272,15 @@ fn loadReplayPlan(git: *const Git, s: *const Session) ![]const []const u8 {
     if (queue.items.len != progress.plan_len) return error.InvalidEditSession;
 
     // Boundaries alone cannot detect missing or reordered commits between cuts.
-    const history = try git.revListParents(
+    var history = try git.history(
         s.nodes[s.active].published_oid,
         s.workNode().published_oid,
     );
-    defer git.allocator.free(history);
-    var lines = std.mem.tokenizeScalar(u8, history, '\n');
-    for (queue.items) |commit| {
-        const line = lines.next() orelse return error.InvalidEditSession;
-        var fields = std.mem.tokenizeScalar(u8, line, ' ');
-        const expected = fields.next() orelse return error.InvalidEditSession;
+    defer history.deinit(git.allocator);
+    if (history.commits.len != queue.items.len) return error.InvalidEditSession;
+    for (queue.items, history.commits) |commit, expected| {
         if (!std.mem.eql(u8, commit, expected)) return error.InvalidEditSession;
     }
-    if (lines.next() != null) return error.InvalidEditSession;
 
     // Every descendant boundary must occur in order, including coincident
     // work/top-cut tips. This also makes replay's advancing cursor safe.

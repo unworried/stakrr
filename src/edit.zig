@@ -203,22 +203,13 @@ fn prepare(git: *const Git, loaded: *Loaded, target: ?usize) !void {
         if (eql(lower, edited) or !try git.isAncestor(lower, edited))
             return error.InvalidEditedHistory;
 
-        if (try git.hasMergeCommits(lower, edited))
+        if (!(try git.history(lower, edited)).linear)
             return error.InvalidEditedHistory;
 
-        const history = try git.revListParents(
+        const commits = (try git.history(
             s.nodes[s.active].published_oid,
             s.workNode().published_oid,
-        );
-
-        var queue: std.ArrayList([]const u8) = .empty;
-        var lines = std.mem.tokenizeScalar(u8, history, '\n');
-        while (lines.next()) |line| {
-            var fields = std.mem.tokenizeScalar(u8, line, ' ');
-            try queue.append(git.allocator, fields.next().?);
-        }
-
-        const commits = try queue.toOwnedSlice(git.allocator);
+        )).commits;
         if (commits.len != 0) try requireNoIgnored(git);
 
         const plan = try git.writeBlobWithFormat(

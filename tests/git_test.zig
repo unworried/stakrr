@@ -322,7 +322,7 @@ test "listRefs finds only branches under the requested prefix" {
     try testing.expectEqualStrings(oid, refs.refs[1].oid);
 }
 
-test "countCommits counts a linear range" {
+test "history lists a range oldest first" {
     var repo = try Repo.init();
     defer repo.deinit();
 
@@ -335,23 +335,43 @@ test "countCommits counts a linear range" {
     const c = try repo.commit("C");
     defer testing.allocator.free(c);
 
-    try testing.expectEqual(
-        @as(usize, 0),
-        try repo.git.countCommits(a, a),
-    );
+    var empty = try repo.git.history(a, a);
+    defer empty.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), empty.commits.len);
 
-    try testing.expectEqual(
-        @as(usize, 1),
-        try repo.git.countCommits(a, b),
-    );
+    var range = try repo.git.history(a, c);
+    defer range.deinit(testing.allocator);
+    try testing.expect(range.linear);
+    try testing.expectEqual(@as(usize, 2), range.commits.len);
+    try testing.expectEqualStrings(b, range.commits[0]);
+    try testing.expectEqualStrings(c, range.commits[1]);
 
-    try testing.expectEqual(
-        @as(usize, 2),
-        try repo.git.countCommits(a, c),
-    );
+    var backwards = try repo.git.history(c, a);
+    defer backwards.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), backwards.commits.len);
+}
 
-    try testing.expectEqual(
-        @as(usize, 0),
-        try repo.git.countCommits(c, a),
-    );
+test "history reports merges as non-linear" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try repo.commit("base");
+    defer testing.allocator.free(base);
+    try repo.exec(&.{ "switch", "-q", "-c", "side" });
+    const side = try repo.commit("side");
+    defer testing.allocator.free(side);
+    try repo.exec(&.{ "switch", "-q", "main" });
+    const main = try repo.commit("main");
+    defer testing.allocator.free(main);
+    try repo.exec(&.{ "merge", "-q", "--no-edit", "side" });
+    const merge = try repo.git.resolveCommit("HEAD");
+    defer testing.allocator.free(merge);
+
+    var linear = try repo.git.history(base, main);
+    defer linear.deinit(testing.allocator);
+    try testing.expect(linear.linear);
+
+    var merged = try repo.git.history(base, merge);
+    defer merged.deinit(testing.allocator);
+    try testing.expect(!merged.linear);
 }
