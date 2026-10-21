@@ -37,6 +37,8 @@ notable changes to stakrr, generated from conventional commits by
 - **cli** give every domain error a message [`2bf0e2d`](https://github.com/unworried/stakrr/commit/2bf0e2d228ca12c2cf6ab72c314542b652bb245b)
 - **stack** validate the layer name before inspecting the stack [`2443bd4`](https://github.com/unworried/stakrr/commit/2443bd43fcaffb98a76b95f58e53a4620e53572e)
 - **stack** validate persisted state before use [`e258951`](https://github.com/unworried/stakrr/commit/e258951879a0d929c0109c5791712c79b4afff15)
+- correctly include tests in build [`41745c5`](https://github.com/unworried/stakrr/commit/41745c572e5d4fd3aa72082b10573818b989a25c)
+- stale fixme [`239744a`](https://github.com/unworried/stakrr/commit/239744a158a2fb28d1ac7350b435e9fbdf2bcd35)
 
 ### ▸ perf
 
@@ -72,7 +74,8 @@ notable changes to stakrr, generated from conventional commits by
 - rewrite readme [`f0057ca`](https://github.com/unworried/stakrr/commit/f0057ca61380da0328a8536177bca27ec2363932)
 - add contributing guide and github templates [`4acc5e5`](https://github.com/unworried/stakrr/commit/4acc5e5bcb13c81b14f2f77df8c321884f3e45e4)
 - restyle the sandbox banner [`94ae4ec`](https://github.com/unworried/stakrr/commit/94ae4ec5b8e8da625c4bfd1badec11387ca22788)
-- add changelog [`9883d65`](https://github.com/unworried/stakrr/commit/9883d6559e0b3a75e4b0f1cdbf2d07640e479c15)
+- add changelog [`2184e77`](https://github.com/unworried/stakrr/commit/2184e77c36abf9acbfd36dc9f6cd03819a5850a6)
+- fix the demo recording [`db70242`](https://github.com/unworried/stakrr/commit/db70242f1326ee987506c15e2da9b7ac5725e96b)
 
 ## v0.0.2 ── test flight pt2
 
