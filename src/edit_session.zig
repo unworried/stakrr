@@ -80,6 +80,34 @@ pub const Session = struct {
         };
     }
 
+    /// Once an edit is incorporated, the active cut's ref holds its pending
+    /// replacement until the replay is published or rolled back.
+    pub fn expectedOid(self: *const Session, index: usize) []const u8 {
+        const node = self.nodes[index];
+        const pending = index == self.active and switch (self.phase) {
+            .detaching, .replay, .conflict, .publishing, .aborting => true,
+            else => false,
+        };
+        return if (pending) node.pending_oid else node.published_oid;
+    }
+
+    /// Index of the first descendant boundary not yet reached once `picked`,
+    /// a prefix of the replay plan, is applied. Boundaries coinciding with
+    /// the active cut are reached before the first pick.
+    pub fn boundaryAfter(self: *const Session, picked: []const []const u8) usize {
+        var boundary = self.active + 1;
+        const active_oid = self.nodes[self.active].published_oid;
+        while (boundary < self.nodes.len and
+            std.mem.eql(u8, self.nodes[boundary].published_oid, active_oid))
+            boundary += 1;
+        for (picked) |commit| {
+            while (boundary < self.nodes.len and
+                std.mem.eql(u8, self.nodes[boundary].published_oid, commit))
+                boundary += 1;
+        }
+        return boundary;
+    }
+
     pub fn destination(self: *const Session) ?usize {
         return switch (self.phase) {
             .switching => |target| target,
@@ -299,15 +327,6 @@ fn loadReplayPlan(git: *const Git, s: *const Session) ![]const []const u8 {
 
     // Every descendant boundary must occur in order, including coincident
     // work/top-cut tips. This also makes replay's advancing cursor safe.
-    var boundary = s.active + 1;
-    const active_oid = s.nodes[s.active].published_oid;
-    while (boundary < s.nodes.len) : (boundary += 1) {
-        if (!std.mem.eql(u8, s.nodes[boundary].published_oid, active_oid)) break;
-    }
-    for (queue.items) |commit| {
-        while (boundary < s.nodes.len and std.mem.eql(u8, s.nodes[boundary].published_oid, commit))
-            boundary += 1;
-    }
-    if (boundary != s.nodes.len) return error.InvalidEditSession;
+    if (s.boundaryAfter(queue.items) != s.nodes.len) return error.InvalidEditSession;
     return queue.items;
 }

@@ -271,15 +271,7 @@ fn replayDescendants(git: *const Git, loaded: *Loaded) !void {
         try coordination.requireQuiescent(git);
     }
     // Skip boundaries incorporated before this command was interrupted.
-    var boundary = s.active + 1;
-    const active_oid = s.nodes[s.active].published_oid;
-    while (boundary < s.nodes.len) : (boundary += 1) {
-        if (!eql(s.nodes[boundary].published_oid, active_oid)) break;
-    }
-    for (queue[0..progress.next]) |commit| {
-        while (boundary < s.nodes.len and eql(s.nodes[boundary].published_oid, commit))
-            boundary += 1;
-    }
+    var boundary = s.boundaryAfter(queue[0..progress.next]);
     while (progress.next < queue.len) {
         const commit = queue[progress.next];
         if (picking) |oid| {
@@ -354,30 +346,43 @@ fn publishResults(git: *const Git, loaded: *Loaded) !void {
     if (!eql(try git.resolveCommit("HEAD"), s.phase.publishing.before)) return error.EditStateChanged;
     try checkRefs(git, s);
     try available(git, s);
-    var changes: std.ArrayList(Git.RefUpdate) = .empty;
-    const old_tip = s.topCut().published_oid;
-    for (s.nodes, 0..) |*node, i| {
-        const old = if (i == s.active) node.pending_oid else node.published_oid;
-        try changes.append(
-            git.allocator,
-            .{ .update = .{
-                .name = node.ref_name,
-                .new = node.pending_oid,
-                .old = old,
-            } },
-        );
-        node.published_oid = node.pending_oid;
-    }
-    try changes.append(
-        git.allocator,
-        .{ .update = .{
-            .name = layout.tip_ref,
-            .new = s.topCut().published_oid,
-            .old = old_tip,
-        } },
-    );
+    const changes = try moveBoundaries(git, s, .pending);
     s.phase = .{ .switching = target };
-    loaded.oid = try save(git, s, loaded.oid, changes.items, &.{});
+    loaded.oid = try save(git, s, loaded.oid, changes, &.{});
+}
+
+/// Compare-and-swap every boundary and the tip guard to the replay result
+/// or back to the original stack, recording the target as published.
+fn moveBoundaries(
+    git: *const Git,
+    s: *Session,
+    comptime target: enum { pending, original },
+) ![]const Git.RefUpdate {
+    const changes = try git.allocator.alloc(Git.RefUpdate, s.nodes.len + 1);
+    // the tip guard tracks the published top cut, never a pending edit
+    const old_tip = s.topCut().published_oid;
+    for (s.nodes, changes[0..s.nodes.len], 0..) |*node, *change, i| {
+        const new = switch (target) {
+            .pending => node.pending_oid,
+            .original => node.original_oid,
+        };
+        change.* = .{ .update = .{ .name = node.ref_name, .new = new, .old = s.expectedOid(i) } };
+        node.published_oid = new;
+        node.pending_oid = new;
+    }
+    changes[s.nodes.len] = .{ .update = .{
+        .name = layout.tip_ref,
+        .new = s.topCut().published_oid,
+        .old = old_tip,
+    } };
+    return changes;
+}
+
+/// Delete the journal, ending the session.
+fn finish(git: *const Git, loaded: *const Loaded, comptime message: []const u8) !void {
+    try git.transact(message, &.{
+        .{ .delete = .{ .name = layout.session_ref, .oid = loaded.oid } },
+    });
 }
 
 fn switchDestination(git: *const Git, loaded: *Loaded) !void {
@@ -391,17 +396,7 @@ fn switchDestination(git: *const Git, loaded: *Loaded) !void {
         s.active = index;
         s.phase = .editing;
         loaded.oid = try save(git, s, loaded.oid, &.{}, &.{});
-    } else {
-        try git.transact(
-            "stakrr: finish edit",
-            &.{
-                .{ .delete = .{
-                    .name = layout.session_ref,
-                    .oid = loaded.oid,
-                } },
-            },
-        );
-    }
+    } else try finish(git, loaded, "stakrr: finish edit");
 }
 
 fn abortSession(git: *const Git, loaded: *Loaded) !void {
@@ -435,39 +430,13 @@ fn abortSession(git: *const Git, loaded: *Loaded) !void {
         try available(git, s);
         const head = try git.resolveCommit("HEAD");
         try detach(git, head);
-        var changes: std.ArrayList(Git.RefUpdate) = .empty;
-        const old_tip = s.topCut().published_oid;
-        for (s.nodes, 0..) |*node, i| {
-            try changes.append(git.allocator, .{ .update = .{
-                .name = node.ref_name,
-                .new = node.original_oid,
-                .old = if (i == s.active) node.pending_oid else node.published_oid,
-            } });
-            node.published_oid = node.original_oid;
-            node.pending_oid = node.original_oid;
-        }
-        try changes.append(
-            git.allocator,
-            .{ .update = .{
-                .name = layout.tip_ref,
-                .new = s.topCut().original_oid,
-                .old = old_tip,
-            } },
-        );
+        const changes = try moveBoundaries(git, s, .original);
         s.phase = .aborted;
-        loaded.oid = try save(git, s, loaded.oid, changes.items, &.{head});
+        loaded.oid = try save(git, s, loaded.oid, changes, &.{head});
     }
     try available(git, s);
     try git.switchBranch(s.origin);
-    try git.transact(
-        "stakrr: abort edit",
-        &.{
-            .{ .delete = .{
-                .name = layout.session_ref,
-                .oid = loaded.oid,
-            } },
-        },
-    );
+    try finish(git, loaded, "stakrr: abort edit");
 }
 
 fn eql(a: []const u8, b: []const u8) bool {
@@ -576,13 +545,9 @@ fn checkRefs(git: *const Git, s: *const Session) !void {
 }
 
 fn checkNode(s: *const Session, index: usize, actual: []const u8) !void {
+    // the user is committing on the active cut
     if (s.phase == .editing and index == s.active) return;
-    const node = s.nodes[index];
-    const expected = if (index == s.active and switch (s.phase) {
-        .detaching, .replay, .conflict, .publishing, .aborting => true,
-        else => false,
-    }) node.pending_oid else node.published_oid;
-    if (!eql(actual, expected)) return error.EditStateChanged;
+    if (!eql(actual, s.expectedOid(index))) return error.EditStateChanged;
 }
 
 fn requireBranch(git: *const Git, ref: []const u8) !void {
