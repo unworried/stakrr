@@ -4,7 +4,9 @@ notable changes to stakrr, generated from conventional commits by
 [git-cliff](https://git-cliff.org).
 
 
-## unreleased
+## v0.0.3
+
+<sub>2026-10-21 · [diff](https://github.com/unworried/stakrr/compare/v0.0.2...v0.0.3)</sub>
 
 ### ▸ features
 
@@ -76,6 +78,10 @@ notable changes to stakrr, generated from conventional commits by
 - restyle the sandbox banner [`94ae4ec`](https://github.com/unworried/stakrr/commit/94ae4ec5b8e8da625c4bfd1badec11387ca22788)
 - add changelog [`2184e77`](https://github.com/unworried/stakrr/commit/2184e77c36abf9acbfd36dc9f6cd03819a5850a6)
 - fix the demo recording [`db70242`](https://github.com/unworried/stakrr/commit/db70242f1326ee987506c15e2da9b7ac5725e96b)
+
+### ▸ other
+
+- changelog [`c2b3dae`](https://github.com/unworried/stakrr/commit/c2b3dae40d1a66831efe5dfa7decda97990a5d96)
 
 ## v0.0.2 ── test flight pt2
 
