@@ -79,9 +79,8 @@ pub fn initStack(
     git: *const Git,
     base_name: []const u8,
 ) !void {
-    const guard = try coordination.lock(git);
+    const guard = try coordination.lockStack(git);
     defer guard.close(git.io);
-    try coordination.requireNoSession(git);
     const allocator = git.allocator;
     // lock() also validates the working tree.
 
@@ -340,9 +339,8 @@ pub fn cut(
     name: []const u8,
     revision: ?[]const u8,
 ) !void {
-    const guard = try coordination.lock(git);
+    const guard = try coordination.lockStack(git);
     defer guard.close(git.io);
-    try coordination.requireNoSession(git);
     const allocator = git.allocator;
 
     // validate the name before inspecting the stack
@@ -456,9 +454,8 @@ pub const ResetOptions = struct { delete_layers: bool = false };
 /// Works on corrupt or outdated state, so it never parses the config.
 pub fn reset(git: *const Git, options: ResetOptions) !ResetResult {
     const delete_layers = options.delete_layers;
-    const guard = try coordination.lock(git);
+    const guard = try coordination.lockStack(git);
     defer guard.close(git.io);
-    try coordination.requireNoSession(git);
     const allocator = git.allocator;
 
     var layers = try git.listRefs(layout.layer_prefix);
@@ -526,9 +523,8 @@ fn navigationRef(snapshot: *const Snapshot, index: usize) []const u8 {
 
 /// Returns false when already at the requested end of the stack.
 pub fn navigate(git: *const Git, direction: Direction) !bool {
-    const guard = try coordination.lock(git);
+    const guard = try coordination.lockStack(git);
     defer guard.close(git.io);
-    try coordination.requireNoSession(git);
     var snapshot = try inspect(git);
     defer snapshot.deinit(git.allocator);
 

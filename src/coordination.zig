@@ -29,11 +29,21 @@ pub fn lock(git: *const Git) !std.Io.File {
     };
 }
 
-pub fn requireNoSession(git: *const Git) !void {
+/// Lock for a stack mutation, which an active edit session excludes.
+pub fn lockStack(git: *const Git) !std.Io.File {
+    const guard = try lock(git);
+    errdefer guard.close(git.io);
     if (try git.readRef(layout.session_ref)) |oid| {
         git.allocator.free(oid);
         return error.EditInProgress;
     }
+    return guard;
+}
+
+/// A clean working tree with no Git operation in progress.
+pub fn requireQuiescent(git: *const Git) !void {
+    try requireClean(git);
+    try requireNoGitOperation(git, .{});
 }
 
 pub fn requireClean(git: *const Git) !void {
@@ -63,15 +73,20 @@ pub fn requireAvailable(git: *const Git, refs: []const []const u8) !void {
     }
 }
 
-pub fn requireNoGitOperation(git: *const Git) !void {
-    if (try git.readRef("CHERRY_PICK_HEAD")) |oid| {
-        git.allocator.free(oid);
-        return error.GitOperationInProgress;
-    }
-    try requireNoOtherGitOperation(git);
-}
+pub const cherry_pick_head = "CHERRY_PICK_HEAD";
 
-pub fn requireNoOtherGitOperation(git: *const Git) !void {
+pub const OperationOptions = struct {
+    /// the caller owns and validates a stopped cherry-pick
+    allow_cherry_pick: bool = false,
+};
+
+pub fn requireNoGitOperation(git: *const Git, options: OperationOptions) !void {
+    if (!options.allow_cherry_pick) {
+        if (try git.readRef(cherry_pick_head)) |oid| {
+            git.allocator.free(oid);
+            return error.GitOperationInProgress;
+        }
+    }
     for ([_][]const u8{ "MERGE_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "sequencer" }) |name| {
         const path = try git.path(&.{ "rev-parse", "--git-path", name });
         defer git.allocator.free(path);

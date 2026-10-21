@@ -129,8 +129,7 @@ pub fn readStatus(original_git: *const Git) !?Status {
 }
 
 fn begin(git: *const Git, name: []const u8) !Loaded {
-    try coordination.requireClean(git);
-    try coordination.requireNoGitOperation(git);
+    try coordination.requireQuiescent(git);
     var snapshot = try stack.inspect(git);
     defer snapshot.deinit(git.allocator);
     const origin = try git.currentBranch();
@@ -188,8 +187,7 @@ fn begin(git: *const Git, name: []const u8) !Loaded {
 fn prepare(git: *const Git, loaded: *Loaded, target: ?usize) !void {
     const s = &loaded.session;
     try requireBranch(git, s.nodes[s.active].ref_name);
-    try coordination.requireClean(git);
-    try coordination.requireNoGitOperation(git);
+    try coordination.requireQuiescent(git);
     const edited = try git.resolveCommit("HEAD");
     var retained: []const []const u8 = &.{edited};
     if (eql(edited, s.nodes[s.active].published_oid)) {
@@ -252,8 +250,7 @@ fn detachForReplay(git: *const Git, loaded: *Loaded) !void {
     const s = &loaded.session;
     const progress = s.phase.detaching;
     const queue = loaded.plan orelse return error.InvalidEditSession;
-    try coordination.requireClean(git);
-    try coordination.requireNoGitOperation(git);
+    try coordination.requireQuiescent(git);
     if (queue.len != 0 and !loaded.ignored_checked) {
         try requireNoIgnored(git);
         loaded.ignored_checked = true;
@@ -274,10 +271,9 @@ fn replayDescendants(git: *const Git, loaded: *Loaded) !void {
     var progress = s.replay().?;
     const queue = loaded.plan orelse return error.InvalidEditSession;
     var head = try git.resolveCommit("HEAD");
-    var picking = try git.readRef("CHERRY_PICK_HEAD");
+    var picking = try git.readRef(coordination.cherry_pick_head);
     if (picking == null) {
-        try coordination.requireClean(git);
-        try coordination.requireNoGitOperation(git);
+        try coordination.requireQuiescent(git);
     }
     // Skip boundaries incorporated before this command was interrupted.
     var boundary = s.active + 1;
@@ -325,7 +321,7 @@ fn replayDescendants(git: *const Git, loaded: *Loaded) !void {
                 "--keep-redundant-commits",
                 commit,
             }) catch |err| {
-                if (try git.readRef("CHERRY_PICK_HEAD")) |_| {
+                if (try git.readRef(coordination.cherry_pick_head)) |_| {
                     s.phase = .{ .conflict = progress };
                     loaded.oid = try save(git, s, loaded.oid, &.{}, &.{});
                     return error.ReplayConflict;
@@ -359,8 +355,7 @@ fn publishResults(git: *const Git, loaded: *Loaded) !void {
     const s = &loaded.session;
     const target = s.phase.publishing.destination;
     try requireDetached(git);
-    try coordination.requireClean(git);
-    try coordination.requireNoGitOperation(git);
+    try coordination.requireQuiescent(git);
     if (!eql(try git.resolveCommit("HEAD"), s.phase.publishing.before)) return error.EditStateChanged;
     try checkRefs(git, s);
     try available(git, s);
@@ -392,8 +387,7 @@ fn publishResults(git: *const Git, loaded: *Loaded) !void {
 
 fn switchDestination(git: *const Git, loaded: *Loaded) !void {
     const s = &loaded.session;
-    try coordination.requireClean(git);
-    try coordination.requireNoGitOperation(git);
+    try coordination.requireQuiescent(git);
     try checkRefs(git, s);
     try available(git, s);
     const target = if (s.phase.switching) |index| s.nodes[index].ref_name else s.origin;
@@ -419,7 +413,7 @@ fn abortSession(git: *const Git, loaded: *Loaded) !void {
     const s = &loaded.session;
     // Never use reset --hard: even conflict resolutions belong to the user.
     try coordination.requireClean(git);
-    const picking = try git.readRef("CHERRY_PICK_HEAD");
+    const picking = try git.readRef(coordination.cherry_pick_head);
     if (picking) |oid| {
         if (s.phase != .replay and s.phase != .conflict and s.phase != .aborting)
             return error.GitOperationInProgress;
@@ -429,8 +423,8 @@ fn abortSession(git: *const Git, loaded: *Loaded) !void {
         if (!eql(oid, queue[progress.next]) or
             !eql(try git.resolveCommit("HEAD"), progress.before))
             return error.EditStateChanged;
-        try coordination.requireNoOtherGitOperation(git);
-    } else try coordination.requireNoGitOperation(git);
+    }
+    try coordination.requireNoGitOperation(git, .{ .allow_cherry_pick = picking != null });
     if (s.phase != .aborting and s.phase != .aborted) {
         if (s.phase == .editing) {
             try requireBranch(git, s.nodes[s.active].ref_name);
