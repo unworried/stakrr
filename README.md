@@ -63,6 +63,66 @@ stakrr cut api                   # everything since, up to the tip, becomes stak
 stakrr status
 ```
 
+## // editing earlier cuts
+
+Use ordinary Git commits or amendments on a cut. Descendants replay when you
+jump to another cut or finish the session:
+
+```sh
+stakrr edit models
+# edit files...
+git add model.zig
+git commit -m "fix validation"    # git commit --amend also works
+stakrr edit api                  # replay, then switch to stakrr/api
+# edit and commit more if needed...
+stakrr edit                      # replay and return to the original branch
+```
+
+An unchanged cut only needs a checkout. A changed cut replays each descendant
+commit in order, including unstacked rolling work. Empty commits stay present;
+upper-layer deletions stay deletions, with normal Git conflicts if an edit
+changes a file deleted above it. Cuts must retain at least one linear commit
+above their previous boundary. Changing earlier boundaries or merging branches
+inside an edit is unsupported.
+
+Transitions require a clean index and working tree, including untracked files.
+No implicit commits or stashes are made. Checkouts and replay refuse to overwrite
+ignored files. During a session, `init`, `cut`, `reset`, `up` and `down` are
+blocked in every worktree. Use `edit <cut>` to move between cuts instead.
+
+On a conflict, the pending destination and session remain saved:
+
+```sh
+stakrr status
+# resolve conflicts, using git rm for a deletion if appropriate...
+git add <resolved-files>
+stakrr edit --continue
+```
+
+`--continue` works after restarting stakrr. A manually committed resolution also
+works. Replay temporarily uses detached HEAD; do not switch branches during it.
+The rewritten boundaries, rolling branch and internal tip are published together
+only after replay completes. Automated replay commits bypass hooks and signing;
+ordinary commits you create while editing keep your normal Git configuration.
+
+`stakrr edit --abort` restores the stack from before the **entire** session,
+including changes incorporated during earlier jumps. It requires clean work:
+commit or otherwise preserve conflict resolutions and other uncommitted changes
+first. It never runs `reset --hard` or discards files. Original boundaries and
+observed edit/replay commits remain pinned under the recovery namespace shown
+by `status`, even after abort or successful completion:
+
+```sh
+git for-each-ref --format='%(refname) %(objecttype)' refs/stakrr/recovery/
+git branch rescue <recovery-ref-that-points-to-a-commit>
+```
+
+Recovery refs also retain replay-plan blobs; only commit refs can become rescue
+branches. Retention is intentional and has no automatic expiry. Direct Git
+commands in other processes do not take stakrr's lock; avoid concurrent manual
+branch updates or worktree changes during an edit. Detected external changes
+stop the operation for recovery.
+
 ## // model
 
 ```
@@ -93,7 +153,9 @@ stakrr status
 | ● | `stakrr status` | draw the stack: layers, commit counts, unstacked work |
 | ● | `stakrr reset [--delete-layers]` | forget the stack so it can be re-initialised |
 | ● | `stakrr version` | print the version |
-| ○ | `stakrr amend` | amend a lower layer and restack the descendants |
+| ● | `stakrr edit [<cut>]` | edit a cut, replay descendants, or finish and return to origin |
+| ● | `stakrr edit --continue` | resume a pending replay or checkout |
+| ● | `stakrr edit --abort` | restore the entire pre-session stack and return to origin |
 | ○ | `stakrr submit` | publish review branches, excluding rolling work |
 | ○ | `stakrr undo` | restore the previous stakrr operation |
 
@@ -107,6 +169,9 @@ stakrr status
 | `refs/stakrr/anchor` | the base commit at `init`, which also keeps it reachable for gc |
 | `refs/stakrr/tip` | concurrency guard at the highest layer, compare-and-swapped in the same ref transaction as each new layer |
 | `refs/heads/stakrr/*` | layer branches |
+| `refs/stakrr/edit` | versioned session checkpoint blob, shared by all worktrees and bound to one owner |
+| `refs/stakrr/recovery/<session>/<oid>` | retained original boundaries, edit/replay commits and immutable replay plans |
+| `<git-common-dir>/stakrr.lock` | advisory lock held for each stakrr mutation; released automatically on process exit |
 
 don't edit the internal refs by hand. an aborted cut leaves every ref
 unchanged. stakrr runs the `git` on your `PATH` and inherits the environment
@@ -114,7 +179,7 @@ unchanged. stakrr runs the `git` on your `PATH` and inherits the environment
 
 ## // recovery
 
-`status` and `cut` refuse to run when the stack no longer matches the rolling
+Outside a managed edit, `status` and `cut` refuse to run when the stack no longer matches the rolling
 branch: after rebasing work past the base, deleting a layer branch, or upgrading
 from an incompatible state version. to start over:
 

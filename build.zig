@@ -58,6 +58,7 @@ pub fn build(b: *std.Build) void {
         "tests/cut_test.zig",
         "tests/reset_test.zig",
         "tests/cli_test.zig",
+        "tests/edit_test.zig",
     };
 
     for (integration_tests) |path| {

@@ -171,3 +171,37 @@ test "cli: version" {
     try testing.expectEqual(@as(u8, 0), version.code);
     try testing.expect(std.mem.startsWith(u8, version.stdout, "stakrr "));
 }
+
+test "cli: navigation and status follow the checked-out branch" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try setup(&repo);
+    const init = try stakrr(&repo, &.{ "init", "--base", "main" });
+    defer init.deinit();
+    try testing.expectEqual(@as(u8, 0), init.code);
+
+    const down = try stakrr(&repo, &.{"down"});
+    defer down.deinit();
+    try testing.expectEqual(@as(u8, 0), down.code);
+    const status = try stakrr(&repo, &.{"status"});
+    defer status.deinit();
+    try testing.expectEqual(@as(u8, 0), status.code);
+    try testing.expect(std.mem.indexOf(u8, status.stdout, "▸ main") != null);
+    try testing.expect(std.mem.indexOf(u8, status.stdout, "▸ work") == null);
+
+    const base = try stakrr(&repo, &.{"down"});
+    defer base.deinit();
+    try testing.expectEqualStrings("already at base\n", base.stdout);
+    const up = try stakrr(&repo, &.{"up"});
+    defer up.deinit();
+    try testing.expectEqual(@as(u8, 0), up.code);
+    const top = try stakrr(&repo, &.{"up"});
+    defer top.deinit();
+    try testing.expectEqualStrings("already at top\n", top.stdout);
+
+    try repo.exec(&.{ "switch", "-q", "--detach" });
+    const detached = try stakrr(&repo, &.{"status"});
+    defer detached.deinit();
+    try testing.expectEqual(@as(u8, 0), detached.code);
+    try testing.expect(std.mem.indexOf(u8, detached.stdout, "▸") == null);
+}

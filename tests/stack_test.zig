@@ -448,3 +448,48 @@ test "stacks work in SHA-256 repositories" {
     try testing.expectEqual(@as(usize, 1), snapshot.layers.len);
     try testing.expectEqualStrings(b, snapshot.layers[0].oid);
 }
+
+test "navigate traverses layers by history and stops at the stack boundaries" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+
+    const first = try repo.commit("first");
+    defer testing.allocator.free(first);
+    try stack.cut(&repo.git, "z-first", null);
+    const second = try repo.commit("second");
+    defer testing.allocator.free(second);
+    try stack.cut(&repo.git, "a-second", null);
+
+    try testing.expect(!try stack.navigate(&repo.git, .up));
+    for ([_][]const u8{ "refs/heads/stakrr/a-second", "refs/heads/stakrr/z-first", "refs/heads/main" }) |expected| {
+        try testing.expect(try stack.navigate(&repo.git, .down));
+        const current = try repo.git.currentBranch();
+        defer testing.allocator.free(current);
+        try testing.expectEqualStrings(expected, current);
+    }
+    try testing.expect(!try stack.navigate(&repo.git, .down));
+    for ([_][]const u8{ "refs/heads/stakrr/z-first", "refs/heads/stakrr/a-second", "refs/heads/work" }) |expected| {
+        try testing.expect(try stack.navigate(&repo.git, .up));
+        const current = try repo.git.currentBranch();
+        defer testing.allocator.free(current);
+        try testing.expectEqualStrings(expected, current);
+    }
+}
+
+test "navigate handles an empty stack and rejects branches outside it" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+
+    try testing.expect(try stack.navigate(&repo.git, .down));
+    try testing.expect(!try stack.navigate(&repo.git, .down));
+    try testing.expect(try stack.navigate(&repo.git, .up));
+    try repo.exec(&.{ "switch", "-q", "-c", "outside" });
+    try testing.expectError(error.NotOnStackBranch, stack.navigate(&repo.git, .up));
+    try testing.expectError(error.NotOnStackBranch, stack.navigate(&repo.git, .down));
+    try repo.exec(&.{ "switch", "-q", "--detach" });
+    try testing.expectError(error.DetachedHead, stack.navigate(&repo.git, .up));
+}

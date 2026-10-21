@@ -129,6 +129,17 @@ pub const Git = struct {
         return self.allocator.dupe(u8, trimmed);
     }
 
+    /// Git path output is terminated by one newline; path bytes may themselves
+    /// end in newlines, unlike ordinary text output.
+    pub fn path(self: *const Git, args: []const []const u8) ![]u8 {
+        const result = try self.run(args);
+        defer self.freeResult(result);
+        if ((try exitCode(result)) != 0) return self.fail(result.stderr);
+        if (result.stdout.len == 0 or result.stdout[result.stdout.len - 1] != '\n')
+            return error.InvalidGitOutput;
+        return self.allocator.dupe(u8, result.stdout[0 .. result.stdout.len - 1]);
+    }
+
     /// execute a Git command that must succeed without retaining stdout
     pub fn exec(self: *const Git, args: []const []const u8) !void {
         const result = try self.run(args);
@@ -354,6 +365,8 @@ pub const Git = struct {
     /// One line of an `update-ref --stdin` transaction.
     pub const RefUpdate = union(enum) {
         verify: ExpectedRef,
+        /// Idempotent recovery pin; name contains its immutable object ID.
+        retain: ExpectedRef,
         create: ExpectedRef,
         /// compare-and-swap `name` from `old` to `new`
         update: struct { name: []const u8, new: []const u8, old: []const u8 },
@@ -374,6 +387,10 @@ pub const Git = struct {
 
         try w.writeAll("start\n");
         for (updates) |update| switch (update) {
+            .retain => |ref| {
+                try checkUpdate(ref.name, &.{ref.oid});
+                try w.print("update {s} {s}\n", .{ ref.name, ref.oid });
+            },
             .verify => |ref| {
                 try checkUpdate(ref.name, &.{ref.oid});
                 try w.print("verify {s} {s}\n", .{ ref.name, ref.oid });
@@ -407,15 +424,17 @@ pub const Git = struct {
     }
 
     fn updateRefStdin(self: *const Git, message: []const u8, transaction: []const u8) !void {
+        try self.input(&.{ "update-ref", "--create-reflog", "-m", message, "--stdin" }, transaction);
+    }
+
+    /// Feed stdin without a shell. Stdout is ignored; blob IDs are computed locally.
+    pub fn input(self: *const Git, args: []const []const u8, data: []const u8) !void {
+        const argv = try self.allocator.alloc([]const u8, args.len + 1);
+        defer self.allocator.free(argv);
+        argv[0] = "git";
+        @memcpy(argv[1..], args);
         var child = try std.process.spawn(self.io, .{
-            .argv = &.{
-                "git",
-                "update-ref",
-                "--create-reflog",
-                "-m",
-                message,
-                "--stdin",
-            },
+            .argv = argv,
             .cwd = self.childCwd(),
             .environ_map = self.environ_map,
             .stdin = .pipe,
@@ -431,7 +450,7 @@ pub const Git = struct {
             }
         }
 
-        try child.stdin.?.writeStreamingAll(self.io, transaction);
+        try child.stdin.?.writeStreamingAll(self.io, data);
         child.stdin.?.close(self.io);
         child.stdin = null;
 
@@ -452,6 +471,47 @@ pub const Git = struct {
         reaped = true;
 
         if (!term.success()) return self.fail(stderr);
+    }
+
+    pub const ObjectFormat = enum { sha1, sha256 };
+
+    pub fn objectFormat(self: *const Git) !ObjectFormat {
+        const format = try self.output(&.{ "rev-parse", "--show-object-format" });
+        defer self.allocator.free(format);
+        return std.meta.stringToEnum(ObjectFormat, format) orelse error.InvalidGitOutput;
+    }
+
+    /// Store session metadata as a Git blob, usable in the same transaction as refs.
+    pub fn writeBlob(self: *const Git, data: []const u8) ![]u8 {
+        return self.writeBlobWithFormat(data, try self.objectFormat());
+    }
+
+    /// Reuse a known object format when writing a sequence of checkpoints.
+    pub fn writeBlobWithFormat(self: *const Git, data: []const u8, format: ObjectFormat) ![]u8 {
+        var header_buffer: ["blob ".len + 20 + 1]u8 = undefined;
+        const header = try std.fmt.bufPrint(&header_buffer, "blob {d}\x00", .{data.len});
+        var digest: [32]u8 = undefined;
+        const len: usize = if (format == .sha1) blk: {
+            var hash = std.crypto.hash.Sha1.init(.{});
+            hash.update(header);
+            hash.update(data);
+            hash.final(digest[0..20]);
+            break :blk 20;
+        } else blk: {
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update(header);
+            hash.update(data);
+            hash.final(&digest);
+            break :blk 32;
+        };
+        try self.input(&.{ "hash-object", "-w", "--stdin" }, data);
+        const hex = try self.allocator.alloc(u8, len * 2);
+        const alphabet = "0123456789abcdef";
+        for (digest[0..len], 0..) |byte, i| {
+            hex[2 * i] = alphabet[byte >> 4];
+            hex[2 * i + 1] = alphabet[byte & 15];
+        }
+        return hex;
     }
 
     /// atomically create a layer and advance the internal tip guard
@@ -487,6 +547,19 @@ pub const Git = struct {
         count += 1;
 
         try self.transact("stakrr: cut", updates[0..count]);
+    }
+
+    pub fn switchBranch(self: *const Git, ref_name: []const u8) !void {
+        if (!isSafeBranchRef(ref_name)) return error.InvalidRefName;
+
+        const branch = ref_name["refs/heads/".len..];
+
+        // Reject option-like names and Git's "-" previous-branch shorthand.
+        if (branch[0] == '-') return error.InvalidRefName;
+
+        try self.exec(&.{
+            "switch", "--quiet", "--no-guess", "--no-overwrite-ignore", "--", branch,
+        });
     }
 };
 

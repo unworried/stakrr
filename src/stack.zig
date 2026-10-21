@@ -1,10 +1,11 @@
 const std = @import("std");
 const git_mod = @import("git.zig");
 const Git = git_mod.Git;
+const coordination = @import("state.zig");
 
 /// Domain errors raised by stack operations. Every member needs a
 /// user-facing message in main.zig; a test there enforces it.
-pub const Error = git_mod.Error || error{
+pub const Error = git_mod.Error || coordination.Error || error{
     AlreadyInitialized,
     NotInitialized,
     ExistingStackRefs,
@@ -24,6 +25,7 @@ pub const Error = git_mod.Error || error{
     EmptyCut,
     InvalidCutBoundary,
     CutOutsideWork,
+    NotOnStackBranch,
 };
 
 /// git config key holding "<version> <base_ref> <work_ref>"
@@ -83,6 +85,9 @@ pub fn initStack(
     git: *const Git,
     base_name: []const u8,
 ) !void {
+    const guard = try coordination.lock(git);
+    defer guard.close(git.io);
+    try coordination.requireNoSession(git);
     const allocator = git.allocator;
     // 1. require standard working tree
     try git.ensureWorkTree();
@@ -349,6 +354,9 @@ pub fn cut(
     name: []const u8,
     revision: ?[]const u8,
 ) !void {
+    const guard = try coordination.lock(git);
+    defer guard.close(git.io);
+    try coordination.requireNoSession(git);
     const allocator = git.allocator;
 
     // validate the name before inspecting the stack
@@ -438,6 +446,9 @@ pub const ResetResult = struct {
 /// re-initialised. Layer branches are kept unless `delete_layers` is set.
 /// Works on corrupt or outdated state, so it never parses the config.
 pub fn reset(git: *const Git, delete_layers: bool) !ResetResult {
+    const guard = try coordination.lock(git);
+    defer guard.close(git.io);
+    try coordination.requireNoSession(git);
     const allocator = git.allocator;
     try git.ensureWorkTree();
 
@@ -501,4 +512,40 @@ pub fn reset(git: *const Git, delete_layers: bool) !ResetResult {
         .deleted_layers = if (delete_layers) layer_count else 0,
         .kept_layers = if (delete_layers) 0 else layer_count,
     };
+}
+
+pub const Direction = enum { up, down };
+
+/// Navigation positions: base, ordered layers, rolling work.
+fn navigationRef(snapshot: *const Snapshot, index: usize) []const u8 {
+    if (index == 0) return snapshot.config.base_ref;
+    if (index == snapshot.layers.len + 1)
+        return snapshot.config.work_ref;
+    return snapshot.layers[index - 1].ref_name;
+}
+
+/// Returns false when already at the requested end of the stack.
+pub fn navigate(git: *const Git, direction: Direction) !bool {
+    const guard = try coordination.lock(git);
+    defer guard.close(git.io);
+    try coordination.requireNoSession(git);
+    var snapshot = try inspect(git);
+    defer snapshot.deinit(git.allocator);
+
+    const current = try git.currentBranch();
+    defer git.allocator.free(current);
+
+    const top = snapshot.layers.len + 1;
+    const index = for (0..(top + 1)) |i| {
+        if (std.mem.eql(u8, current, navigationRef(&snapshot, i)))
+            break i;
+    } else return error.NotOnStackBranch;
+
+    const target_index = switch (direction) {
+        .up => if (index == top) return false else index + 1,
+        .down => if (index == 0) return false else index - 1,
+    };
+
+    try git.switchBranch(navigationRef(&snapshot, target_index));
+    return true;
 }

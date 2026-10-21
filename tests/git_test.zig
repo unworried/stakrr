@@ -7,6 +7,31 @@ const Git = stakrr_git.Git;
 const support = @import("support/repo.zig");
 const Repo = support.Repo;
 
+test "blob storage computes Git object IDs for both formats and arbitrary bytes" {
+    inline for (.{ "sha1", "sha256" }) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+
+        for ([_][]const u8{ "", "metadata\x00with binary bytes\xff\n\n" }) |data| {
+            const oid = try repo.git.writeBlob(data);
+            defer testing.allocator.free(oid);
+            try testing.expectEqual(@as(usize, if (std.mem.eql(u8, format, "sha1")) 40 else 64), oid.len);
+            const result = try repo.git.run(&.{ "cat-file", "blob", oid });
+            defer repo.git.freeResult(result);
+            try testing.expect(result.term.success());
+            try testing.expectEqualStrings(data, result.stdout);
+        }
+    }
+}
+
+test "Git paths preserve trailing newline bytes" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    const path = try repo.git.path(&.{ "rev-parse", "--git-path", "trailing\n\n" });
+    defer testing.allocator.free(path);
+    try testing.expectEqualStrings(".git/trailing\n\n", path);
+}
+
 test "ensureWorkTree accepts a normal repository" {
     var repo = try Repo.init();
     defer repo.deinit();

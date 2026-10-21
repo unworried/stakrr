@@ -4,6 +4,7 @@ const stakrr = @import("stakrr");
 const Git = stakrr.git.Git;
 const Diagnostics = stakrr.git.Diagnostics;
 const stack = stakrr.stack;
+const edit = stakrr.edit;
 const term = @import("term.zig");
 const Terminal = term.Terminal;
 
@@ -14,6 +15,9 @@ pub const Command = union(enum) {
     status,
     cut: struct { name: []const u8, at: ?[]const u8 = null },
     reset: struct { delete_layers: bool = false },
+    up,
+    down,
+    edit: edit.Request,
 };
 
 pub const ParseError = error{ InvalidArguments, UnknownCommand };
@@ -101,11 +105,29 @@ pub fn parseArgs(args: []const []const u8) ParseError!Command {
         } };
     }
 
+    if (eql(command, "edit")) {
+        if (rest.len == 0) return .{ .edit = .{ .jump = null } };
+        if (rest.len != 1) return error.InvalidArguments;
+        if (eql(rest[0], "--continue")) return .{ .edit = .continue_edit };
+        if (eql(rest[0], "--abort")) return .{ .edit = .abort };
+        return .{ .edit = .{ .jump = try value(rest[0]) } };
+    }
+
     if (eql(command, "reset")) {
         if (rest.len == 0) return .{ .reset = .{} };
         if (rest.len == 1 and eql(rest[0], "--delete-layers"))
             return .{ .reset = .{ .delete_layers = true } };
         return error.InvalidArguments;
+    }
+
+    if (eql(command, "up")) {
+        if (rest.len != 0) return error.InvalidArguments;
+        return .up;
+    }
+
+    if (eql(command, "down")) {
+        if (rest.len != 0) return error.InvalidArguments;
+        return .down;
     }
 
     return error.UnknownCommand;
@@ -137,10 +159,25 @@ fn runCommand(
             try stdout.writeByte('\n');
         },
         .status => {
+            if (try edit.printStatus(git, stdout)) return;
             var snapshot = try stack.inspect(git);
             defer snapshot.deinit(git.allocator);
 
-            try printStatus(out, snapshot);
+            const current: ?[]u8 = git.currentBranch() catch |err| switch (err) {
+                error.DetachedHead => null,
+                else => return err,
+            };
+            defer if (current) |ref| git.allocator.free(ref);
+
+            try printStatus(out, snapshot, current);
+        },
+        .edit => |request| {
+            try edit.run(git, request);
+            if (!try edit.printStatus(git, stdout)) {
+                try stdout.writeAll("edit session closed; returned to origin\n");
+                if (request == .abort)
+                    try stdout.writeAll("retained edits: git for-each-ref refs/stakrr/recovery/\n");
+            }
         },
         .cut => |options| {
             try stack.cut(git, options.name, options.at);
@@ -163,6 +200,14 @@ fn runCommand(
                 });
                 try stdout.writeAll("; remove them or run 'stakrr reset --delete-layers' before re-initializing\n");
             }
+        },
+        .up => {
+            if (!try stack.navigate(git, .up))
+                try stdout.writeAll("already at top\n");
+        },
+        .down => {
+            if (!try stack.navigate(git, .down))
+                try stdout.writeAll("already at base\n");
         },
     }
 }
@@ -210,7 +255,10 @@ const help_commands = [_]struct { name: []const u8, args: []const u8, about: []c
     .{ .name = "init", .args = "--base <branch>", .about = "adopt current branch as rolling work" },
     .{ .name = "status", .args = "", .about = "display layers and unstacked commits" },
     .{ .name = "cut", .args = "<name> [--at <rev>]", .about = "create the next layer" },
+    .{ .name = "edit", .args = "[<cut>|--continue|--abort]", .about = "edit a cut and replay descendants" },
     .{ .name = "reset", .args = "[--delete-layers]", .about = "forget the stack so it can be re-initialized" },
+    .{ .name = "up", .args = "", .about = "switch toward rolling work" },
+    .{ .name = "down", .args = "", .about = "switch toward the base" },
     .{ .name = "version", .args = "", .about = "print the stakrr version" },
     .{ .name = "help", .args = "", .about = "show this message" },
 };
@@ -229,7 +277,7 @@ fn printHelp(out: Terminal) !void {
         try w.writeAll("  ");
         try term.styled(out, .accent, "{s}", .{cmd.name});
         if (cmd.args.len != 0) try w.print(" {s}", .{cmd.args});
-        try w.splatByteAll(' ', 30 - width);
+        try w.splatByteAll(' ', @max(30, width + 2) - width);
         try term.styled(out, .dim, "{s}", .{cmd.about});
         try w.writeByte('\n');
     }
@@ -237,6 +285,20 @@ fn printHelp(out: Terminal) !void {
 
 fn userError(err: anyerror) ?[]const u8 {
     return switch (err) {
+        error.MutationInProgress => "another stakrr mutation is running",
+        error.EditInProgress => "an edit session is active (finish with 'stakrr edit' or 'stakrr edit --abort')",
+        error.BranchOccupied => "a required branch is checked out in another worktree",
+        error.DirtyWorkTree => "preserve uncommitted changes before editing, continuing, or aborting",
+        error.GitOperationInProgress => "finish the active Git operation before proceeding",
+        error.NoEditSession => "no edit session is active",
+        error.UnknownCut => "cut not found (use its short name)",
+        error.WrongEditWorktree => "this edit session belongs to another worktree",
+        error.InvalidEditSession => "invalid edit checkpoint; keep refs/stakrr/edit and recovery refs for recovery",
+        error.EditStateChanged => "Git refs or HEAD changed outside the edit workflow; preserve work before recovery",
+        error.ReplayConflict => "replay conflict: resolve files, git add them, then run 'stakrr edit --continue'; preserve uncommitted work before '--abort'",
+        error.NoPendingEdit => "no transition is pending (use 'stakrr edit [<cut>]' to leave the active cut)",
+        error.EditNeedsContinue => "use 'stakrr edit --continue' to complete the pending transition",
+        error.InvalidEditedHistory => "edited cut must contain linear commits above its previous boundary",
         error.InvalidArguments => "invalid arguments (run 'stakrr help')",
         error.UnknownCommand => "unknown command (run 'stakrr help')",
         error.NotInitialized => "stack not initialized (run 'stakrr init --base <branch>')",
@@ -268,6 +330,7 @@ fn userError(err: anyerror) ?[]const u8 {
         error.StreamTooLong => "git output exceeded the size limit",
         error.FileNotFound => "git executable not found on PATH",
         error.OutOfMemory => "out of memory",
+        error.NotOnStackBranch => "current branch is outside the configured stack",
         else => null,
     };
 }
@@ -287,13 +350,19 @@ fn plural(n: usize, one: []const u8, many: []const u8) []const u8 {
 
 /// draw the stack top-down: rolling work, layers from highest to lowest,
 /// then the base they were cut from
-fn printStatus(out: Terminal, snapshot: stack.Snapshot) !void {
+/// Draw the stack top-down, marking the checked-out branch with ▸.
+fn printStatus(
+    out: Terminal,
+    snapshot: stack.Snapshot,
+    current: ?[]const u8,
+) !void {
     const w = out.writer;
     const base = shortRef(snapshot.config.base_ref);
     const work = shortRef(snapshot.config.work_ref);
 
     var width = @max(base.len, work.len);
-    for (snapshot.layers) |layer| width = @max(width, shortRef(layer.ref_name).len);
+    for (snapshot.layers) |layer|
+        width = @max(width, shortRef(layer.ref_name).len);
     width += 3;
 
     try term.styled(out, .dim, "stack", .{});
@@ -313,7 +382,10 @@ fn printStatus(out: Terminal, snapshot: stack.Snapshot) !void {
     }
 
     try w.writeAll("  ");
-    try term.styled(out, .accent, "▸ {s}", .{work});
+    try term.styled(out, .accent, "{s} {s}", .{
+        if (isCurrent(current, snapshot.config.work_ref)) "▸" else "│",
+        work,
+    });
     try w.splatByteAll(' ', width - work.len);
     try term.styled(out, .dim, "{d} unstacked", .{snapshot.unstacked_commits});
     try w.writeByte('\n');
@@ -323,8 +395,12 @@ fn printStatus(out: Terminal, snapshot: stack.Snapshot) !void {
         i -= 1;
         const layer = snapshot.layers[i];
         const name = shortRef(layer.ref_name);
+        const selected = isCurrent(current, layer.ref_name);
+
         try w.writeAll("  ");
-        try term.styled(out, .dim, "│", .{});
+        try term.styled(out, if (selected) .accent else .dim, "{s}", .{
+            if (selected) "▸" else "│",
+        });
         try w.print(" {s}", .{name});
         try w.splatByteAll(' ', width - name.len);
         try term.styled(out, .dim, "{d} {s}", .{
@@ -334,8 +410,12 @@ fn printStatus(out: Terminal, snapshot: stack.Snapshot) !void {
         try w.writeByte('\n');
     }
 
+    const base_selected = isCurrent(current, snapshot.config.base_ref);
+
     try w.writeAll("  ");
-    try term.styled(out, .dim, "└", .{});
+    try term.styled(out, if (base_selected) .accent else .dim, "{s}", .{
+        if (base_selected) "▸" else "└",
+    });
     try w.print(" {s}", .{base});
     try w.splatByteAll(' ', width - base.len);
     try term.styled(out, .dim, "base", .{});
@@ -347,6 +427,10 @@ fn printStatus(out: Terminal, snapshot: stack.Snapshot) !void {
     });
 }
 
+fn isCurrent(current: ?[]const u8, ref_name: []const u8) bool {
+    return if (current) |ref| eql(ref, ref_name) else false;
+}
+
 const testing = std.testing;
 
 test {
@@ -354,7 +438,7 @@ test {
 }
 
 test "every domain error has a user message" {
-    inline for (@typeInfo(stack.Error).error_set.error_names.?) |name| {
+    inline for (@typeInfo(stack.Error || edit.Error).error_set.error_names.?) |name| {
         try testing.expect(userError(@field(anyerror, name)) != null);
     }
 }
@@ -403,4 +487,13 @@ test "parseArgs: status and reset" {
     try testing.expect(!(try parseArgs(&.{ "stakrr", "reset" })).reset.delete_layers);
     try testing.expect((try parseArgs(&.{ "stakrr", "reset", "--delete-layers" })).reset.delete_layers);
     try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "reset", "--force" }));
+}
+
+test "parseArgs: edit transitions are mutually exclusive" {
+    try testing.expect((try parseArgs(&.{ "stakrr", "edit" })).edit.jump == null);
+    try testing.expectEqualStrings("models", (try parseArgs(&.{ "stakrr", "edit", "models" })).edit.jump.?);
+    try testing.expectEqual(edit.Request.continue_edit, (try parseArgs(&.{ "stakrr", "edit", "--continue" })).edit);
+    try testing.expectEqual(edit.Request.abort, (try parseArgs(&.{ "stakrr", "edit", "--abort" })).edit);
+    try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "edit", "models", "--abort" }));
+    try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "edit", "--unknown" }));
 }
