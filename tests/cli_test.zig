@@ -205,3 +205,76 @@ test "cli: navigation and status follow the checked-out branch" {
     try testing.expectEqual(@as(u8, 0), detached.code);
     try testing.expect(std.mem.indexOf(u8, detached.stdout, "▸") == null);
 }
+
+test "cli: edit confirmations and status share terminal conventions" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try setup(&repo);
+    const init = try stakrr(&repo, &.{ "init", "--base", "main" });
+    defer init.deinit();
+    const oid = try repo.commit("layer");
+    testing.allocator.free(oid);
+    const cut = try stakrr(&repo, &.{ "cut", "p1" });
+    defer cut.deinit();
+    const started = try stakrr(&repo, &.{ "edit", "p1" });
+    defer started.deinit();
+    try testing.expectEqual(@as(u8, 0), started.code);
+    try testing.expectEqualStrings("editing stakrr/p1\n", started.stdout);
+    const status = try stakrr(&repo, &.{"status"});
+    defer status.deinit();
+    try testing.expectEqualStrings(
+        "stack  main → work\nedit   stakrr/p1\n\n  │ work\n  ▸ stakrr/p1   editing\n  └ main        base\n\n  1 layer\n",
+        status.stdout,
+    );
+    try repo.env.put("CLICOLOR_FORCE", "1");
+    const colored = try stakrr(&repo, &.{"status"});
+    defer colored.deinit();
+    try testing.expect(std.mem.indexOf(u8, colored.stdout, "\x1b[36m") != null);
+    try repo.env.put("NO_COLOR", "1");
+    const plain = try stakrr(&repo, &.{"status"});
+    defer plain.deinit();
+    try testing.expectEqualStrings(status.stdout, plain.stdout);
+    const finished = try stakrr(&repo, &.{"edit"});
+    defer finished.deinit();
+    try testing.expectEqualStrings("edit completed; returned to work\n", finished.stdout);
+    const restarted = try stakrr(&repo, &.{ "edit", "p1" });
+    defer restarted.deinit();
+    const aborted = try stakrr(&repo, &.{ "edit", "--abort" });
+    defer aborted.deinit();
+    try testing.expectEqualStrings("edit aborted; returned to work\nretained edits: git for-each-ref refs/stakrr/recovery/\n", aborted.stdout);
+}
+
+test "cli: conflict status shows detached replay and a resolution hint" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try setup(&repo);
+    const init = try stakrr(&repo, &.{ "init", "--base", "main" });
+    defer init.deinit();
+    try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "shared", .data = "lower\n" });
+    try repo.exec(&.{ "add", "shared" });
+    const lower = try repo.commit("lower");
+    testing.allocator.free(lower);
+    const cut = try stakrr(&repo, &.{ "cut", "p1" });
+    defer cut.deinit();
+    try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "shared", .data = "upper\n" });
+    try repo.exec(&.{ "add", "shared" });
+    const upper = try repo.commit("upper");
+    testing.allocator.free(upper);
+    const started = try stakrr(&repo, &.{ "edit", "p1" });
+    defer started.deinit();
+    try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "shared", .data = "edited\n" });
+    try repo.exec(&.{ "add", "shared" });
+    const edited = try repo.commit("edited");
+    testing.allocator.free(edited);
+    const conflict = try stakrr(&repo, &.{"edit"});
+    defer conflict.deinit();
+    try testing.expectEqual(@as(u8, 1), conflict.code);
+    try testing.expectEqualStrings("", conflict.stdout);
+    const status = try stakrr(&repo, &.{"status"});
+    defer status.deinit();
+    try testing.expectEqual(@as(u8, 0), status.code);
+    try testing.expectEqualStrings(
+        "stack  main → work\nedit   stakrr/p1 (conflict) → work\n\n  │ work\n  │ stakrr/p1   conflict\n  └ main        base\n\n  1 layer\n\n  resolve conflicts, git add, then stakrr edit --continue\n",
+        status.stdout,
+    );
+}

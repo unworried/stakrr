@@ -16,10 +16,9 @@ test "blob storage computes Git object IDs for both formats and arbitrary bytes"
             const oid = try repo.git.writeBlob(data);
             defer testing.allocator.free(oid);
             try testing.expectEqual(@as(usize, if (std.mem.eql(u8, format, "sha1")) 40 else 64), oid.len);
-            const result = try repo.git.run(&.{ "cat-file", "blob", oid });
-            defer repo.git.freeResult(result);
-            try testing.expect(result.term.success());
-            try testing.expectEqualStrings(data, result.stdout);
+            const bytes = try repo.git.outputRaw(&.{ "cat-file", "blob", oid });
+            defer testing.allocator.free(bytes);
+            try testing.expectEqualStrings(data, bytes);
         }
     }
 }
@@ -312,17 +311,17 @@ test "configGet rejects empty values" {
     );
 }
 
-test "listStackRefs returns empty when no layers exist" {
+test "listRefs returns empty when the prefix has no refs" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const refs = try repo.git.listStackRefs();
+    const refs = try repo.git.listRefs("refs/heads/stakrr/");
     defer testing.allocator.free(refs);
 
     try testing.expectEqualStrings("", refs);
 }
 
-test "listStackRefs finds only owned stack branches" {
+test "listRefs finds only branches under the requested prefix" {
     var repo = try Repo.init();
     defer repo.deinit();
 
@@ -333,7 +332,7 @@ test "listStackRefs finds only owned stack branches" {
     try repo.exec(&.{ "branch", "stakrr/second" });
     try repo.exec(&.{ "branch", "stakrr-other" });
 
-    const refs = try repo.git.listStackRefs();
+    const refs = try repo.git.listRefs("refs/heads/stakrr/");
     defer testing.allocator.free(refs);
 
     const first = try std.fmt.allocPrint(

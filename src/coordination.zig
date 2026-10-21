@@ -3,7 +3,14 @@ const std = @import("std");
 const Git = @import("git.zig").Git;
 
 pub const session_ref = "refs/stakrr/edit";
-pub const Error = error{ MutationInProgress, EditInProgress, BranchOccupied, DirtyWorkTree, GitOperationInProgress };
+pub const Error = error{
+    MutationInProgress,
+    EditInProgress,
+    BranchOccupied,
+    DirtyWorkTree,
+    IgnoredFilesPresent,
+    GitOperationInProgress,
+};
 
 /// Keep the inode: unlinking an advisory lock would allow two owners.
 pub fn lock(git: *const Git) !std.Io.File {

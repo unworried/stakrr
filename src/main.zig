@@ -14,7 +14,7 @@ pub const Command = union(enum) {
     init: struct { base: []const u8 },
     status,
     cut: struct { name: []const u8, at: ?[]const u8 = null },
-    reset: struct { delete_layers: bool = false },
+    reset: stack.ResetOptions,
     up,
     down,
     edit: edit.Request,
@@ -159,7 +159,7 @@ fn runCommand(
             try stdout.writeByte('\n');
         },
         .status => {
-            if (try edit.printStatus(git, stdout)) return;
+            if (try printEditStatus(git, out)) return;
             var snapshot = try stack.inspect(git);
             defer snapshot.deinit(git.allocator);
 
@@ -173,11 +173,20 @@ fn runCommand(
         },
         .edit => |request| {
             try edit.run(git, request);
-            if (!try edit.printStatus(git, stdout)) {
-                try stdout.writeAll("edit session closed; returned to origin\n");
-                if (request == .abort)
-                    try stdout.writeAll("retained edits: git for-each-ref refs/stakrr/recovery/\n");
+            var status = try edit.readStatus(git);
+            defer if (status) |*view| view.deinit();
+            if (status) |view| {
+                try stdout.writeAll("editing ");
+                try term.styled(out, .accent, "{s}", .{shortRef(view.branches[view.active])});
+            } else {
+                const branch = try git.currentBranch();
+                defer git.allocator.free(branch);
+                try stdout.print("edit {s}; returned to ", .{if (request == .abort) "aborted" else "completed"});
+                try term.styled(out, .accent, "{s}", .{shortRef(branch)});
             }
+            try stdout.writeByte('\n');
+            if (request == .abort)
+                try stdout.writeAll("retained edits: git for-each-ref refs/stakrr/recovery/\n");
         },
         .cut => |options| {
             try stack.cut(git, options.name, options.at);
@@ -186,7 +195,7 @@ fn runCommand(
             try stdout.writeByte('\n');
         },
         .reset => |options| {
-            const result = try stack.reset(git, options.delete_layers);
+            const result = try stack.reset(git, options);
             try stdout.writeAll("stack reset\n");
             if (result.deleted_layers != 0)
                 try stdout.print("deleted {d} layer {s}\n", .{
@@ -198,7 +207,9 @@ fn runCommand(
                     result.kept_layers,
                     plural(result.kept_layers, "branch", "branches"),
                 });
-                try stdout.writeAll("; remove them or run 'stakrr reset --delete-layers' before re-initializing\n");
+                try stdout.writeAll(
+                    "; remove them or run 'stakrr reset --delete-layers' before re-initializing\n",
+                );
             }
         },
         .up => {
@@ -255,8 +266,16 @@ const help_commands = [_]struct { name: []const u8, args: []const u8, about: []c
     .{ .name = "init", .args = "--base <branch>", .about = "adopt current branch as rolling work" },
     .{ .name = "status", .args = "", .about = "display layers and unstacked commits" },
     .{ .name = "cut", .args = "<name> [--at <rev>]", .about = "create the next layer" },
-    .{ .name = "edit", .args = "[<cut>|--continue|--abort]", .about = "edit a cut and replay descendants" },
-    .{ .name = "reset", .args = "[--delete-layers]", .about = "forget the stack so it can be re-initialized" },
+    .{
+        .name = "edit",
+        .args = "[<cut>|--continue|--abort]",
+        .about = "edit a cut and replay descendants",
+    },
+    .{
+        .name = "reset",
+        .args = "[--delete-layers]",
+        .about = "forget the stack so it can be re-initialized",
+    },
     .{ .name = "up", .args = "", .about = "switch toward rolling work" },
     .{ .name = "down", .args = "", .about = "switch toward the base" },
     .{ .name = "version", .args = "", .about = "print the stakrr version" },
@@ -286,16 +305,21 @@ fn printHelp(out: Terminal) !void {
 fn userError(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MutationInProgress => "another stakrr mutation is running",
-        error.EditInProgress => "an edit session is active (finish with 'stakrr edit' or 'stakrr edit --abort')",
+        error.EditInProgress => "an edit session is active " ++
+            "(finish with 'stakrr edit' or 'stakrr edit --abort')",
         error.BranchOccupied => "a required branch is checked out in another worktree",
-        error.DirtyWorkTree => "preserve uncommitted changes before editing, continuing, or aborting",
+        error.DirtyWorkTree => "preserve uncommitted changes before proceeding",
+        error.IgnoredFilesPresent => "preserve and remove ignored files before replaying descendants",
         error.GitOperationInProgress => "finish the active Git operation before proceeding",
         error.NoEditSession => "no edit session is active",
         error.UnknownCut => "cut not found (use its short name)",
         error.WrongEditWorktree => "this edit session belongs to another worktree",
-        error.InvalidEditSession => "invalid edit checkpoint; keep refs/stakrr/edit and recovery refs for recovery",
-        error.EditStateChanged => "Git refs or HEAD changed outside the edit workflow; preserve work before recovery",
-        error.ReplayConflict => "replay conflict: resolve files, git add them, then run 'stakrr edit --continue'; preserve uncommitted work before '--abort'",
+        error.InvalidEditSession => "invalid edit checkpoint; " ++
+            "keep refs/stakrr/edit and recovery refs for recovery",
+        error.EditStateChanged => "Git refs or HEAD changed outside the edit workflow; " ++
+            "preserve work before recovery",
+        error.ReplayConflict => "replay conflict: resolve files, git add them, then run 'stakrr edit --continue'; " ++
+            "preserve uncommitted work before '--abort'",
         error.NoPendingEdit => "no transition is pending (use 'stakrr edit [<cut>]' to leave the active cut)",
         error.EditNeedsContinue => "use 'stakrr edit --continue' to complete the pending transition",
         error.InvalidEditedHistory => "edited cut must contain linear commits above its previous boundary",
@@ -303,15 +327,18 @@ fn userError(err: anyerror) ?[]const u8 {
         error.UnknownCommand => "unknown command (run 'stakrr help')",
         error.NotInitialized => "stack not initialized (run 'stakrr init --base <branch>')",
         error.AlreadyInitialized => "stack already initialized (run 'stakrr reset' to start over)",
-        error.ExistingStackRefs => "existing stakrr refs found (run 'stakrr reset --delete-layers' to remove them)",
+        error.ExistingStackRefs => "existing stakrr refs found " ++
+            "(run 'stakrr reset --delete-layers' to remove them)",
         error.ReservedBranchNamespace => "base and work branches cannot use stakrr/",
         error.BaseEqualsWork => "base and work branches must differ",
         error.BaseNotFound => "base branch not found (it must be a local branch)",
         error.BaseNotAncestor => "base is not an ancestor of work",
         error.MergeCommitsUnsupported => "merge commits in the stack are unsupported",
         error.InvalidConfig => "stakrr state in git config is invalid (run 'stakrr reset')",
-        error.UnsupportedConfigVersion => "stack was created by an incompatible stakrr version (run 'stakrr reset')",
-        error.InvalidStack, error.InvalidLayerBoundary => "stack refs are inconsistent with the rolling branch (run 'stakrr reset' to start over)",
+        error.UnsupportedConfigVersion => "stack was created by an incompatible stakrr version " ++
+            "(run 'stakrr reset')",
+        error.InvalidStack, error.InvalidLayerBoundary => "stack refs are inconsistent with the rolling branch " ++
+            "(run 'stakrr reset' to start over)",
         error.NotOnWorkBranch => "cut must run on the rolling work branch",
         error.InvalidLayerName => "invalid layer name",
         error.LayerExists => "a layer with that name already exists or conflicts with one",
@@ -335,6 +362,62 @@ fn userError(err: anyerror) ?[]const u8 {
     };
 }
 
+fn printEditStatus(git: *const Git, out: Terminal) !bool {
+    var status = (try edit.readStatus(git)) orelse return false;
+    defer status.deinit();
+    const w = out.writer;
+    const current = git.currentBranch() catch |err| switch (err) {
+        error.DetachedHead => null,
+        else => return err,
+    };
+    defer if (current) |ref| git.allocator.free(ref);
+    try printStackHeader(out, status.base, status.branches[status.branches.len - 1]);
+    try term.styled(out, .dim, "edit", .{});
+    try w.writeAll("   ");
+    try term.styled(out, .accent, "{s}", .{shortRef(status.branches[status.active])});
+    if (status.phase != .editing)
+        try w.print(" ({s}) → {s}", .{ @tagName(status.phase), shortRef(status.destination) });
+    try w.writeAll("\n\n");
+    var width = shortRef(status.base).len;
+    for (status.branches) |ref| width = @max(width, shortRef(ref).len);
+    width += 3;
+    var i = status.branches.len;
+    while (i > 0) {
+        i -= 1;
+        try printStackRow(out, status.branches[i], isCurrent(current, status.branches[i]), false, if (i == status.active) width else 0);
+        if (i == status.active)
+            try term.styled(out, if (status.phase == .conflict) .warn else .dim, "{s}", .{@tagName(status.phase)});
+        try w.writeByte('\n');
+    }
+    try printStackRow(out, status.base, isCurrent(current, status.base), true, width);
+    try term.styled(out, .dim, "base", .{});
+    try w.print("\n\n  {d} {s}\n", .{ status.branches.len - 1, plural(status.branches.len - 1, "layer", "layers") });
+    if (status.phase == .conflict) {
+        try w.writeAll("\n  resolve conflicts, git add, then stakrr edit --continue\n");
+    } else if (status.phase != .editing) {
+        try w.writeAll("\n  stakrr edit --continue\n");
+    }
+    return true;
+}
+
+fn printStackHeader(out: Terminal, base: []const u8, work: []const u8) !void {
+    try term.styled(out, .dim, "stack", .{});
+    try out.writer.print("  {s} → ", .{shortRef(base)});
+    try term.styled(out, .accent, "{s}", .{shortRef(work)});
+    try out.writer.writeByte('\n');
+}
+
+/// Shared branch markers and column alignment for ordinary and edit status.
+fn printStackRow(out: Terminal, ref: []const u8, selected: bool, base: bool, width: usize) !void {
+    const name = shortRef(ref);
+    try out.writer.writeAll("  ");
+    try term.styled(out, if (selected) .accent else .dim, "{s}", .{
+        if (selected) "▸" else if (base) "└" else "│",
+    });
+    try out.writer.print(" {s}", .{name});
+    if (width > name.len) try out.writer.splatByteAll(' ', width - name.len);
+}
+
 fn shortRef(ref_name: []const u8) []const u8 {
     const prefix = "refs/heads/";
 
@@ -348,8 +431,6 @@ fn plural(n: usize, one: []const u8, many: []const u8) []const u8 {
     return if (n == 1) one else many;
 }
 
-/// draw the stack top-down: rolling work, layers from highest to lowest,
-/// then the base they were cut from
 /// Draw the stack top-down, marking the checked-out branch with ▸.
 fn printStatus(
     out: Terminal,
@@ -365,10 +446,8 @@ fn printStatus(
         width = @max(width, shortRef(layer.ref_name).len);
     width += 3;
 
-    try term.styled(out, .dim, "stack", .{});
-    try w.print("  {s} → ", .{base});
-    try term.styled(out, .accent, "{s}", .{work});
-    try w.writeAll("\n\n");
+    try printStackHeader(out, snapshot.config.base_ref, snapshot.config.work_ref);
+    try w.writeByte('\n');
 
     if (snapshot.base_moved) {
         try w.writeAll("  ");
@@ -381,12 +460,7 @@ fn printStatus(
         try w.writeAll("\n\n");
     }
 
-    try w.writeAll("  ");
-    try term.styled(out, .accent, "{s} {s}", .{
-        if (isCurrent(current, snapshot.config.work_ref)) "▸" else "│",
-        work,
-    });
-    try w.splatByteAll(' ', width - work.len);
+    try printStackRow(out, snapshot.config.work_ref, isCurrent(current, snapshot.config.work_ref), false, width);
     try term.styled(out, .dim, "{d} unstacked", .{snapshot.unstacked_commits});
     try w.writeByte('\n');
 
@@ -394,15 +468,7 @@ fn printStatus(
     while (i > 0) {
         i -= 1;
         const layer = snapshot.layers[i];
-        const name = shortRef(layer.ref_name);
-        const selected = isCurrent(current, layer.ref_name);
-
-        try w.writeAll("  ");
-        try term.styled(out, if (selected) .accent else .dim, "{s}", .{
-            if (selected) "▸" else "│",
-        });
-        try w.print(" {s}", .{name});
-        try w.splatByteAll(' ', width - name.len);
+        try printStackRow(out, layer.ref_name, isCurrent(current, layer.ref_name), false, width);
         try term.styled(out, .dim, "{d} {s}", .{
             layer.commits,
             plural(layer.commits, "commit", "commits"),
@@ -410,14 +476,7 @@ fn printStatus(
         try w.writeByte('\n');
     }
 
-    const base_selected = isCurrent(current, snapshot.config.base_ref);
-
-    try w.writeAll("  ");
-    try term.styled(out, if (base_selected) .accent else .dim, "{s}", .{
-        if (base_selected) "▸" else "└",
-    });
-    try w.print(" {s}", .{base});
-    try w.splatByteAll(' ', width - base.len);
+    try printStackRow(out, snapshot.config.base_ref, isCurrent(current, snapshot.config.base_ref), true, width);
     try term.styled(out, .dim, "base", .{});
     try w.writeByte('\n');
 
@@ -458,7 +517,10 @@ test "parseArgs: init" {
     try testing.expectEqualStrings("main", b.init.base);
 
     try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "init" }));
-    try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "init", "--base", "--x" }));
+    try testing.expectError(
+        error.InvalidArguments,
+        parseArgs(&.{ "stakrr", "init", "--base", "--x" }),
+    );
     try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "init", "--base=" }));
 }
 
@@ -485,15 +547,29 @@ test "parseArgs: status and reset" {
     try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "status", "x" }));
 
     try testing.expect(!(try parseArgs(&.{ "stakrr", "reset" })).reset.delete_layers);
-    try testing.expect((try parseArgs(&.{ "stakrr", "reset", "--delete-layers" })).reset.delete_layers);
+    try testing.expect(
+        (try parseArgs(&.{ "stakrr", "reset", "--delete-layers" })).reset.delete_layers,
+    );
     try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "reset", "--force" }));
 }
 
 test "parseArgs: edit transitions are mutually exclusive" {
     try testing.expect((try parseArgs(&.{ "stakrr", "edit" })).edit.jump == null);
-    try testing.expectEqualStrings("models", (try parseArgs(&.{ "stakrr", "edit", "models" })).edit.jump.?);
-    try testing.expectEqual(edit.Request.continue_edit, (try parseArgs(&.{ "stakrr", "edit", "--continue" })).edit);
-    try testing.expectEqual(edit.Request.abort, (try parseArgs(&.{ "stakrr", "edit", "--abort" })).edit);
-    try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "edit", "models", "--abort" }));
+    try testing.expectEqualStrings(
+        "models",
+        (try parseArgs(&.{ "stakrr", "edit", "models" })).edit.jump.?,
+    );
+    try testing.expectEqual(
+        edit.Request.continue_edit,
+        (try parseArgs(&.{ "stakrr", "edit", "--continue" })).edit,
+    );
+    try testing.expectEqual(
+        edit.Request.abort,
+        (try parseArgs(&.{ "stakrr", "edit", "--abort" })).edit,
+    );
+    try testing.expectError(
+        error.InvalidArguments,
+        parseArgs(&.{ "stakrr", "edit", "models", "--abort" }),
+    );
     try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "edit", "--unknown" }));
 }

@@ -119,14 +119,19 @@ pub const Git = struct {
         self: *const Git,
         args: []const []const u8,
     ) ![]u8 {
+        const bytes = try self.outputRaw(args);
+        defer self.allocator.free(bytes);
+        return self.allocator.dupe(u8, std.mem.trimEnd(u8, bytes, "\r\n"));
+    }
+
+    /// Successful stdout, unchanged. The caller owns the returned bytes.
+    /// Use for blobs and NUL-delimited records, which are not text lines.
+    pub fn outputRaw(self: *const Git, args: []const []const u8) ![]u8 {
         const result = try self.run(args);
-        defer self.freeResult(result);
-
-        if ((try exitCode(result)) != 0)
-            return self.fail(result.stderr);
-
-        const trimmed = std.mem.trimEnd(u8, result.stdout, "\r\n");
-        return self.allocator.dupe(u8, trimmed);
+        defer self.allocator.free(result.stderr);
+        errdefer self.allocator.free(result.stdout);
+        if ((try exitCode(result)) != 0) return self.fail(result.stderr);
+        return result.stdout;
     }
 
     /// Git path output is terminated by one newline; path bytes may themselves
@@ -199,7 +204,11 @@ pub const Git = struct {
     /// Commits in `older..newer`, oldest first, one "<oid> <parents...>"
     /// line per commit. The caller owns the returned buffer.
     pub fn revListParents(self: *const Git, older: []const u8, newer: []const u8) ![]u8 {
-        const range = try std.fmt.allocPrint(self.allocator, "{s}..{s}", .{ older, newer });
+        const range = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}..{s}",
+            .{ older, newer },
+        );
         defer self.allocator.free(range);
         return self.output(&.{ "rev-list", "--parents", "--reverse", "--end-of-options", range });
     }
@@ -325,19 +334,15 @@ pub const Git = struct {
         };
     }
 
-    pub fn listStackRefs(self: *const Git) ![]u8 {
+    pub fn listRefs(self: *const Git, prefix: []const u8) ![]u8 {
         return self.output(&.{
             "for-each-ref",
             "--format=%(refname)%09%(objectname)",
-            "refs/heads/stakrr/",
+            prefix,
         });
     }
 
-    pub fn countCommits(
-        self: *const Git,
-        older: []const u8,
-        newer: []const u8,
-    ) !usize {
+    pub fn countCommits(self: *const Git, older: []const u8, newer: []const u8) !usize {
         const range = try std.fmt.allocPrint(
             self.allocator,
             "{s}..{s}",
@@ -423,12 +428,24 @@ pub const Git = struct {
         }
     }
 
-    fn updateRefStdin(self: *const Git, message: []const u8, transaction: []const u8) !void {
-        try self.input(&.{ "update-ref", "--create-reflog", "-m", message, "--stdin" }, transaction);
+    fn updateRefStdin(
+        self: *const Git,
+        message: []const u8,
+        transaction: []const u8,
+    ) !void {
+        try self.input(
+            &.{ "update-ref", "--create-reflog", "-m", message, "--stdin" },
+            transaction,
+        );
     }
 
-    /// Feed stdin without a shell. Stdout is ignored; blob IDs are computed locally.
-    pub fn input(self: *const Git, args: []const []const u8, data: []const u8) !void {
+    /// Feed stdin without a shell. Stdout is ignored; blob IDs are
+    /// computed locally.
+    pub fn input(
+        self: *const Git,
+        args: []const []const u8,
+        data: []const u8,
+    ) !void {
         const argv = try self.allocator.alloc([]const u8, args.len + 1);
         defer self.allocator.free(argv);
         argv[0] = "git";
@@ -478,7 +495,8 @@ pub const Git = struct {
     pub fn objectFormat(self: *const Git) !ObjectFormat {
         const format = try self.output(&.{ "rev-parse", "--show-object-format" });
         defer self.allocator.free(format);
-        return std.meta.stringToEnum(ObjectFormat, format) orelse error.InvalidGitOutput;
+        return std.meta.stringToEnum(ObjectFormat, format) orelse
+            error.InvalidGitOutput;
     }
 
     /// Store session metadata as a Git blob, usable in the same transaction as refs.
@@ -487,9 +505,17 @@ pub const Git = struct {
     }
 
     /// Reuse a known object format when writing a sequence of checkpoints.
-    pub fn writeBlobWithFormat(self: *const Git, data: []const u8, format: ObjectFormat) ![]u8 {
+    pub fn writeBlobWithFormat(
+        self: *const Git,
+        data: []const u8,
+        format: ObjectFormat,
+    ) ![]u8 {
         var header_buffer: ["blob ".len + 20 + 1]u8 = undefined;
-        const header = try std.fmt.bufPrint(&header_buffer, "blob {d}\x00", .{data.len});
+        const header = try std.fmt.bufPrint(
+            &header_buffer,
+            "blob {d}\x00",
+            .{data.len},
+        );
         var digest: [32]u8 = undefined;
         const len: usize = if (format == .sha1) blk: {
             var hash = std.crypto.hash.Sha1.init(.{});
@@ -514,41 +540,6 @@ pub const Git = struct {
         return hex;
     }
 
-    /// atomically create a layer and advance the internal tip guard
-    /// verifies all observed refs and fails if the stack changed meanwhile
-    pub fn createLayerRef(
-        self: *const Git,
-        name: []const u8,
-        oid: []const u8,
-        anchor: ExpectedRef,
-        work: ExpectedRef,
-        previous: ?ExpectedRef,
-    ) !void {
-        var updates: [5]RefUpdate = undefined;
-        var count: usize = 0;
-
-        updates[count] = .{ .verify = anchor };
-        count += 1;
-        updates[count] = .{ .verify = work };
-        count += 1;
-
-        if (previous) |ref| {
-            updates[count] = .{ .verify = ref };
-            count += 1;
-        }
-
-        updates[count] = .{ .create = .{ .name = name, .oid = oid } };
-        count += 1;
-
-        updates[count] = if (previous) |ref|
-            .{ .update = .{ .name = tip_ref, .new = oid, .old = ref.oid } }
-        else
-            .{ .create = .{ .name = tip_ref, .oid = oid } };
-        count += 1;
-
-        try self.transact("stakrr: cut", updates[0..count]);
-    }
-
     pub fn switchBranch(self: *const Git, ref_name: []const u8) !void {
         if (!isSafeBranchRef(ref_name)) return error.InvalidRefName;
 
@@ -562,12 +553,3 @@ pub const Git = struct {
         });
     }
 };
-
-/// internal guard pointing at the highest layer
-pub const tip_ref = "refs/stakrr/tip";
-
-/// the stack's starting commit; also keeps it reachable for gc
-pub const anchor_ref = "refs/stakrr/anchor";
-
-/// namespace for stakrr-managed layer branches
-pub const layer_prefix = "refs/heads/stakrr/";

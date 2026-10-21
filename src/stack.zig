@@ -1,7 +1,7 @@
 const std = @import("std");
 const git_mod = @import("git.zig");
 const Git = git_mod.Git;
-const coordination = @import("state.zig");
+const coordination = @import("coordination.zig");
 
 /// Domain errors raised by stack operations. Every member needs a
 /// user-facing message in main.zig; a test there enforces it.
@@ -27,6 +27,15 @@ pub const Error = git_mod.Error || coordination.Error || error{
     CutOutsideWork,
     NotOnStackBranch,
 };
+
+/// internal guard pointing at the highest layer
+pub const tip_ref = "refs/stakrr/tip";
+
+/// the stack's starting commit; also keeps it reachable for gc
+pub const anchor_ref = "refs/stakrr/anchor";
+
+/// namespace for stakrr-managed layer branches
+pub const layer_prefix = "refs/heads/stakrr/";
 
 /// git config key holding "<version> <base_ref> <work_ref>"
 pub const state_key = "stakrr.state";
@@ -54,11 +63,8 @@ pub const Layer = struct {
     ref_name: []const u8,
     oid: []const u8,
 
-    // commits between anchor and this layer
-    depth: usize,
-
     // commits since the previous layer boundary
-    commits: usize = 0,
+    commits: usize,
 };
 
 pub const Snapshot = struct {
@@ -89,8 +95,7 @@ pub fn initStack(
     defer guard.close(git.io);
     try coordination.requireNoSession(git);
     const allocator = git.allocator;
-    // 1. require standard working tree
-    try git.ensureWorkTree();
+    // lock() also validates the working tree.
 
     // 2. refuse existing initialisation
     if (try git.configGet(state_key)) |existing| {
@@ -99,10 +104,10 @@ pub fn initStack(
     }
 
     // reserve stakrr's branch namespace and internal refs for managed layers
-    const existing_layers = try git.listStackRefs();
+    const existing_layers = try git.listRefs(layer_prefix);
     defer allocator.free(existing_layers);
     if (existing_layers.len != 0) return error.ExistingStackRefs;
-    for ([_][]const u8{ git_mod.tip_ref, git_mod.anchor_ref }) |ref_name| {
+    for ([_][]const u8{ tip_ref, anchor_ref }) |ref_name| {
         const existing = try git.readRef(ref_name);
         defer if (existing) |oid| allocator.free(oid);
         if (existing != null) return error.ExistingStackRefs;
@@ -120,8 +125,8 @@ pub fn initStack(
     defer allocator.free(base_ref);
 
     // layer names live exclusively under refs/heads/stakrr/
-    if (std.mem.startsWith(u8, work_ref, git_mod.layer_prefix) or
-        std.mem.startsWith(u8, base_ref, git_mod.layer_prefix))
+    if (std.mem.startsWith(u8, work_ref, layer_prefix) or
+        std.mem.startsWith(u8, base_ref, layer_prefix))
         return error.ReservedBranchNamespace;
 
     try git.checkRefFormat(base_ref);
@@ -146,7 +151,7 @@ pub fn initStack(
         return error.MergeCommitsUnsupported;
 
     // 7. claim the anchor; `create` fails if a concurrent init won the race
-    const anchor: Git.ExpectedRef = .{ .name = git_mod.anchor_ref, .oid = base_oid };
+    const anchor: Git.ExpectedRef = .{ .name = anchor_ref, .oid = base_oid };
     try git.transact("stakrr: init", &.{.{ .create = anchor }});
     errdefer git.transact("stakrr: init rollback", &.{.{ .delete = anchor }}) catch {};
 
@@ -161,12 +166,14 @@ pub fn initStack(
     try git.exec(&.{ "config", "--local", state_key, state });
 }
 
-pub fn loadConfig(git: *const Git) !Config {
-    const allocator = git.allocator;
-    const raw = (try git.configGet(state_key)) orelse
-        return error.NotInitialized;
-    errdefer allocator.free(raw);
+/// Validated config refs borrowing from the supplied persisted value.
+/// Shared by stack loading and edit checkpoint validation.
+pub const ConfigRefs = struct {
+    base_ref: []const u8,
+    work_ref: []const u8,
+};
 
+pub fn parseConfig(raw: []const u8) Error!ConfigRefs {
     var tokens = std.mem.tokenizeScalar(u8, raw, ' ');
 
     const version = tokens.next() orelse
@@ -188,10 +195,23 @@ pub fn loadConfig(git: *const Git) !Config {
     if (!git_mod.isSafeBranchRef(base) or !git_mod.isSafeBranchRef(work))
         return error.InvalidConfig;
 
-    if (std.mem.eql(u8, base, work))
+    if (std.mem.eql(u8, base, work) or
+        std.mem.startsWith(u8, base, layer_prefix) or
+        std.mem.startsWith(u8, work, layer_prefix))
         return error.InvalidConfig;
 
-    const anchor = (try git.readRef(git_mod.anchor_ref)) orelse
+    return .{ .base_ref = base, .work_ref = work };
+}
+
+pub fn loadConfig(git: *const Git) !Config {
+    const allocator = git.allocator;
+    const raw = (try git.configGet(state_key)) orelse
+        return error.NotInitialized;
+    errdefer allocator.free(raw);
+
+    const refs = try parseConfig(raw);
+
+    const anchor = (try git.readRef(anchor_ref)) orelse
         return error.InvalidStack;
     errdefer allocator.free(anchor);
 
@@ -199,12 +219,15 @@ pub fn loadConfig(git: *const Git) !Config {
         return error.InvalidGitOutput;
 
     return .{
-        .base_ref = base,
-        .work_ref = work,
+        .base_ref = refs.base_ref,
+        .work_ref = refs.work_ref,
         .anchor_oid = anchor,
         ._storage = raw,
     };
 }
+
+// Inspection alone needs cumulative depths to sort boundaries by ancestry.
+const Boundary = struct { ref_name: []const u8, oid: []const u8, depth: usize };
 
 pub fn inspect(git: *const Git) !Snapshot {
     const allocator = git.allocator;
@@ -252,11 +275,11 @@ pub fn inspect(git: *const Git) !Snapshot {
     }
 
     // discover branches owned by stakrr
-    const raw_refs = try git.listStackRefs();
+    const raw_refs = try git.listRefs(layer_prefix);
     errdefer allocator.free(raw_refs);
 
-    var layers: std.ArrayList(Layer) = .empty;
-    errdefer layers.deinit(allocator);
+    var layers: std.ArrayList(Boundary) = .empty;
+    defer layers.deinit(allocator);
     var lines = std.mem.splitScalar(u8, raw_refs, '\n');
 
     while (lines.next()) |line| {
@@ -286,12 +309,8 @@ pub fn inspect(git: *const Git) !Snapshot {
     }
 
     // order by distance from anchor, not branch name
-    std.mem.sort(Layer, layers.items, {}, struct {
-        fn lessThan(
-            _: void,
-            a: Layer,
-            b: Layer,
-        ) bool {
+    std.mem.sort(Boundary, layers.items, {}, struct {
+        fn lessThan(_: void, a: Boundary, b: Boundary) bool {
             return a.depth < b.depth;
         }
     }.lessThan);
@@ -300,19 +319,25 @@ pub fn inspect(git: *const Git) !Snapshot {
     var previous_oid = config.anchor_oid;
     var previous_depth: usize = 0;
 
-    for (layers.items) |*layer| {
+    const result = try allocator.alloc(Layer, layers.items.len);
+    errdefer allocator.free(result);
+    for (layers.items, result) |layer, *out| {
         // each layer must introduce at least one commit
         if (layer.depth <= previous_depth)
             return error.InvalidLayerBoundary;
 
-        layer.commits = layer.depth - previous_depth;
+        out.* = .{
+            .ref_name = layer.ref_name,
+            .oid = layer.oid,
+            .commits = layer.depth - previous_depth,
+        };
 
         previous_oid = layer.oid;
         previous_depth = layer.depth;
     }
 
     // the private tip guard must match the highest committed layer
-    const tip = try git.readRef(git_mod.tip_ref);
+    const tip = try git.readRef(tip_ref);
     defer if (tip) |oid| allocator.free(oid);
     if (layers.items.len == 0) {
         if (tip != null) return error.InvalidStack;
@@ -323,7 +348,7 @@ pub fn inspect(git: *const Git) !Snapshot {
 
     return .{
         .config = config,
-        .layers = try layers.toOwnedSlice(allocator),
+        .layers = result,
         .work_oid = work_oid,
         .unstacked_commits = chain_len - previous_depth,
         .base_moved = !std.mem.eql(
@@ -365,7 +390,7 @@ pub fn cut(
 
     const new_ref = try std.fmt.allocPrint(
         allocator,
-        git_mod.layer_prefix ++ "{s}",
+        layer_prefix ++ "{s}",
         .{name},
     );
     defer allocator.free(new_ref);
@@ -416,25 +441,46 @@ pub fn cut(
 
     // The base may have moved since init; layers are carved relative to
     // the anchor, which the transaction pins instead of the base branch.
-    try git.createLayerRef(
-        new_ref,
-        target,
-        .{
-            .name = git_mod.anchor_ref,
-            .oid = snapshot.config.anchor_oid,
-        },
-        .{
-            .name = snapshot.config.work_ref,
-            .oid = snapshot.work_oid,
-        },
-        if (last_layer) |layer|
-            .{
-                .name = layer.ref_name,
-                .oid = layer.oid,
-            }
+    try createLayerRef(git, .{
+        .layer = .{ .name = new_ref, .oid = target },
+        .anchor = .{ .name = anchor_ref, .oid = snapshot.config.anchor_oid },
+        .work = .{ .name = snapshot.config.work_ref, .oid = snapshot.work_oid },
+        .previous = if (last_layer) |layer|
+            .{ .name = layer.ref_name, .oid = layer.oid }
         else
             null,
-    );
+    });
+}
+
+pub const LayerCreation = struct {
+    layer: Git.ExpectedRef,
+    anchor: Git.ExpectedRef,
+    work: Git.ExpectedRef,
+    previous: ?Git.ExpectedRef = null,
+};
+
+/// Create a boundary and advance the stack guard in one compare-and-swap.
+pub fn createLayerRef(git: *const Git, expected: LayerCreation) !void {
+    var updates: [5]Git.RefUpdate = undefined;
+    updates[0] = .{ .verify = expected.anchor };
+    updates[1] = .{ .verify = expected.work };
+    var count: usize = 2;
+    if (expected.previous) |previous| {
+        updates[count] = .{ .verify = previous };
+        count += 1;
+    }
+    updates[count] = .{ .create = expected.layer };
+    count += 1;
+    updates[count] = if (expected.previous) |previous|
+        .{ .update = .{
+            .name = tip_ref,
+            .new = expected.layer.oid,
+            .old = previous.oid,
+        } }
+    else
+        .{ .create = .{ .name = tip_ref, .oid = expected.layer.oid } };
+    count += 1;
+    try git.transact("stakrr: cut", updates[0..count]);
 }
 
 pub const ResetResult = struct {
@@ -442,23 +488,25 @@ pub const ResetResult = struct {
     kept_layers: usize,
 };
 
+pub const ResetOptions = struct { delete_layers: bool = false };
+
 /// Remove stakrr's state and internal refs so the stack can be
 /// re-initialised. Layer branches are kept unless `delete_layers` is set.
 /// Works on corrupt or outdated state, so it never parses the config.
-pub fn reset(git: *const Git, delete_layers: bool) !ResetResult {
+pub fn reset(git: *const Git, options: ResetOptions) !ResetResult {
+    const delete_layers = options.delete_layers;
     const guard = try coordination.lock(git);
     defer guard.close(git.io);
     try coordination.requireNoSession(git);
     const allocator = git.allocator;
-    try git.ensureWorkTree();
 
-    const raw_refs = try git.listStackRefs();
+    const raw_refs = try git.listRefs(layer_prefix);
     defer allocator.free(raw_refs);
 
     var updates: std.ArrayList(Git.RefUpdate) = .empty;
     defer updates.deinit(allocator);
 
-    const internal = [_][]const u8{ git_mod.tip_ref, git_mod.anchor_ref };
+    const internal = [_][]const u8{ tip_ref, anchor_ref };
     var internal_oids: [internal.len]?[]u8 = @splat(null);
     defer for (internal_oids) |maybe| if (maybe) |oid| allocator.free(oid);
 
@@ -488,13 +536,24 @@ pub fn reset(git: *const Git, delete_layers: bool) !ResetResult {
 
     // deleting a checked-out branch would leave HEAD pointing nowhere
     if (delete_layers and layer_count != 0) {
+        const refs = try allocator.alloc([]const u8, layer_count);
+        defer allocator.free(refs);
+        var index: usize = 0;
+        for (updates.items) |update| switch (update) {
+            .delete => |ref| if (std.mem.startsWith(u8, ref.name, layer_prefix)) {
+                refs[index] = ref.name;
+                index += 1;
+            },
+            else => {},
+        };
+        try coordination.requireAvailable(git, refs);
         const head: ?[]u8 = git.currentBranch() catch |err| switch (err) {
             error.DetachedHead => null,
             else => return err,
         };
         defer if (head) |ref_name| allocator.free(ref_name);
         if (head) |ref_name| {
-            if (std.mem.startsWith(u8, ref_name, git_mod.layer_prefix))
+            if (std.mem.startsWith(u8, ref_name, layer_prefix))
                 return error.LayerCheckedOut;
         }
     }

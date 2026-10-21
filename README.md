@@ -65,6 +65,9 @@ stakrr status
 
 ## // editing earlier cuts
 
+Edit commands print a short confirmation. Use `stakrr status` for the full stack,
+active edit phase, and any instructions needed to continue.
+
 Use ordinary Git commits or amendments on a cut. Descendants replay when you
 jump to another cut or finish the session:
 
@@ -86,9 +89,12 @@ above their previous boundary. Changing earlier boundaries or merging branches
 inside an edit is unsupported.
 
 Transitions require a clean index and working tree, including untracked files.
-No implicit commits or stashes are made. Checkouts and replay refuse to overwrite
-ignored files. During a session, `init`, `cut`, `reset`, `up` and `down` are
-blocked in every worktree. Use `edit <cut>` to move between cuts instead.
+No implicit commits or stashes are made. Checkouts refuse to overwrite ignored
+files. Before replaying descendants, preserve and remove **all ignored files**,
+including unrelated build output: Git's rename handling can write paths absent
+from the incoming commit's diff. Unchanged cuts can still be navigated with
+unrelated ignored files present. During a session, `init`, `cut`, `reset`, `up`
+and `down` are blocked in every worktree. Use `edit <cut>` to move between cuts instead.
 
 On a conflict, the pending destination and session remain saved:
 
@@ -109,8 +115,8 @@ ordinary commits you create while editing keep your normal Git configuration.
 including changes incorporated during earlier jumps. It requires clean work:
 commit or otherwise preserve conflict resolutions and other uncommitted changes
 first. It never runs `reset --hard` or discards files. Original boundaries and
-observed edit/replay commits remain pinned under the recovery namespace shown
-by `status`, even after abort or successful completion:
+observed edit/replay commits remain pinned under `refs/stakrr/recovery/`, even
+after abort or successful completion. Abort prints a reminder to inspect them:
 
 ```sh
 git for-each-ref --format='%(refname) %(objecttype)' refs/stakrr/recovery/
@@ -190,7 +196,8 @@ stakrr init --base main
 ```
 
 `reset` never touches the rolling branch, `HEAD`, the index or the working
-tree, and refuses to delete layers while one of them is checked out.
+tree, and refuses to delete layers while one of them is checked out in any
+worktree.
 
 ## // roadmap
 

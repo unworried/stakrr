@@ -27,7 +27,7 @@ test "reset on an uninitialized repository reports NotInitialized" {
 
     try testing.expectError(
         error.NotInitialized,
-        stack.reset(&repo.git, false),
+        stack.reset(&repo.git, .{}),
     );
 }
 
@@ -42,7 +42,7 @@ test "reset keeps layers by default and blocks re-init until they go" {
     defer testing.allocator.free(b);
     try stack.cut(&repo.git, "p1", null);
 
-    const result = try stack.reset(&repo.git, false);
+    const result = try stack.reset(&repo.git, .{});
     try testing.expectEqual(@as(usize, 1), result.kept_layers);
     try testing.expectEqual(@as(usize, 0), result.deleted_layers);
 
@@ -75,7 +75,7 @@ test "reset --delete-layers allows a clean re-init" {
     defer testing.allocator.free(c);
     try stack.cut(&repo.git, "p2", null);
 
-    const result = try stack.reset(&repo.git, true);
+    const result = try stack.reset(&repo.git, .{ .delete_layers = true });
     try testing.expectEqual(@as(usize, 2), result.deleted_layers);
     try testing.expect(!try refExists(&repo, "refs/heads/stakrr/p1"));
     try testing.expect(!try refExists(&repo, "refs/heads/stakrr/p2"));
@@ -103,7 +103,7 @@ test "reset recovers from corrupt and outdated state" {
         stack.inspect(&repo.git),
     );
 
-    _ = try stack.reset(&repo.git, false);
+    _ = try stack.reset(&repo.git, .{});
     try stack.initStack(&repo.git, "main");
 }
 
@@ -122,7 +122,34 @@ test "reset refuses to delete a checked-out layer" {
 
     try testing.expectError(
         error.LayerCheckedOut,
-        stack.reset(&repo.git, true),
+        stack.reset(&repo.git, .{ .delete_layers = true }),
     );
     try testing.expect(try refExists(&repo, "refs/stakrr/anchor"));
+}
+
+test "reset refuses layers occupied in linked worktrees without changing any state" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+    const layer = try repo.commit("layer");
+    defer testing.allocator.free(layer);
+    try stack.cut(&repo.git, "p1", null);
+    const path = "linked space\nnewline";
+    try repo.exec(&.{ "worktree", "add", "-q", path, "stakrr/p1" });
+
+    try testing.expectError(error.BranchOccupied, stack.reset(&repo.git, .{ .delete_layers = true }));
+    for ([_][]const u8{ "refs/stakrr/anchor", "refs/stakrr/tip", "refs/heads/stakrr/p1" }) |ref|
+        try testing.expect(try refExists(&repo, ref));
+    const config = (try repo.git.configGet(stack.state_key)).?;
+    defer testing.allocator.free(config);
+    try testing.expectEqualStrings("v1 refs/heads/main refs/heads/work", config);
+    const head = try repo.git.output(&.{ "-C", path, "rev-parse", "HEAD" });
+    defer testing.allocator.free(head);
+    try testing.expectEqualStrings(layer, head);
+    const status = try repo.git.output(&.{ "-C", path, "status", "--porcelain=v1" });
+    defer testing.allocator.free(status);
+    try testing.expectEqualStrings("", status);
+    try repo.exec(&.{ "-C", path, "switch", "-q", "--detach" });
+    _ = try stack.reset(&repo.git, .{ .delete_layers = true });
 }

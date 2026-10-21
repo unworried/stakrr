@@ -44,7 +44,9 @@ fn noSession(repo: *const Repo) !void {
     try t.expect(session == null);
 }
 fn expectRecoverable(repo: *const Repo, oid: []const u8) !void {
-    const refs = try repo.git.output(&.{ "for-each-ref", "--format=%(objectname)", "refs/stakrr/recovery/" });
+    const refs = try repo.git.output(
+        &.{ "for-each-ref", "--format=%(objectname)", "refs/stakrr/recovery/" },
+    );
     defer t.allocator.free(refs);
     try t.expect(std.mem.indexOf(u8, refs, oid) != null);
 }
@@ -61,7 +63,7 @@ test "edit unchanged cuts never replay; unknown cuts leave no session" {
     var repo = try Repo.init();
     defer repo.deinit();
     try setup(&repo);
-    const before = try repo.git.listStackRefs();
+    const before = try repo.git.listRefs("refs/heads/stakrr/");
     defer t.allocator.free(before);
     const work = try repo.git.resolveCommit("work");
     defer t.allocator.free(work);
@@ -74,7 +76,7 @@ test "edit unchanged cuts never replay; unknown cuts leave no session" {
     try t.expectError(error.NoPendingEdit, edit.run(&repo.git, .continue_edit));
     try edit.run(&repo.git, .{ .jump = "api" });
     try edit.run(&repo.git, .{ .jump = null });
-    const after = try repo.git.listStackRefs();
+    const after = try repo.git.listRefs("refs/heads/stakrr/");
     defer t.allocator.free(after);
     try t.expectEqualStrings(before, after);
     try refEquals(&repo, "work", work);
@@ -100,7 +102,11 @@ test "correction commits replay in order and preserve upper deletions and rollin
     try write(&repo, "api", "corrected api\n");
     try commit(&repo, "correct api");
     try edit.run(&repo.git, .{ .jump = null });
-    try outputEquals(&repo, &.{ "log", "--format=%s", "--reverse", "main..work" }, "models\nfix validation\napi\ndelete obsolete\ncorrect api\nrolling");
+    try outputEquals(
+        &repo,
+        &.{ "log", "--format=%s", "--reverse", "main..work" },
+        "models\nfix validation\napi\ndelete obsolete\ncorrect api\nrolling",
+    );
     try outputEquals(&repo, &.{ "show", "work:tail" }, "rolling");
     try outputEquals(&repo, &.{ "show", "work:api" }, "corrected api");
     try valid(&repo);
@@ -130,7 +136,7 @@ test "abort restores the initial stack across multiple incorporated jumps and re
     var repo = try Repo.init();
     defer repo.deinit();
     try setup(&repo);
-    const initial = try repo.git.listStackRefs();
+    const initial = try repo.git.listRefs("refs/heads/stakrr/");
     defer t.allocator.free(initial);
     const work = try repo.git.resolveCommit("work");
     defer t.allocator.free(work);
@@ -145,7 +151,7 @@ test "abort restores the initial stack across multiple incorporated jumps and re
     const second = try repo.git.resolveCommit("HEAD");
     defer t.allocator.free(second);
     try edit.run(&repo.git, .abort);
-    const actual = try repo.git.listStackRefs();
+    const actual = try repo.git.listRefs("refs/heads/stakrr/");
     defer t.allocator.free(actual);
     try t.expectEqualStrings(initial, actual);
     try refEquals(&repo, "work", work);
@@ -196,11 +202,14 @@ test "conflicted replay persists destination and continues a staged resolution" 
     try refEquals(&repo, "work", old_work); // no partial publication
     try t.expectError(error.EditNeedsContinue, edit.run(&repo.git, .{ .jump = null }));
     try t.expectError(error.DirtyWorkTree, edit.run(&repo.git, .abort));
-    var status: std.Io.Writer.Allocating = .init(t.allocator);
-    defer status.deinit();
-    try t.expect(try edit.printStatus(&repo.git, &status.writer));
-    try t.expect(std.mem.indexOf(u8, status.written(), "models (conflict)") != null);
-    try t.expect(std.mem.indexOf(u8, status.written(), "pending: stakrr/api") != null);
+    var session_status = (try edit.readStatus(&repo.git)).?;
+    defer session_status.deinit();
+    try t.expectEqual(.conflict, session_status.phase);
+    try t.expectEqualStrings(
+        "refs/heads/stakrr/models",
+        session_status.branches[session_status.active],
+    );
+    try t.expectEqualStrings("refs/heads/stakrr/api", session_status.destination);
     try write(&repo, "shared", "resolved\n");
     try repo.exec(&.{ "add", "shared" });
     try edit.run(&repo.git, .continue_edit);
@@ -244,7 +253,7 @@ test "active sessions reject every competing stakrr mutation" {
     try setup(&repo);
     try edit.run(&repo.git, .{ .jump = "models" });
     try t.expectError(error.EditInProgress, stack.cut(&repo.git, "new", null));
-    try t.expectError(error.EditInProgress, stack.reset(&repo.git, true));
+    try t.expectError(error.EditInProgress, stack.reset(&repo.git, .{ .delete_layers = true }));
     try t.expectError(error.EditInProgress, stack.initStack(&repo.git, "main"));
     try t.expectError(error.EditInProgress, stack.navigate(&repo.git, .up));
     try t.expectError(error.EditInProgress, stack.navigate(&repo.git, .down));
@@ -266,9 +275,10 @@ test "external changes to nonactive refs and invalid edited histories are reject
 }
 
 fn linked(repo: *const Repo, path: []const u8, branch: []const u8) !stakrr.git.Git {
-    try write(repo, ".git/info/exclude", "linked*\n");
-    try repo.exec(&.{ "worktree", "add", "-q", path, branch });
-    const dir = try repo.tmp.dir.openDir(t.io, path, .{});
+    const metadata_path = try std.fmt.allocPrint(t.allocator, ".git/{s}", .{path});
+    defer t.allocator.free(metadata_path);
+    try repo.exec(&.{ "worktree", "add", "-q", metadata_path, branch });
+    const dir = try repo.tmp.dir.openDir(t.io, metadata_path, .{});
     var git = repo.git;
     git.cwd = dir;
     return git;
@@ -306,7 +316,7 @@ test "sessions belong to one worktree and share the mutation guard" {
     try edit.run(&repo.git, .{ .jump = "models" });
     try t.expectError(error.WrongEditWorktree, edit.run(&other, .abort));
     try t.expectError(error.WrongEditWorktree, edit.run(&other, .continue_edit));
-    try t.expectError(error.EditInProgress, stack.reset(&other, false));
+    try t.expectError(error.EditInProgress, stack.reset(&other, .{}));
     try edit.run(&repo.git, .abort);
 }
 
@@ -316,14 +326,19 @@ test "the common directory lock excludes mutations from every worktree" {
     try setup(&repo);
     const other = try linked(&repo, "linked", "main");
     defer other.cwd.?.close(t.io);
-    const common = try repo.git.output(&.{ "rev-parse", "--path-format=absolute", "--git-common-dir" });
+    const common = try repo.git.output(
+        &.{ "rev-parse", "--path-format=absolute", "--git-common-dir" },
+    );
     defer t.allocator.free(common);
     const path = try std.fs.path.join(t.allocator, &.{ common, "stakrr.lock" });
     defer t.allocator.free(path);
-    const guard = try std.Io.Dir.cwd().createFile(t.io, path, .{ .truncate = false, .lock = .exclusive });
+    const guard = try std.Io.Dir.cwd().createFile(t.io, path, .{
+        .truncate = false,
+        .lock = .exclusive,
+    });
     defer guard.close(t.io);
     try t.expectError(error.MutationInProgress, edit.run(&repo.git, .{ .jump = "models" }));
-    try t.expectError(error.MutationInProgress, stack.reset(&other, true));
+    try t.expectError(error.MutationInProgress, stack.reset(&other, .{ .delete_layers = true }));
     try t.expectError(error.MutationInProgress, stack.cut(&repo.git, "new", null));
     try noSession(&repo);
 }
@@ -386,18 +401,18 @@ test "replay preserves ignored files and directory contents before writing incom
         defer repo.git.cwd = root;
         const work = try repo.git.resolveCommit("work");
         defer t.allocator.free(work);
-        try t.expectError(error.DirtyWorkTree, edit.run(&repo.git, .{ .jump = null }));
+        try t.expectError(error.IgnoredFilesPresent, edit.run(&repo.git, .{ .jump = null }));
         try refEquals(&repo, "work", work);
         const contents = try repo.tmp.dir.readFileAlloc(t.io, path, t.allocator, .limited(1024));
         defer t.allocator.free(contents);
         try t.expectEqualStrings("precious ignored work\n", contents);
         try repo.tmp.dir.deleteFile(t.io, path);
         if (directory) try repo.tmp.dir.deleteDir(t.io, "tail");
-        try edit.run(&repo.git, .continue_edit);
+        try t.expectError(error.IgnoredFilesPresent, edit.run(&repo.git, .{ .jump = null }));
+        try repo.tmp.dir.deleteFile(t.io, "unrelated");
+        try edit.run(&repo.git, .{ .jump = null });
         try outputEquals(&repo, &.{ "show", "work:tail" }, "rolling");
-        const unrelated = try repo.tmp.dir.readFileAlloc(t.io, "unrelated", t.allocator, .limited(1024));
-        defer t.allocator.free(unrelated);
-        try t.expectEqualStrings("unrelated ignored work\n", unrelated);
+
         try valid(&repo);
         try noSession(&repo);
     }
@@ -426,6 +441,51 @@ test "conflict continuation rejects untracked files outside the current director
     try refEquals(&repo, "CHERRY_PICK_HEAD", picking);
     try repo.tmp.dir.deleteFile(t.io, "precious");
     try edit.run(&repo.git, .continue_edit);
+    try noSession(&repo);
+}
+
+test "directory rename replay refuses ignored merge destinations before detaching" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try repo.exec(&.{ "config", "merge.directoryRenames", "true" });
+    try write(&repo, ".gitignore", "new/b\n");
+    try commit(&repo, "base");
+    try repo.exec(&.{ "switch", "-q", "-c", "work" });
+    try stack.initStack(&repo.git, "main");
+    try repo.tmp.dir.createDir(t.io, "old", .default_dir);
+    try write(&repo, "old/a", "a\n");
+    try commit(&repo, "layer");
+    try stack.cut(&repo.git, "one", null);
+    try write(&repo, "old/b", "incoming\n");
+    try commit(&repo, "tail");
+    try edit.run(&repo.git, .{ .jump = "one" });
+    try repo.exec(&.{ "mv", "old", "new" });
+    try commit(&repo, "rename directory");
+    try write(&repo, "new/b", "precious ignored data\n");
+    const refs = try repo.git.output(&.{"show-ref"});
+    defer t.allocator.free(refs);
+    try t.expectError(error.IgnoredFilesPresent, edit.run(&repo.git, .{ .jump = null }));
+    try outputEquals(&repo, &.{"show-ref"}, refs);
+    try outputEquals(&repo, &.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/one");
+    try outputEquals(&repo, &.{ "status", "--porcelain=v1" }, "");
+    const contents = try repo.tmp.dir.readFileAlloc(t.io, "new/b", t.allocator, .limited(1024));
+    defer t.allocator.free(contents);
+    try t.expectEqualStrings("precious ignored data\n", contents);
+    try repo.tmp.dir.deleteFile(t.io, "new/b");
+    try edit.run(&repo.git, .{ .jump = null });
+    try outputEquals(&repo, &.{ "show", "work:new/b" }, "incoming");
+    try noSession(&repo);
+}
+
+test "unchanged cuts can navigate with unrelated ignored files" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try setup(&repo);
+    try write(&repo, ".git/info/exclude", "unrelated\n");
+    try write(&repo, "unrelated", "ignored\n");
+    try edit.run(&repo.git, .{ .jump = "models" });
+    try edit.run(&repo.git, .{ .jump = "api" });
+    try edit.run(&repo.git, .{ .jump = null });
     try noSession(&repo);
 }
 
@@ -498,7 +558,11 @@ test "replay resumes after process death on either side of every ref checkpoint"
             try valid(&repo);
             try outputEquals(&repo, &.{ "symbolic-ref", "HEAD" }, "refs/heads/work");
             try outputEquals(&repo, &.{ "show", "work:model" }, "fixed");
-            try outputEquals(&repo, &.{ "log", "--format=%s", "--reverse", "main..work" }, "models\ncorrection\napi\ndelete obsolete\nrolling");
+            try outputEquals(
+                &repo,
+                &.{ "log", "--format=%s", "--reverse", "main..work" },
+                "models\ncorrection\napi\ndelete obsolete\nrolling",
+            );
         }
     }
 }
@@ -517,7 +581,11 @@ test "a successful cherry-pick interrupted before journaling is incorporated exa
     try t.expect(!killed.term.success());
     _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
     try assertCliSuccess(&repo, &.{ "edit", "--continue" });
-    try outputEquals(&repo, &.{ "log", "--format=%s", "--reverse", "main..work" }, "models\ncorrection\napi\ndelete obsolete\nrolling");
+    try outputEquals(
+        &repo,
+        &.{ "log", "--format=%s", "--reverse", "main..work" },
+        "models\ncorrection\napi\ndelete obsolete\nrolling",
+    );
     try noSession(&repo);
 }
 
@@ -546,7 +614,7 @@ test "abort and its restoration transaction resume after process death" {
             var repo = try Repo.init();
             defer repo.deinit();
             try setup(&repo);
-            const refs = try repo.git.listStackRefs();
+            const refs = try repo.git.listRefs("refs/heads/stakrr/");
             defer t.allocator.free(refs);
             const work = try repo.git.resolveCommit("work");
             defer t.allocator.free(work);
@@ -569,7 +637,7 @@ test "abort and its restoration transaction resume after process death" {
             try t.expect(!killed.term.success());
             _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
             try assertCliSuccess(&repo, &.{ "edit", "--abort" });
-            const restored = try repo.git.listStackRefs();
+            const restored = try repo.git.listRefs("refs/heads/stakrr/");
             defer t.allocator.free(restored);
             try t.expectEqualStrings(refs, restored);
             try refEquals(&repo, "work", work);
@@ -630,7 +698,7 @@ test "session validation rejects extra layers and corrupt checkpoints" {
     defer t.allocator.free(bad);
     try repo.exec(&.{ "update-ref", "refs/stakrr/edit", bad });
     try t.expectError(error.InvalidEditSession, edit.run(&repo.git, .abort));
-    try t.expectError(error.EditInProgress, stack.reset(&repo.git, true));
+    try t.expectError(error.EditInProgress, stack.reset(&repo.git, .{ .delete_layers = true }));
 }
 
 test "a later edit below an incorporated upper correction preserves both" {
@@ -646,7 +714,11 @@ test "a later edit below an incorporated upper correction preserves both" {
     try edit.run(&repo.git, .{ .jump = null });
     try outputEquals(&repo, &.{ "show", "work:model" }, "corrected model");
     try outputEquals(&repo, &.{ "show", "work:api" }, "corrected api");
-    try outputEquals(&repo, &.{ "log", "--format=%s", "--reverse", "main..work" }, "models\nfix models\napi\ndelete obsolete\nfix api\nrolling");
+    try outputEquals(
+        &repo,
+        &.{ "log", "--format=%s", "--reverse", "main..work" },
+        "models\nfix models\napi\ndelete obsolete\nfix api\nrolling",
+    );
     try valid(&repo);
 }
 
@@ -699,5 +771,280 @@ test "continue and abort reject an inconsistent replay plan before changing Git 
     }
     try repo.exec(&.{ "update-ref", "refs/stakrr/edit", checkpoint });
     try edit.run(&repo.git, .abort);
+    try noSession(&repo);
+}
+
+fn replaceCheckpoint(repo: *const Repo, value: std.json.Value) ![]u8 {
+    const raw = try std.json.Stringify.valueAlloc(t.allocator, value, .{});
+    defer t.allocator.free(raw);
+    const oid = try repo.git.writeBlob(raw);
+    errdefer t.allocator.free(oid);
+    try repo.exec(&.{ "update-ref", "refs/stakrr/edit", oid });
+    return oid;
+}
+
+fn pausedBeforeDetach(repo: *Repo) !void {
+    try setup(repo);
+    try edit.run(&repo.git, .{ .jump = "models" });
+    try write(repo, "model", "corrected\n");
+    try commit(repo, "correction");
+    try installFaultShim(repo);
+    try repo.env.put("STAKRR_TEST_FAULT", "after:1");
+    const stopped = try cli(repo, &.{"edit"});
+    defer repo.git.freeResult(stopped);
+    try t.expect(!stopped.term.success());
+    _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
+    try outputEquals(repo, &.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
+}
+
+fn expectInvalidCheckpointUnchanged(repo: *const Repo, oid: []const u8) !void {
+    const refs = try repo.git.output(&.{"show-ref"});
+    defer t.allocator.free(refs);
+    for ([_]edit.Request{ .continue_edit, .abort }) |request| {
+        try t.expectError(error.InvalidEditSession, edit.run(&repo.git, request));
+        try outputEquals(repo, &.{"show-ref"}, refs);
+        try outputEquals(repo, &.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
+        try outputEquals(repo, &.{ "status", "--porcelain=v1" }, "");
+        try refEquals(repo, "refs/stakrr/edit", oid);
+        try outputEquals(repo, &.{ "show", "HEAD:model" }, "corrected");
+    }
+}
+
+test "every checkpoint phase rejects inconsistent state before changing Git" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try pausedBeforeDetach(&repo);
+    const checkpoint = (try repo.git.readRef("refs/stakrr/edit")).?;
+    defer t.allocator.free(checkpoint);
+    const raw = try repo.git.outputRaw(&.{ "cat-file", "blob", checkpoint });
+    defer t.allocator.free(raw);
+    const phases = [_][]const u8{
+        "switching",
+        "editing",
+        "detaching",
+        "replay",
+        "conflict",
+        "publishing",
+        "aborting",
+        "aborted",
+    };
+    for (phases) |phase| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, raw, .{});
+        defer parsed.deinit();
+        const object = &parsed.value.object;
+        object.getPtr("phase").?.* = .{ .string = phase };
+        if (std.mem.eql(u8, phase, "switching")) {
+            object.getPtr("destination").?.* = .{ .integer = 999 };
+        } else if (std.mem.eql(u8, phase, "editing")) {
+            object.getPtr("queue_oid").?.* = .null;
+            object.getPtr("queue_len").?.* = .{ .integer = 0 };
+            // Finishing was requested; editing must instead target its active cut.
+            object.getPtr("destination").?.* = .null;
+        } else if (std.mem.eql(u8, phase, "detaching")) {
+            object.getPtr("next").?.* = .{ .integer = 1 };
+        } else if (std.mem.eql(u8, phase, "replay")) {
+            object.getPtr("queue_oid").?.* = .null;
+            object.getPtr("queue_len").?.* = .{ .integer = 0 };
+        } else if (std.mem.eql(u8, phase, "conflict")) {
+            object.getPtr("next").?.* = object.get("queue_len").?;
+        } else if (std.mem.eql(u8, phase, "publishing")) {
+            object.getPtr("next").?.* = .{ .integer = 0 };
+        } else if (std.mem.eql(u8, phase, "aborting")) {
+            object.getPtr("queue_oid").?.* = .null;
+        } else {
+            object.getPtr("id").?.* = .{
+                .string = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            };
+        }
+        const invalid = try replaceCheckpoint(&repo, parsed.value);
+        defer t.allocator.free(invalid);
+        try expectInvalidCheckpointUnchanged(&repo, invalid);
+    }
+    try repo.exec(&.{ "update-ref", "refs/stakrr/edit", checkpoint });
+    try edit.run(&repo.git, .abort);
+    try noSession(&repo);
+}
+
+test "invalid replay plans are rejected before detach and before a clean abort" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try pausedBeforeDetach(&repo);
+    const checkpoint = (try repo.git.readRef("refs/stakrr/edit")).?;
+    defer t.allocator.free(checkpoint);
+    const raw = try repo.git.outputRaw(&.{ "cat-file", "blob", checkpoint });
+    defer t.allocator.free(raw);
+    for ([_]bool{ false, true }) |reverse| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, raw, .{});
+        defer parsed.deinit();
+        if (reverse) {
+            const oid = parsed.value.object.get("queue_oid").?.string;
+            const plan = try repo.git.output(&.{ "cat-file", "blob", oid });
+            defer t.allocator.free(plan);
+            var commits: std.ArrayList([]const u8) = .empty;
+            defer commits.deinit(t.allocator);
+            var lines = std.mem.tokenizeScalar(u8, plan, '\n');
+            while (lines.next()) |line| try commits.append(t.allocator, line);
+            std.mem.reverse([]const u8, commits.items);
+            const reversed = try std.mem.join(t.allocator, "\n", commits.items);
+            defer t.allocator.free(reversed);
+            const bad_plan = try repo.git.writeBlob(reversed);
+            defer t.allocator.free(bad_plan);
+            parsed.value.object.getPtr("queue_oid").?.* = .{ .string = bad_plan };
+            const invalid = try replaceCheckpoint(&repo, parsed.value);
+            defer t.allocator.free(invalid);
+            try expectInvalidCheckpointUnchanged(&repo, invalid);
+        } else {
+            parsed.value.object.getPtr("queue_len").?.integer += 1;
+            const invalid = try replaceCheckpoint(&repo, parsed.value);
+            defer t.allocator.free(invalid);
+            try expectInvalidCheckpointUnchanged(&repo, invalid);
+        }
+    }
+    try repo.exec(&.{ "update-ref", "refs/stakrr/edit", checkpoint });
+    try edit.run(&repo.git, .continue_edit);
+    try valid(&repo);
+    try noSession(&repo);
+}
+
+test "replay plans cannot omit a commit between cut boundaries" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try pausedBeforeDetach(&repo);
+    const checkpoint = (try repo.git.readRef("refs/stakrr/edit")).?;
+    defer t.allocator.free(checkpoint);
+    const raw = try repo.git.outputRaw(&.{ "cat-file", "blob", checkpoint });
+    defer t.allocator.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, raw, .{});
+    defer parsed.deinit();
+    const object = &parsed.value.object;
+    const plan = try repo.git.outputRaw(&.{ "cat-file", "blob", object.get("queue_oid").?.string });
+    defer t.allocator.free(plan);
+    // The first API commit is inside the cut; later commits still include
+    // every cut boundary, so boundary-only validation would accept this plan.
+    const first_newline = std.mem.indexOfScalar(u8, plan, '\n').?;
+    const shortened = try repo.git.writeBlob(plan[first_newline + 1 ..]);
+    defer t.allocator.free(shortened);
+    object.getPtr("queue_oid").?.* = .{ .string = shortened };
+    object.getPtr("queue_len").?.integer -= 1;
+    const invalid = try replaceCheckpoint(&repo, parsed.value);
+    defer t.allocator.free(invalid);
+    try expectInvalidCheckpointUnchanged(&repo, invalid);
+    try repo.exec(&.{ "update-ref", "refs/stakrr/edit", checkpoint });
+    try edit.run(&repo.git, .continue_edit);
+    try valid(&repo);
+    try noSession(&repo);
+}
+
+test "restarted detach refuses newly created ignored files without changing state" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try pausedBeforeDetach(&repo);
+    try write(&repo, ".git/info/exclude", "precious\n");
+    try write(&repo, "precious", "ignored data\n");
+    const refs = try repo.git.output(&.{"show-ref"});
+    defer t.allocator.free(refs);
+    try t.expectError(error.IgnoredFilesPresent, edit.run(&repo.git, .continue_edit));
+    try outputEquals(&repo, &.{"show-ref"}, refs);
+    try outputEquals(&repo, &.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
+    const bytes = try repo.tmp.dir.readFileAlloc(t.io, "precious", t.allocator, .limited(1024));
+    defer t.allocator.free(bytes);
+    try t.expectEqualStrings("ignored data\n", bytes);
+    try repo.tmp.dir.deleteFile(t.io, "precious");
+    try edit.run(&repo.git, .continue_edit);
+    try noSession(&repo);
+}
+
+test "checkout hooks cannot bypass the ignored-file replay guard" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try setup(&repo);
+    try edit.run(&repo.git, .{ .jump = "models" });
+    try write(&repo, "model", "fixed\n");
+    try commit(&repo, "correction");
+    try write(&repo, ".git/info/exclude", "api\n");
+    try repo.tmp.dir.createDir(t.io, ".git/checkout-hooks", .default_dir);
+    try repo.tmp.dir.writeFile(t.io, .{
+        .sub_path = ".git/checkout-hooks/post-checkout",
+        .data = "#!/bin/sh\nprintf 'ignored from checkout hook\\n' > api\n",
+        .flags = .{ .permissions = .executable_file },
+    });
+    try repo.exec(&.{ "config", "core.hooksPath", ".git/checkout-hooks" });
+    const work = try repo.git.resolveCommit("work");
+    defer t.allocator.free(work);
+    try t.expectError(error.IgnoredFilesPresent, edit.run(&repo.git, .{ .jump = null }));
+    try refEquals(&repo, "work", work);
+    const bytes = try repo.tmp.dir.readFileAlloc(t.io, "api", t.allocator, .limited(1024));
+    defer t.allocator.free(bytes);
+    try t.expectEqualStrings("ignored from checkout hook\n", bytes);
+    try repo.exec(&.{ "config", "core.hooksPath", "/dev/null" });
+    try repo.tmp.dir.deleteFile(t.io, "api");
+    try edit.run(&repo.git, .continue_edit);
+    try outputEquals(&repo, &.{ "show", "work:api" }, "api");
+    try noSession(&repo);
+}
+
+test "legacy v1 switching checkpoints may retain a completed replay plan" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try pausedBeforeDetach(&repo);
+    const before = try repo.git.outputRaw(&.{ "cat-file", "blob", "refs/stakrr/edit" });
+    defer t.allocator.free(before);
+    var original = try std.json.parseFromSlice(std.json.Value, t.allocator, before, .{});
+    defer original.deinit();
+    try repo.env.put("STAKRR_TEST_FAULT", "after:7");
+    const stopped = try cli(&repo, &.{ "edit", "--continue" });
+    defer repo.git.freeResult(stopped);
+    try t.expect(!stopped.term.success());
+    _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
+    const raw = try repo.git.outputRaw(&.{ "cat-file", "blob", "refs/stakrr/edit" });
+    defer t.allocator.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, raw, .{});
+    defer parsed.deinit();
+    try t.expectEqualStrings("switching", parsed.value.object.get("phase").?.string);
+    // Older versions left this completed plan in the switching checkpoint,
+    // even though its old boundary OIDs no longer match the published nodes.
+    for ([_][]const u8{ "queue_oid", "queue_len" }) |field|
+        parsed.value.object.getPtr(field).?.* = original.value.object.get(field).?;
+    parsed.value.object.getPtr("next").?.* = original.value.object.get("queue_len").?;
+    const head = try repo.git.resolveCommit("HEAD");
+    defer t.allocator.free(head);
+    parsed.value.object.getPtr("before").?.* = .{ .string = head };
+    const legacy = try replaceCheckpoint(&repo, parsed.value);
+    defer t.allocator.free(legacy);
+    try edit.run(&repo.git, .continue_edit);
+    try valid(&repo);
+    try noSession(&repo);
+}
+
+test "a non-blob edit checkpoint reports invalid session without changing refs" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try setup(&repo);
+    const commit_oid = try repo.git.resolveCommit("HEAD");
+    defer t.allocator.free(commit_oid);
+    try repo.exec(&.{ "update-ref", "refs/stakrr/edit", commit_oid });
+    const refs = try repo.git.output(&.{"show-ref"});
+    defer t.allocator.free(refs);
+    try t.expectError(error.InvalidEditSession, edit.readStatus(&repo.git));
+    for ([_]edit.Request{ .continue_edit, .abort }) |request| {
+        try t.expectError(error.InvalidEditSession, edit.run(&repo.git, request));
+        try outputEquals(&repo, &.{"show-ref"}, refs);
+    }
+    try outputEquals(&repo, &.{ "symbolic-ref", "HEAD" }, "refs/heads/work");
+}
+
+test "pending edit status offers continue without conflict instructions" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try pausedBeforeDetach(&repo);
+    const result = try cli(&repo, &.{"status"});
+    defer repo.git.freeResult(result);
+    try t.expect(result.term.success());
+    try t.expect(std.mem.indexOf(u8, result.stdout, "(detaching) → work") != null);
+    try t.expect(std.mem.indexOf(u8, result.stdout, "\n  stakrr edit --continue\n") != null);
+    try t.expect(std.mem.indexOf(u8, result.stdout, "resolve conflicts") == null);
+    try t.expect(std.mem.indexOf(u8, result.stdout, "recovery:") == null);
+    try t.expect(std.mem.indexOf(u8, result.stdout, "worktree:") == null);
+    try edit.run(&repo.git, .continue_edit);
     try noSession(&repo);
 }

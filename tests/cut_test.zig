@@ -329,13 +329,11 @@ test "ref transaction aborts if work changes after inspection" {
 
     try testing.expectError(
         error.GitFailed,
-        repo.git.createLayerRef(
-            "refs/heads/stakrr/race",
-            b,
-            .{ .name = "refs/stakrr/anchor", .oid = base },
-            .{ .name = "refs/heads/work", .oid = b },
-            null,
-        ),
+        stack.createLayerRef(&repo.git, .{
+            .layer = .{ .name = "refs/heads/stakrr/race", .oid = b },
+            .anchor = .{ .name = "refs/stakrr/anchor", .oid = base },
+            .work = .{ .name = "refs/heads/work", .oid = b },
+        }),
     );
 
     try expectNoRef(&repo, "refs/heads/stakrr/race");
@@ -352,17 +350,15 @@ test "ref transaction aborts if the stack is reset after inspection" {
     const b = try repo.commit("B");
     defer testing.allocator.free(b);
 
-    _ = try stack.reset(&repo.git, false);
+    _ = try stack.reset(&repo.git, .{});
 
     try testing.expectError(
         error.GitFailed,
-        repo.git.createLayerRef(
-            "refs/heads/stakrr/race",
-            b,
-            .{ .name = "refs/stakrr/anchor", .oid = base },
-            .{ .name = "refs/heads/work", .oid = b },
-            null,
-        ),
+        stack.createLayerRef(&repo.git, .{
+            .layer = .{ .name = "refs/heads/stakrr/race", .oid = b },
+            .anchor = .{ .name = "refs/stakrr/anchor", .oid = base },
+            .work = .{ .name = "refs/heads/work", .oid = b },
+        }),
     );
 
     try expectNoRef(&repo, "refs/heads/stakrr/race");
@@ -391,23 +387,19 @@ test "ref transaction rejects two cuts from the same old tip" {
         .oid = c,
     };
 
-    try repo.git.createLayerRef(
-        "refs/heads/stakrr/first",
-        b,
-        expected_base,
-        expected_work,
-        null,
-    );
+    try stack.createLayerRef(&repo.git, .{
+        .layer = .{ .name = "refs/heads/stakrr/first", .oid = b },
+        .anchor = expected_base,
+        .work = expected_work,
+    });
 
     try testing.expectError(
         error.GitFailed,
-        repo.git.createLayerRef(
-            "refs/heads/stakrr/second",
-            c,
-            expected_base,
-            expected_work,
-            null,
-        ),
+        stack.createLayerRef(&repo.git, .{
+            .layer = .{ .name = "refs/heads/stakrr/second", .oid = c },
+            .anchor = expected_base,
+            .work = expected_work,
+        }),
     );
 
     try expectNoRef(&repo, "refs/heads/stakrr/second");

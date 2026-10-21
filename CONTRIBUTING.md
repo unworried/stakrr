@@ -14,6 +14,18 @@ zig build test -Doptimize=ReleaseSafe
 `./mktemprepo.sh` drops you into a throwaway repo with a fresh build on `PATH`
 for poking at the cli by hand.
 
+The source layout stays flat: `git.zig` runs Git and applies generic ref
+transactions; `coordination.zig` owns locks and worktree guards; `stack.zig`
+owns stack policy and snapshots; `edit.zig` advances the edit workflow;
+`edit_session.zig` holds its private model and v1 checkpoint codec. CLI parsing
+and rendering live in `main.zig`, with styling in `term.zig`.
+
+Public snapshots and edit status views own their storage and need `deinit`.
+Edit internals use a command arena, with a separate scratch arena for each
+checkpoint. Keep history inspection batched and publish refs with the journal
+in one compare-and-swap transaction. Recovery tests kill the process around
+those checkpoints; preserve their coverage when changing edit phases.
+
 ## // commits
 
 [conventional commits](https://www.conventionalcommits.org), lowercase,

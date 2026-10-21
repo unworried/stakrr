@@ -125,6 +125,14 @@ test "loadConfig rejects malformed state" {
             .value = "v1 refs/heads/main refs/heads/main",
             .expected = error.InvalidConfig,
         },
+        .{
+            .value = "v1 refs/heads/main refs/heads/stakrr/work",
+            .expected = error.InvalidConfig,
+        },
+        .{
+            .value = "v1 refs/heads/stakrr/base refs/heads/work",
+            .expected = error.InvalidConfig,
+        },
     };
 
     for (cases) |case| {
@@ -310,9 +318,7 @@ test "inspect reports layers, depths and unstacked commits" {
     defer snapshot.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 2), snapshot.layers.len);
-    try testing.expectEqual(@as(usize, 1), snapshot.layers[0].depth);
     try testing.expectEqual(@as(usize, 1), snapshot.layers[0].commits);
-    try testing.expectEqual(@as(usize, 3), snapshot.layers[1].depth);
     try testing.expectEqual(@as(usize, 2), snapshot.layers[1].commits);
     try testing.expectEqual(@as(usize, 1), snapshot.unstacked_commits);
     try testing.expect(!snapshot.base_moved);
