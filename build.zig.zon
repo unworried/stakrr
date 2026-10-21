@@ -1,6 +1,6 @@
 .{
     .name = .stakrr,
-    .version = "0.0.2",
+    .version = "0.0.3",
 
     .fingerprint = 0x543c27000b01fcfa, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0",
@@ -9,7 +9,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
-        //"tests",
+        "tests",
         "LICENSE",
         "README.md",
     },

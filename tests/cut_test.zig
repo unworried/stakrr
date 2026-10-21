@@ -28,7 +28,7 @@ fn expectNoRef(repo: *const Repo, ref_name: []const u8) !void {
     const result = try repo.git.run(&.{
         "show-ref", "--verify", "--quiet", ref_name,
     });
-    defer repo.git.free(result);
+    defer repo.git.freeResult(result);
     try testing.expect(!result.term.success());
 }
 
@@ -55,7 +55,7 @@ test "cut at HEAD creates the first layer without moving work" {
     try testing.expectEqualStrings("refs/heads/work", head);
 
     var snapshot = try stack.inspect(&repo.git);
-    defer snapshot.deinit();
+    defer snapshot.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 1), snapshot.layers.len);
     try testing.expectEqual(@as(usize, 1), snapshot.layers[0].commits);
@@ -81,7 +81,7 @@ test "cut at an earlier commit leaves rolling work untouched" {
     try expectRef(&repo, "refs/heads/work", c);
 
     var snapshot = try stack.inspect(&repo.git);
-    defer snapshot.deinit();
+    defer snapshot.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 1), snapshot.unstacked_commits);
 }
@@ -112,7 +112,7 @@ test "two sequential cuts create ordered boundaries" {
     try expectRef(&repo, "refs/heads/work", d);
 
     var snapshot = try stack.inspect(&repo.git);
-    defer snapshot.deinit();
+    defer snapshot.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 2), snapshot.layers.len);
 
@@ -208,8 +208,14 @@ test "cut rejects duplicate or invalid layer names" {
     defer testing.allocator.free(c);
 
     try testing.expectError(
-        error.GitFailed,
+        error.LayerExists,
         stack.cut(&repo.git, "p1", null),
+    );
+
+    // directory/file conflicts with an existing layer
+    try testing.expectError(
+        error.LayerExists,
+        stack.cut(&repo.git, "p1/sub", null),
     );
 
     try expectRef(&repo, "refs/heads/stakrr/p1", b);
@@ -224,9 +230,14 @@ test "cut rejects duplicate or invalid layer names" {
         error.InvalidLayerName,
         stack.cut(&repo.git, "", null),
     );
+
+    try testing.expectError(
+        error.InvalidLayerName,
+        stack.cut(&repo.git, "-x", null),
+    );
 }
 
-test "cut rejects non-work branch and moved base" {
+test "cut rejects a non-work branch" {
     var repo = try Repo.init();
     defer repo.deinit();
 
@@ -243,17 +254,32 @@ test "cut rejects non-work branch and moved base" {
         stack.cut(&repo.git, "p1", null),
     );
 
-    const new_base = try repo.commit("moved main");
-    defer testing.allocator.free(new_base);
+    try expectNoRef(&repo, "refs/heads/stakrr/p1");
+}
 
+test "cut still works after the base moves" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+
+    const b = try repo.commit("B");
+    defer testing.allocator.free(b);
+
+    try repo.exec(&.{ "switch", "-q", "main" });
+    const moved = try repo.commit("moved main");
+    defer testing.allocator.free(moved);
     try repo.exec(&.{ "switch", "-q", "work" });
 
-    try testing.expectError(
-        error.BaseMoved,
-        stack.cut(&repo.git, "p1", null),
-    );
+    try stack.cut(&repo.git, "p1", null);
+    try expectRef(&repo, "refs/heads/stakrr/p1", b);
 
-    try expectNoRef(&repo, "refs/heads/stakrr/p1");
+    var snapshot = try stack.inspect(&repo.git);
+    defer snapshot.deinit(testing.allocator);
+
+    try testing.expect(snapshot.base_moved);
+    try testing.expectEqual(@as(usize, 1), snapshot.layers[0].commits);
 }
 
 test "cut allows staged changes without changing the index" {
@@ -306,7 +332,7 @@ test "ref transaction aborts if work changes after inspection" {
         repo.git.createLayerRef(
             "refs/heads/stakrr/race",
             b,
-            .{ .name = "refs/heads/main", .oid = base },
+            .{ .name = "refs/stakrr/anchor", .oid = base },
             .{ .name = "refs/heads/work", .oid = b },
             null,
         ),
@@ -314,6 +340,32 @@ test "ref transaction aborts if work changes after inspection" {
 
     try expectNoRef(&repo, "refs/heads/stakrr/race");
     try expectNoRef(&repo, "refs/stakrr/tip");
+}
+
+test "ref transaction aborts if the stack is reset after inspection" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+
+    const b = try repo.commit("B");
+    defer testing.allocator.free(b);
+
+    _ = try stack.reset(&repo.git, false);
+
+    try testing.expectError(
+        error.GitFailed,
+        repo.git.createLayerRef(
+            "refs/heads/stakrr/race",
+            b,
+            .{ .name = "refs/stakrr/anchor", .oid = base },
+            .{ .name = "refs/heads/work", .oid = b },
+            null,
+        ),
+    );
+
+    try expectNoRef(&repo, "refs/heads/stakrr/race");
 }
 
 test "ref transaction rejects two cuts from the same old tip" {
@@ -330,7 +382,7 @@ test "ref transaction rejects two cuts from the same old tip" {
     defer testing.allocator.free(c);
 
     const expected_base = Git.ExpectedRef{
-        .name = "refs/heads/main",
+        .name = "refs/stakrr/anchor",
         .oid = base,
     };
 
