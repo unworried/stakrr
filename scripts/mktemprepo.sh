@@ -3,7 +3,7 @@ set -euo pipefail
 # tool used to create new test repo w/ stakrr exec in path
 
 # resolve the stakrr project root
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 bin="$root/zig-out/bin/stakrr"
 
 # Build unless explicitly disabled.
@@ -32,6 +32,7 @@ cleanup() {
 
 trap cleanup EXIT
 
+# keep in sync with Repo.initOptions in tests/support/repo.zig
 git -C "$repo" init -q -b main
 git -C "$repo" config user.name "Stakrr Test"
 git -C "$repo" config user.email "test@stakrr.local"

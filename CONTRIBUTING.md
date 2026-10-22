@@ -11,7 +11,7 @@ zig build test
 zig build test -Doptimize=ReleaseSafe
 ```
 
-`./mktemprepo.sh` drops you into a throwaway repo with a fresh build on `PATH`
+`scripts/mktemprepo.sh` drops you into a throwaway repo with a fresh build on `PATH`
 for poking at the cli by hand.
 
 The source layout stays flat: `layout.zig` names every ref and config key

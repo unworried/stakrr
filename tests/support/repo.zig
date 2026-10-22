@@ -40,7 +40,8 @@ pub const Repo = struct {
             "init", "-q", "-b", "main", "--object-format", options.object_format,
         });
 
-        // never depend on identity/signing settings.
+        // never depend on identity/signing settings. keep in sync with
+        // scripts/mktemprepo.sh
         try repo.exec(&.{
             "config", "--local", "user.name", "Stakrr Test",
         });
