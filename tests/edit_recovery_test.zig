@@ -521,6 +521,8 @@ test "pending edit status offers continue without conflict instructions" {
     try testing.expectEqual(@as(?u8, 0), result.code);
     try testing.expect(std.mem.indexOf(u8, result.stdout, "(detaching) → work") != null);
     try testing.expect(std.mem.indexOf(u8, result.stdout, "\n  stakrr edit --continue\n") != null);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "\nreplay 0/3 done\n") != null);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "  stakrr edit --quit leaves") != null);
     try testing.expect(std.mem.indexOf(u8, result.stdout, "resolve conflicts") == null);
     try testing.expect(std.mem.indexOf(u8, result.stdout, "recovery:") == null);
     try testing.expect(std.mem.indexOf(u8, result.stdout, "worktree:") == null);

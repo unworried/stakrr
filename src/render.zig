@@ -107,7 +107,16 @@ pub fn printEditStatus(out: Terminal, status: edit.Status, current: ?[]const u8)
     try term.styled(out, .accent, "{s}", .{shortRef(status.branches[status.active])});
     if (status.phase != .editing)
         try w.print(" ({s}) → {s}", .{ @tagName(status.phase), shortRef(status.destination) });
-    try w.writeAll("\n\n");
+    try w.writeByte('\n');
+    if (status.progress) |progress| {
+        try term.styled(out, .dim, "replay", .{});
+        if (status.stopped) |stop| {
+            try w.print(" {d}/{d} stopped at ", .{ progress.done + 1, progress.total });
+            try term.styled(out, .warn, "{s}", .{stop.oid[0..7]});
+            try w.print(" {s}\n", .{stop.subject});
+        } else try w.print(" {d}/{d} done\n", .{ progress.done, progress.total });
+    }
+    try w.writeByte('\n');
 
     var width: usize = 0;
     for (status.branches) |ref| width = @max(width, columnWidth(status.base, ref));
@@ -123,10 +132,15 @@ pub fn printEditStatus(out: Terminal, status: edit.Status, current: ?[]const u8)
     }
 
     try printFooter(out, status.base, current, width, status.branches.len - 1);
-    if (status.phase == .conflict) {
-        try w.writeAll("\n  resolve conflicts, git add, then stakrr edit --continue\n");
-    } else if (status.phase != .editing) {
-        try w.writeAll("\n  stakrr edit --continue\n");
+    // every command that can move this phase forward, back, or out
+    switch (status.phase) {
+        .editing => try w.writeAll("\n  commit fixes, then stakrr edit <cut> to move or stakrr edit to finish\n" ++
+            "  stakrr edit --abort restores the pre-edit stack\n"),
+        .conflict => try w.writeAll("\n  resolve conflicts, git add, then stakrr edit --continue\n" ++
+            "  to give up, commit the resolution, then stakrr edit --abort\n"),
+        else => try w.writeAll("\n  stakrr edit --continue\n" ++
+            "  stakrr edit --abort restores the pre-edit stack\n" ++
+            "  stakrr edit --quit leaves HEAD and branches as they are\n"),
     }
 }
 

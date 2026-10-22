@@ -54,7 +54,14 @@ pub const Status = struct {
     destination: []const u8,
     branches: []const []const u8,
     session_id: []const u8,
+    /// set while descendants replay, from detaching until publication
+    progress: ?Progress,
+    /// the commit a replay conflict stopped on
+    stopped: ?Stop,
     _arena: std.heap.ArenaAllocator,
+
+    pub const Progress = struct { done: usize, total: usize };
+    pub const Stop = struct { oid: []const u8, subject: []const u8 };
 
     pub fn deinit(self: *Status) void {
         self._arena.deinit();
@@ -116,6 +123,15 @@ pub fn readStatus(original_git: *const Git) !?Status {
     const s = &loaded.session;
     const branches = try git.allocator.alloc([]const u8, s.nodes.len);
     for (s.nodes, branches) |node, *ref| ref.* = node.ref_name;
+    const progress: ?Status.Progress = switch (s.phase) {
+        .detaching, .replay, .conflict, .publishing => |p| .{ .done = p.next, .total = p.plan_len },
+        else => null,
+    };
+    var stopped: ?Status.Stop = null;
+    if (s.phase == .conflict) {
+        const oid = loaded.plan.?[s.phase.conflict.next];
+        stopped = .{ .oid = oid, .subject = try git.output(&.{ "log", "--no-walk", "--format=%s", oid }) };
+    }
     return .{
         .active = s.active,
         .phase = std.meta.activeTag(s.phase),
@@ -125,6 +141,8 @@ pub fn readStatus(original_git: *const Git) !?Status {
         .destination = if (s.destination()) |i| s.nodes[i].ref_name else s.origin,
         .branches = branches,
         .session_id = s.id,
+        .progress = progress,
+        .stopped = stopped,
         ._arena = context.arena,
     };
 }

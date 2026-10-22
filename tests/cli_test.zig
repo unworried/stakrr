@@ -182,7 +182,9 @@ test "cli: edit confirmations and status share terminal conventions" {
     const status = try stakrr(&repo, &.{"status"});
     defer status.deinit();
     try testing.expectEqualStrings(
-        "stack  main → work\nedit   stakrr/p1\n\n  │ work\n  ▸ stakrr/p1   editing\n  └ main        base\n\n  1 layer\n",
+        "stack  main → work\nedit   stakrr/p1\n\n  │ work\n  ▸ stakrr/p1   editing\n  └ main        base\n\n  1 layer\n\n" ++
+            "  commit fixes, then stakrr edit <cut> to move or stakrr edit to finish\n" ++
+            "  stakrr edit --abort restores the pre-edit stack\n",
         status.stdout,
     );
     try repo.env.put("CLICOLOR_FORCE", "1");
@@ -218,7 +220,7 @@ test "cli: conflict status shows detached replay and a resolution hint" {
     try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "shared", .data = "upper\n" });
     try repo.exec(&.{ "add", "shared" });
     const upper = try repo.commit("upper");
-    testing.allocator.free(upper);
+    defer testing.allocator.free(upper);
     const started = try stakrr(&repo, &.{ "edit", "p1" });
     defer started.deinit();
     try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "shared", .data = "edited\n" });
@@ -232,8 +234,14 @@ test "cli: conflict status shows detached replay and a resolution hint" {
     const status = try stakrr(&repo, &.{"status"});
     defer status.deinit();
     try testing.expectEqual(@as(?u8, 0), status.code);
-    try testing.expectEqualStrings(
-        "stack  main → work\nedit   stakrr/p1 (conflict) → work\n\n  │ work\n  │ stakrr/p1   conflict\n  └ main        base\n\n  1 layer\n\n  resolve conflicts, git add, then stakrr edit --continue\n",
-        status.stdout,
+    const expected = try std.fmt.allocPrint(
+        testing.allocator,
+        "stack  main → work\nedit   stakrr/p1 (conflict) → work\nreplay 1/1 stopped at {s} upper\n\n" ++
+            "  │ work\n  │ stakrr/p1   conflict\n  └ main        base\n\n  1 layer\n\n" ++
+            "  resolve conflicts, git add, then stakrr edit --continue\n" ++
+            "  to give up, commit the resolution, then stakrr edit --abort\n",
+        .{upper[0..7]},
     );
+    defer testing.allocator.free(expected);
+    try testing.expectEqualStrings(expected, status.stdout);
 }
