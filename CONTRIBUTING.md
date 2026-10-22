@@ -14,11 +14,13 @@ zig build test -Doptimize=ReleaseSafe
 `./mktemprepo.sh` drops you into a throwaway repo with a fresh build on `PATH`
 for poking at the cli by hand.
 
-The source layout stays flat: `git.zig` runs Git and applies generic ref
+The source layout stays flat: `layout.zig` names every ref and config key
+stakrr persists; `git.zig` runs Git, parses its output and applies generic ref
 transactions; `coordination.zig` owns locks and worktree guards; `stack.zig`
 owns stack policy and snapshots; `edit.zig` advances the edit workflow;
-`edit_session.zig` holds its private model and v1 checkpoint codec. CLI parsing
-and rendering live in `main.zig`, with styling in `term.zig`.
+`edit_session.zig` holds its private model and checkpoint codec. On the CLI
+side, `cli.zig` parses arguments, `render.zig` draws output, `term.zig` styles
+it, and `main.zig` dispatches commands and maps errors to messages.
 
 Public snapshots and edit status views own their storage and need `deinit`.
 Edit internals use a command arena, with a separate scratch arena for each
