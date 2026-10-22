@@ -130,6 +130,46 @@ pub fn printEditStatus(out: Terminal, status: edit.Status, current: ?[]const u8)
     }
 }
 
+/// Git-style hints naming what changed under an edit and how to put it back.
+pub fn printDriftHints(out: Terminal, drift: edit.Drift) !void {
+    const name = drift.name;
+    if (std.mem.eql(u8, name, "HEAD")) {
+        const expected = drift.expected.?;
+        try hint(out, "HEAD is at {s}, expected {s}", .{ drift.actual.?, shortRef(expected) });
+        if (std.mem.startsWith(u8, expected, stakrr.layout.branch_prefix)) {
+            try hint(out, "restore it: git switch {s}", .{shortRef(expected)});
+        } else try hint(out, "restore it: git switch --detach {s}", .{expected});
+    } else if (std.mem.eql(u8, name, stakrr.layout.state_key)) {
+        try hint(out, "{s} is '{s}', expected '{s}'", .{ name, drift.actual orelse "", drift.expected.? });
+        try hint(out, "restore it: git config {s} '{s}'", .{ name, drift.expected.? });
+    } else if (drift.expected) |expected| {
+        if (drift.actual) |actual| {
+            try hint(out, "{s} is at {s}, expected {s}", .{ name, actual, expected });
+            try keepHint(out, name, actual);
+            try hint(out, "restore it: git update-ref {s} {s} {s}", .{ name, expected, actual });
+        } else {
+            try hint(out, "{s} is missing, expected {s}", .{ name, expected });
+            try hint(out, "restore it: git update-ref {s} {s}", .{ name, expected });
+        }
+    } else {
+        const actual = drift.actual.?;
+        try hint(out, "{s} at {s} is not part of the edit session", .{ name, actual });
+        try keepHint(out, name, actual);
+        try hint(out, "remove it: git update-ref -d {s} {s}", .{ name, actual });
+    }
+    try hint(out, "then rerun the stakrr edit command, or keep it and leave: stakrr edit --quit", .{});
+}
+
+fn keepHint(out: Terminal, name: []const u8, actual: []const u8) !void {
+    if (!std.mem.startsWith(u8, name, stakrr.layout.branch_prefix)) return;
+    try hint(out, "keep it:    git branch rescue/{s} {s}", .{ shortRef(name), actual });
+}
+
+fn hint(out: Terminal, comptime fmt: []const u8, args: anytype) !void {
+    try term.styled(out, .dim, "hint:", .{});
+    try out.writer.print(" " ++ fmt ++ "\n", args);
+}
+
 fn printStackHeader(out: Terminal, base: []const u8, work: []const u8) !void {
     try term.styled(out, .dim, "stack", .{});
     try out.writer.print("  {s} → ", .{shortRef(base)});

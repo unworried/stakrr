@@ -19,7 +19,7 @@ pub fn main(init: std.process.Init) !void {
 
     const env = init.environ_map;
 
-    const command = cli.parseArgs(args) catch |err| fail(init.io, env, err, null);
+    const command = cli.parseArgs(args) catch |err| fail(init.io, env, err, null, null);
 
     var stdout_buffer: [4096]u8 = undefined;
     const stdout_file = std.Io.File.stdout();
@@ -39,7 +39,9 @@ pub fn main(init: std.process.Init) !void {
 
     runCommand(&git, out, command) catch |err| {
         stdout.flush() catch {};
-        fail(init.io, env, err, &diagnostics);
+        // best effort: a failed diagnosis still reports the original error
+        const drift = if (err == error.EditStateChanged) edit.findDrift(&git) catch null else null;
+        fail(init.io, env, err, &diagnostics, drift);
     };
     try stdout.flush();
 }
@@ -137,6 +139,7 @@ fn fail(
     env: *const std.process.Environ.Map,
     err: anyerror,
     diagnostics: ?*const Diagnostics,
+    drift: ?edit.Drift,
 ) noreturn {
     var buffer: [2048]u8 = undefined;
     const stderr_file = std.Io.File.stderr();
@@ -163,6 +166,8 @@ fn fail(
         }
     }
 
+    if (drift) |found| render.printDriftHints(errout, found) catch {};
+
     stderr.flush() catch {};
 
     const usage_error = err == error.InvalidArguments or err == error.UnknownCommand;
@@ -184,7 +189,7 @@ fn userError(err: anyerror) ?[]const u8 {
         error.InvalidEditSession => "invalid edit checkpoint; " ++
             "leave it with 'stakrr edit --quit', which keeps recovery refs",
         error.EditStateChanged => "Git refs or HEAD changed outside the edit workflow; " ++
-            "preserve work before recovery",
+            "restore them, or keep them and leave with 'stakrr edit --quit'",
         error.ReplayConflict => "replay conflict: resolve files, git add them, then run 'stakrr edit --continue'; " ++
             "preserve uncommitted work before '--abort'",
         error.NoPendingEdit => "no transition is pending (use 'stakrr edit [<cut>]' to leave the active cut)",

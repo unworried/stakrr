@@ -129,6 +129,44 @@ pub fn readStatus(original_git: *const Git) !?Status {
     };
 }
 
+/// Owned description of the first ref, config value or HEAD that differs from
+/// the journal. `expected` is null for a ref the session does not know; `actual`
+/// is null for a missing ref. HEAD values are a branch ref or a detached oid.
+pub const Drift = struct {
+    name: []const u8,
+    expected: ?[]const u8,
+    actual: ?[]const u8,
+    _arena: std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *Drift) void {
+        self._arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Explain an `EditStateChanged` failure. Read-only and unlocked, like status;
+/// null when no session exists or nothing differs any more.
+pub fn findDrift(original_git: *const Git) !?Drift {
+    var context: Context = undefined;
+    context.init(original_git);
+    errdefer context.deinit();
+    const git = &context.git;
+    const found = drift(git) catch |err| switch (err) {
+        error.InvalidEditSession => null,
+        else => return err,
+    };
+    const m = found orelse {
+        context.deinit();
+        return null;
+    };
+    return .{ .name = m.name, .expected = m.expected, .actual = m.actual, ._arena = context.arena };
+}
+
+fn drift(git: *const Git) !?Mismatch {
+    const loaded = (try checkpoint.load(git)) orelse return null;
+    return (try refDrift(git, &loaded.session)) orelse try headDrift(git, &loaded.session);
+}
+
 fn begin(git: *const Git, name: []const u8) !Loaded {
     try coordination.requireQuiescent(git);
     var snapshot = try stack.inspect(git);
@@ -544,38 +582,75 @@ fn available(git: *const Git, s: *const Session) !void {
 }
 
 fn checkRefs(git: *const Git, s: *const Session) !void {
-    const config = (try git.configGet(layout.state_key)) orelse
-        return error.EditStateChanged;
-    if (!eql(config, s.config)) return error.EditStateChanged;
+    if (try refDrift(git, s) != null) return error.EditStateChanged;
+}
 
-    const anchor = (try git.readRef(layout.anchor_ref)) orelse
-        return error.EditStateChanged;
-    if (!eql(anchor, s.anchor)) return error.EditStateChanged;
+const Mismatch = struct {
+    name: []const u8,
+    expected: ?[]const u8,
+    actual: ?[]const u8,
 
-    const tip = (try git.readRef(layout.tip_ref)) orelse
-        return error.EditStateChanged;
-    if (!eql(tip, s.topCut().published_oid)) return error.EditStateChanged;
+    fn of(name: []const u8, expected: ?[]const u8, actual: ?[]const u8) ?Mismatch {
+        if (expected != null and actual != null and eql(expected.?, actual.?)) return null;
+        return .{ .name = name, .expected = expected, .actual = actual };
+    }
+};
+
+/// First persisted value that no longer matches the journal.
+fn refDrift(git: *const Git, s: *const Session) !?Mismatch {
+    const config = try git.configGet(layout.state_key);
+    if (Mismatch.of(layout.state_key, s.config, config)) |m| return m;
+    if (Mismatch.of(layout.anchor_ref, s.anchor, try git.readRef(layout.anchor_ref))) |m| return m;
+    const tip = try git.readRef(layout.tip_ref);
+    if (Mismatch.of(layout.tip_ref, s.topCut().published_oid, tip)) |m| return m;
 
     var indexes: std.StringHashMapUnmanaged(usize) = .empty;
     for (s.nodes, 0..) |node, i| try indexes.put(git.allocator, node.ref_name, i);
+    const seen = try git.allocator.alloc(bool, s.nodes.len);
+    @memset(seen, false);
     const layers = (try git.listRefs(layout.layer_prefix)).refs;
     for (layers) |ref| {
         const index = indexes.get(ref.name) orelse
-            return error.EditStateChanged;
+            return .{ .name = ref.name, .expected = null, .actual = ref.oid };
         if (index == s.nodes.len - 1) return error.InvalidEditSession;
-        try checkNode(s, index, ref.oid);
+        seen[index] = true;
+        if (nodeDrift(s, index, ref.oid)) |m| return m;
     }
-    if (layers.len != s.nodes.len - 1) return error.EditStateChanged;
+    for (s.nodes[0 .. s.nodes.len - 1], seen[0 .. s.nodes.len - 1], 0..) |node, found, i| {
+        if (!found) return .{ .name = node.ref_name, .expected = s.expectedOid(i), .actual = null };
+    }
 
     const work = (try git.readRef(s.workNode().ref_name)) orelse
-        return error.EditStateChanged;
-    try checkNode(s, s.nodes.len - 1, work);
+        return .{ .name = s.workNode().ref_name, .expected = s.workNode().published_oid, .actual = null };
+    return nodeDrift(s, s.nodes.len - 1, work);
 }
 
-fn checkNode(s: *const Session, index: usize, actual: []const u8) !void {
+fn nodeDrift(s: *const Session, index: usize, actual: []const u8) ?Mismatch {
     // the user is committing on the active cut
-    if (s.phase == .editing and index == s.active) return;
-    if (!eql(actual, s.expectedOid(index))) return error.EditStateChanged;
+    if (s.phase == .editing and index == s.active) return null;
+    return Mismatch.of(s.nodes[index].ref_name, s.expectedOid(index), actual);
+}
+
+/// Where each phase leaves HEAD, mirroring the checks its handler makes.
+fn headDrift(git: *const Git, s: *const Session) !?Mismatch {
+    const current = try git.head();
+    const head = try git.resolveCommit("HEAD");
+    const actual = current orelse head;
+    switch (s.phase) {
+        .editing => return Mismatch.of("HEAD", s.nodes[s.active].ref_name, actual),
+        .detaching => |progress| return Mismatch.of("HEAD", progress.before, head),
+        .replay, .conflict, .publishing => |progress| {
+            if (current == null and s.phase == .replay and !eql(head, progress.before)) {
+                // a pick committed before its checkpoint is still in sequence
+                const parent = try git.output(&.{ "rev-list", "--parents", "-n", "1", head });
+                const expected = try std.fmt.allocPrint(git.allocator, "{s} {s}", .{ head, progress.before });
+                if (eql(parent, expected)) return null;
+            }
+            if (current != null) return .{ .name = "HEAD", .expected = progress.before, .actual = actual };
+            return Mismatch.of("HEAD", progress.before, head);
+        },
+        .switching, .aborting, .aborted => return null,
+    }
 }
 
 fn requireBranch(git: *const Git, ref: []const u8) !void {

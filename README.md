@@ -127,7 +127,15 @@ Recovery refs also retain replay-plan blobs; only commit refs can become rescue
 branches. Retention is intentional and has no automatic expiry. Direct Git
 commands in other processes do not take stakrr's lock; avoid concurrent manual
 branch updates or worktree changes during an edit. Detected external changes
-stop the operation for recovery.
+stop the operation and name the ref or HEAD that moved, with the commands to
+keep it on a rescue branch and restore the expected value:
+
+```sh
+error: Git refs or HEAD changed outside the edit workflow; ...
+hint: refs/heads/stakrr/api is at 9f8e7d6..., expected 1a2b3c4...
+hint: keep it:    git branch rescue/stakrr/api 9f8e7d6...
+hint: restore it: git update-ref refs/heads/stakrr/api 1a2b3c4... 9f8e7d6...
+```
 
 To keep the changed state instead, `stakrr edit --quit` drops the session like
 `git rebase --quit`: HEAD, the index, files and branches stay as they are, and

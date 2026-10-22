@@ -4,6 +4,7 @@ const stakrr = @import("stakrr");
 const stack = stakrr.stack;
 const edit = stakrr.edit;
 const layout = stakrr.layout;
+const cli = @import("support/cli.zig");
 const Repo = @import("support/repo.zig").Repo;
 const fixture = @import("support/edit_fixture.zig");
 const setup = fixture.setup;
@@ -212,6 +213,51 @@ test "external changes to nonactive refs and invalid edited histories are reject
     try repo.exec(&.{ "branch", "-f", "stakrr/api", layout.tip_ref });
     try repo.exec(&.{ "reset", "--hard", "main" });
     try testing.expectError(error.InvalidEditedHistory, edit.run(&repo.git, .{ .jump = null }));
+    try edit.run(&repo.git, .abort);
+    try valid(&repo);
+}
+
+test "state changes name the drifted ref or HEAD and how to restore it" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try setup(&repo);
+    try edit.run(&repo.git, .{ .jump = "models" });
+    try testing.expect(try edit.findDrift(&repo.git) == null);
+    const api = try repo.git.resolveCommit("stakrr/api");
+    defer testing.allocator.free(api);
+    const base = try repo.git.resolveCommit("main");
+    defer testing.allocator.free(base);
+
+    try repo.exec(&.{ "branch", "-f", "stakrr/api", "main" });
+    const moved = try cli.run(&repo, &.{"edit"});
+    defer moved.deinit();
+    try testing.expectEqual(@as(?u8, 1), moved.code);
+    const keep = try std.fmt.allocPrint(testing.allocator, "git branch rescue/stakrr/api {s}", .{base});
+    defer testing.allocator.free(keep);
+    const restore = try std.fmt.allocPrint(testing.allocator, "git update-ref refs/heads/stakrr/api {s} {s}", .{ api, base });
+    defer testing.allocator.free(restore);
+    for ([_][]const u8{ keep, restore }) |line| {
+        try testing.expect(std.mem.indexOf(u8, moved.stderr, line) != null);
+    }
+    try repo.exec(&.{ "update-ref", "refs/heads/stakrr/api", api, base });
+
+    try repo.exec(&.{ "branch", "-q", "-D", "stakrr/api" });
+    var missing = (try edit.findDrift(&repo.git)).?;
+    defer missing.deinit();
+    try testing.expectEqualStrings("refs/heads/stakrr/api", missing.name);
+    try testing.expectEqualStrings(api, missing.expected.?);
+    try testing.expect(missing.actual == null);
+    try repo.exec(&.{ "update-ref", "refs/heads/stakrr/api", api });
+
+    try repo.exec(&.{ "switch", "-q", "work" });
+    var head = (try edit.findDrift(&repo.git)).?;
+    defer head.deinit();
+    try testing.expectEqualStrings("HEAD", head.name);
+    try testing.expectEqualStrings("refs/heads/stakrr/models", head.expected.?);
+    try testing.expectEqualStrings("refs/heads/work", head.actual.?);
+    try testing.expectError(error.EditStateChanged, edit.run(&repo.git, .{ .jump = null }));
+
+    try repo.exec(&.{ "switch", "-q", "stakrr/models" });
     try edit.run(&repo.git, .abort);
     try valid(&repo);
 }
