@@ -76,6 +76,12 @@ fn runCommand(
         },
         .edit => |request| {
             try edit.run(git, request);
+            if (request == .quit) {
+                try stdout.writeAll("edit session dropped; HEAD and branches left as they are\n" ++
+                    "check the stack with 'stakrr status' (it may need 'stakrr reset')\n" ++
+                    "retained: git for-each-ref " ++ stakrr.layout.recovery_prefix ++ "\n");
+                return;
+            }
             var status = try edit.readStatus(git);
             defer if (status) |*view| view.deinit();
             if (status) |view| {
@@ -176,7 +182,7 @@ fn userError(err: anyerror) ?[]const u8 {
         error.UnknownCut => "cut not found (use its short name)",
         error.WrongEditWorktree => "this edit session belongs to another worktree",
         error.InvalidEditSession => "invalid edit checkpoint; " ++
-            "keep refs/stakrr/edit and recovery refs for recovery",
+            "leave it with 'stakrr edit --quit', which keeps recovery refs",
         error.EditStateChanged => "Git refs or HEAD changed outside the edit workflow; " ++
             "preserve work before recovery",
         error.ReplayConflict => "replay conflict: resolve files, git add them, then run 'stakrr edit --continue'; " ++

@@ -129,6 +129,11 @@ commands in other processes do not take stakrr's lock; avoid concurrent manual
 branch updates or worktree changes during an edit. Detected external changes
 stop the operation for recovery.
 
+To keep the changed state instead, `stakrr edit --quit` drops the session like
+`git rebase --quit`: HEAD, the index, files and branches stay as they are, and
+HEAD plus the checkpoint are pinned under `refs/stakrr/recovery/`. It also
+leaves a corrupt checkpoint. Afterwards `stakrr status` may need `stakrr reset`.
+
 ## // model
 
 ```
@@ -162,6 +167,7 @@ stop the operation for recovery.
 | ● | `stakrr edit [<cut>]` | edit a cut, replay descendants, or finish and return to origin |
 | ● | `stakrr edit --continue` | resume a pending replay or checkout |
 | ● | `stakrr edit --abort` | restore the entire pre-session stack and return to origin |
+| ● | `stakrr edit --quit` | drop the session, leaving HEAD and every branch as they are |
 | ○ | `stakrr submit` | publish review branches, excluding rolling work |
 | ○ | `stakrr undo` | restore the previous stakrr operation |
 

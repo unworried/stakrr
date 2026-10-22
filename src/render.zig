@@ -19,7 +19,7 @@ const help_commands = [_]struct { name: []const u8, args: []const u8, about: []c
     .{ .name = "cut", .args = "<name> [--at <rev>]", .about = "create the next layer" },
     .{
         .name = "edit",
-        .args = "[<cut>|--continue|--abort]",
+        .args = "[<cut>|--continue|--abort|--quit]",
         .about = "edit a cut and replay descendants",
     },
     .{

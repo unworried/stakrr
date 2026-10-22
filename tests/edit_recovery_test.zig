@@ -467,6 +467,51 @@ test "a non-blob edit checkpoint reports invalid session without changing refs" 
     try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/work");
 }
 
+test "quit drops only the journal of drifted and corrupt sessions" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try setup(&repo);
+    try testing.expectError(error.NoEditSession, edit.run(&repo.git, .quit));
+    try edit.run(&repo.git, .{ .jump = "models" });
+    try repo.write("model", "corrected\n");
+    try repo.commitAll("correction");
+    try repo.exec(&.{ "branch", "-f", "stakrr/api", "main" });
+    try testing.expectError(error.EditStateChanged, edit.run(&repo.git, .abort));
+    const head = try repo.git.resolveCommit("HEAD");
+    defer testing.allocator.free(head);
+    const checkpoint = (try repo.git.readRef(layout.session_ref)).?;
+    defer testing.allocator.free(checkpoint);
+    const branches = try repo.git.output(&.{ "for-each-ref", "refs/heads/" });
+    defer testing.allocator.free(branches);
+
+    try edit.run(&repo.git, .quit);
+    try noSession(&repo);
+    try repo.expectOutput(&.{ "for-each-ref", "refs/heads/" }, branches);
+    try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
+    try repo.expectOutput(&.{ "status", "--porcelain=v1" }, "");
+    try expectRecoverable(&repo, head);
+    try expectRecoverable(&repo, checkpoint);
+
+    const corrupt = try repo.git.writeBlob("not a checkpoint");
+    defer testing.allocator.free(corrupt);
+    try repo.exec(&.{ "update-ref", layout.session_ref, corrupt });
+    try testing.expectError(error.InvalidEditSession, edit.run(&repo.git, .abort));
+    try cli.expectSuccess(&repo, &.{ "edit", "--quit" });
+    try noSession(&repo);
+    try expectRecoverable(&repo, corrupt);
+}
+
+test "quit refuses while a replay pick is in progress" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try conflictSetup(&repo);
+    try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .{ .jump = "api" }));
+    const checkpoint = (try repo.git.readRef(layout.session_ref)).?;
+    defer testing.allocator.free(checkpoint);
+    try testing.expectError(error.GitOperationInProgress, edit.run(&repo.git, .quit));
+    try repo.expectRef(layout.session_ref, checkpoint);
+}
+
 test "pending edit status offers continue without conflict instructions" {
     var repo = try Repo.init();
     defer repo.deinit();

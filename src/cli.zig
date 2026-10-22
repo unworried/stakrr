@@ -74,6 +74,7 @@ pub fn parseArgs(args: []const []const u8) ParseError!Command {
         if (rest.len != 1) return error.InvalidArguments;
         if (eql(rest[0], "--continue")) return .{ .edit = .continue_edit };
         if (eql(rest[0], "--abort")) return .{ .edit = .abort };
+        if (eql(rest[0], "--quit")) return .{ .edit = .quit };
         return .{ .edit = .{ .jump = try value(rest[0]) } };
     }
 
@@ -174,6 +175,10 @@ test "parseArgs: edit transitions are mutually exclusive" {
     try testing.expectEqual(
         edit.Request.abort,
         (try parseArgs(&.{ "stakrr", "edit", "--abort" })).edit,
+    );
+    try testing.expectEqual(
+        edit.Request.quit,
+        (try parseArgs(&.{ "stakrr", "edit", "--quit" })).edit,
     );
     try testing.expectError(
         error.InvalidArguments,

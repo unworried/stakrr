@@ -21,7 +21,7 @@ pub const Error = stack.Error || error{
     NoPendingEdit,
     InvalidEditedHistory,
 };
-pub const Request = union(enum) { jump: ?[]const u8, continue_edit, abort };
+pub const Request = union(enum) { jump: ?[]const u8, continue_edit, abort, quit };
 const checkpoint = @import("edit_session.zig");
 const Node = checkpoint.Node;
 const Session = checkpoint.Session;
@@ -71,6 +71,7 @@ pub fn run(original_git: *const Git, request: Request) !void {
     const git = &context.git;
     const guard = try coordination.lock(git);
     defer guard.close(git.io);
+    if (request == .quit) return quitSession(git);
     var loaded = (try checkpoint.load(git)) orelse {
         const name = switch (request) {
             .jump => |cut| cut orelse return error.NoEditSession,
@@ -97,7 +98,7 @@ pub fn run(original_git: *const Git, request: Request) !void {
         .continue_edit => {
             if (s.phase == .editing) return error.NoPendingEdit;
         },
-        .abort => unreachable,
+        .abort, .quit => unreachable,
     }
     try advance(git, &loaded);
 }
@@ -437,6 +438,33 @@ fn abortSession(git: *const Git, loaded: *Loaded) !void {
     try available(git, s);
     try git.switchBranch(s.origin);
     try finish(git, loaded, "stakrr: abort edit");
+}
+
+/// Drop the journal like `git rebase --quit`: HEAD, the index, files and every
+/// branch stay exactly as they are. Skips ref and plan validation so drifted or
+/// corrupt sessions can always be left; HEAD and the checkpoint stay retained.
+fn quitSession(git: *const Git) !void {
+    const oid = (try git.readRef(layout.session_ref)) orelse return error.NoEditSession;
+    const loaded = checkpoint.load(git) catch |err| switch (err) {
+        error.InvalidEditSession => null,
+        else => return err,
+    };
+    // an unreadable checkpoint has no owner to check; its oid names the pins
+    const id = if (loaded) |l| id: {
+        try checkOwner(git, &l.session);
+        break :id l.session.id;
+    } else oid;
+    try coordination.requireNoGitOperation(git, .{});
+    const head = try git.resolveCommit("HEAD");
+    var updates: std.ArrayList(Git.RefUpdate) = .empty;
+    for ([_][]const u8{ head, oid }) |pinned| {
+        try updates.append(git.allocator, .{ .retain = .{
+            .name = try std.fmt.allocPrint(git.allocator, layout.recovery_prefix ++ "{s}/{s}", .{ id, pinned }),
+            .oid = pinned,
+        } });
+    }
+    try updates.append(git.allocator, .{ .delete = .{ .name = layout.session_ref, .oid = oid } });
+    try git.transact("stakrr: quit edit", updates.items);
 }
 
 fn eql(a: []const u8, b: []const u8) bool {
