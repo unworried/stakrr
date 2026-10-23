@@ -229,7 +229,7 @@ test "cli: conflict status shows detached replay and a resolution hint" {
     testing.allocator.free(edited);
     const conflict = try stakrr(&repo, &.{"restack"});
     defer conflict.deinit();
-    try testing.expectEqual(@as(?u8, 1), conflict.code);
+    try testing.expectEqual(@as(?u8, 3), conflict.code);
     try testing.expectEqualStrings("", conflict.stdout);
     const status = try stakrr(&repo, &.{"status"});
     defer status.deinit();

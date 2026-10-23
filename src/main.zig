@@ -186,8 +186,19 @@ fn fail(
 
     stderr.flush() catch {};
 
-    const usage_error = err == error.InvalidArguments or err == error.UnknownCommand;
-    std.process.exit(if (usage_error) 2 else 1);
+    std.process.exit(exitCode(err));
+}
+
+/// 1 generic failure, 2 usage, 3 replay conflict pending, 4 tree not clean enough
+/// to proceed, 5 refs or HEAD moved outside stakrr
+fn exitCode(err: anyerror) u8 {
+    return switch (err) {
+        error.InvalidArguments, error.UnknownCommand => 2,
+        error.ReplayConflict => 3,
+        error.DirtyWorkTree, error.IgnoredFilesPresent, error.GitOperationInProgress => 4,
+        error.EditStateChanged => 5,
+        else => 1,
+    };
 }
 
 fn userError(err: anyerror) ?[]const u8 {
@@ -257,6 +268,14 @@ test {
     _ = term;
     _ = cli;
     _ = render;
+}
+
+test "exit codes distinguish usage, conflict, dirty tree and drift" {
+    try testing.expectEqual(@as(u8, 2), exitCode(error.InvalidArguments));
+    try testing.expectEqual(@as(u8, 3), exitCode(error.ReplayConflict));
+    try testing.expectEqual(@as(u8, 4), exitCode(error.DirtyWorkTree));
+    try testing.expectEqual(@as(u8, 5), exitCode(error.EditStateChanged));
+    try testing.expectEqual(@as(u8, 1), exitCode(error.GitFailed));
 }
 
 test "every domain error has a user message" {

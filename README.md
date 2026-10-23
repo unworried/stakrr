@@ -200,6 +200,10 @@ HEAD plus the checkpoint are retained in `refs/stakrr/oplog` (inspect them with
 
 <sub>● shipped · ○ planned for m2</sub>
 
+Exit codes: 0 success, 1 failure, 2 usage, 3 replay conflict pending, 4 tree not
+clean enough to proceed (dirty, ignored files, or a Git operation running), 5 refs
+or HEAD changed outside stakrr.
+
 ## // internals
 
 | ref | holds |
