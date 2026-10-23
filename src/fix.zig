@@ -12,7 +12,6 @@ const checkpoint = @import("edit_session.zig");
 
 pub const Error = stack.Error || error{
     NoLayers,
-    UnknownCut,
     NothingStaged,
     FixConflict,
     FixDiverged,
@@ -58,6 +57,8 @@ pub fn fix(original_git: *const Git, options: Options) !Result {
     if (!std.mem.eql(u8, current, snapshot.config.work_ref)) return error.NotOnWorkBranch;
     try coordination.requireNoGitOperation(git, .{});
     if (layers.len == 0) return error.NoLayers;
+    // commits made on a layer must be restacked before anything else moves it
+    for (layers) |layer| if (layer.stale()) return error.StaleLayers;
     const index = try findLayer(layers, options.layer);
 
     // rewritten branches must not be checked out in another worktree
@@ -145,7 +146,7 @@ fn publish(
         .anchor = snapshot.config.anchor_oid,
         .nodes = nodes,
         .active = index,
-        .phase = .{ .switching = null },
+        .phase = .switching,
     };
     s.id = try git.writeBlob(try checkpoint.encode(allocator, &s));
 
@@ -154,8 +155,14 @@ fn publish(
     const saved = try checkpoint.create(git, &s, null, &.{snapshot.work_oid}, label);
 
     var updates: std.ArrayList(Git.RefUpdate) = .empty;
-    for (layers[index..], moved) |layer, oid|
+    for (layers[index..], moved) |layer, oid| {
         try updates.append(allocator, .{ .update = .{ .name = layer.ref_name, .new = oid, .old = layer.oid } });
+        try updates.append(allocator, .{ .update = .{
+            .name = try layout.recordRef(allocator, layer.ref_name),
+            .new = oid,
+            .old = layer.oid,
+        } });
+    }
     try updates.append(allocator, .{ .update = .{
         .name = snapshot.config.work_ref,
         .new = work_new,

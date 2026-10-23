@@ -8,69 +8,12 @@ const fixture = @import("support/edit_fixture.zig");
 const cli = @import("support/cli.zig");
 
 fn positions(repo: *const Repo) ![]u8 {
-    return repo.git.output(&.{ "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/", layout.tip_ref });
+    return repo.git.output(&.{ "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/", layout.tip_ref, layout.record_prefix });
 }
 
 fn finishEdit(repo: *const Repo) !void {
-    try edit.run(&repo.git, .{ .jump = "models" });
-    try repo.write("model", "corrected\n");
-    try repo.commitAll("correction");
-    try edit.run(&repo.git, .{ .jump = null });
-}
-
-test "edit undo restores the previous editing checkpoint and can walk back further" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-    try fixture.setup(&repo);
-    const initial = try positions(&repo);
-    defer testing.allocator.free(initial);
-    try edit.run(&repo.git, .{ .jump = "models" });
-    try testing.expectError(error.NoUndo, edit.run(&repo.git, .undo));
-    try repo.write("model", "corrected\n");
-    try repo.commitAll("correction");
-    const correction = try repo.git.resolveCommit("HEAD");
-    defer testing.allocator.free(correction);
-    try edit.run(&repo.git, .{ .jump = "api" });
-    const first = try positions(&repo);
-    defer testing.allocator.free(first);
-    try repo.write("api", "corrected api\n");
-    try repo.commitAll("correct api");
-    try edit.run(&repo.git, .{ .jump = "models" });
-    try cli.expectSuccess(&repo, &.{"undo"});
-    try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/api");
-    const restored = try positions(&repo);
-    defer testing.allocator.free(restored);
-    try testing.expectEqualStrings(first, restored);
-    // A fresh jump after undo starts a new path through the remaining history.
-    try edit.run(&repo.git, .{ .jump = "models" });
-    try edit.run(&repo.git, .undo);
-    try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/api");
-    try edit.run(&repo.git, .undo);
-    try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
-    const restored_initial = try positions(&repo);
-    defer testing.allocator.free(restored_initial);
-    try testing.expectEqualStrings(initial, restored_initial);
-    try testing.expectError(error.NoUndo, edit.run(&repo.git, .undo));
-    try edit.run(&repo.git, .abort);
-    try fixture.expectRecoverable(&repo, correction);
-    try fixture.noSession(&repo);
-}
-
-test "edit undo can leave a replay conflict after the resolution is preserved" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-    try fixture.conflictSetup(&repo);
-    try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .{ .jump = "api" }));
-    try testing.expectError(error.DirtyWorkTree, edit.run(&repo.git, .undo));
-    try repo.write("shared", "resolved\n");
-    try repo.commitAll("preserve resolution");
-    const resolution = try repo.git.resolveCommit("HEAD");
-    defer testing.allocator.free(resolution);
-    try edit.run(&repo.git, .undo);
-    try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
-    try repo.expectOutput(&.{ "show", "HEAD:shared" }, "base");
-    try fixture.expectRecoverable(&repo, resolution);
-    try edit.run(&repo.git, .abort);
+    try fixture.correctModels(repo);
+    try edit.run(&repo.git, .restack);
 }
 
 test "undo of a completed edit and undo of undo restore exact refs in both object formats" {
@@ -85,7 +28,6 @@ test "undo of a completed edit and undo of undo restore exact refs in both objec
         const after = try positions(&repo);
         defer testing.allocator.free(after);
         try testing.expect(!std.mem.eql(u8, before, after));
-        try repo.expectOutput(&.{ "for-each-ref", layout.recovery_prefix }, "");
         try cli.expectSuccess(&repo, &.{"undo"});
         const undone = try positions(&repo);
         defer testing.allocator.free(undone);
@@ -126,8 +68,14 @@ test "global undo refuses drift dirty work active sessions and occupied branches
     defer other.cwd.?.close(testing.io);
     try testing.expectError(error.BranchOccupied, edit.undo(&repo.git));
     try other.exec(&.{ "switch", "-q", "--detach" });
-    try edit.run(&repo.git, .{ .jump = "models" });
+    // a conflicted restack is an active session, which excludes undo
+    try fixture.on(&repo, "models");
+    try repo.write("obsolete", "corrected then deleted\n");
+    try repo.commitAll("correct obsolete");
+    try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .restack));
     try testing.expectError(error.EditInProgress, edit.undo(&repo.git));
+    try repo.exec(&.{ "rm", "-q", "obsolete" });
+    try repo.exec(&.{ "commit", "-q", "--no-edit" });
     try edit.run(&repo.git, .abort);
     try edit.undo(&repo.git); // an aborted session does not hide the completed edit
 }
@@ -136,10 +84,8 @@ test "v2 journal retains checkpoints plans and edited commits through immediate 
     var repo = try Repo.init();
     defer repo.deinit();
     try fixture.setup(&repo);
-    try edit.run(&repo.git, .{ .jump = "models" });
-    try repo.write("model", "corrected\n");
-    try repo.commitAll("correction");
-    const correction = try repo.git.resolveCommit("HEAD");
+    try fixture.correctModels(&repo);
+    const correction = try repo.git.resolveCommit("stakrr/models");
     defer testing.allocator.free(correction);
     try cli.installFaultShim(&repo);
     try repo.env.put("STAKRR_TEST_FAULT", "after:1");
@@ -162,7 +108,6 @@ test "v2 journal retains checkpoints plans and edited commits through immediate 
     try repo.expectOutput(&.{ "cat-file", "-t", correction }, "commit");
     try repo.expectOutput(&.{ "cat-file", "-t", checkpoint }, "commit");
     try repo.expectOutput(&.{ "cat-file", "-t", plan }, "blob");
-    try repo.expectOutput(&.{ "for-each-ref", layout.recovery_prefix }, "");
     try edit.undo(&repo.git);
     try repo.expectOutput(&.{ "show", "work:model" }, "corrected");
 }
@@ -228,45 +173,41 @@ test "undo restoration resumes around every boundary transaction" {
     }
 }
 
-test "local undo resumes after either side of each restoration checkpoint" {
-    for ([_][]const u8{ "before:1", "after:1", "before:2", "after:2", "before:3", "after:3" }) |fault| {
+test "restack archives its final checkpoint atomically" {
+    for ([_][]const u8{ "before:archive", "after:archive" }) |fault| {
         var repo = try Repo.init();
         defer repo.deinit();
         try fixture.setup(&repo);
-        const before = try positions(&repo);
-        defer testing.allocator.free(before);
-        try edit.run(&repo.git, .{ .jump = "models" });
-        try repo.write("model", "corrected\n");
-        try repo.commitAll("correction");
-        try edit.run(&repo.git, .{ .jump = "api" });
+        try fixture.correctModels(&repo);
         try cli.installFaultShim(&repo);
         try repo.env.put("STAKRR_TEST_FAULT", fault);
-        const killed = try cli.run(&repo, &.{"undo"});
+        const killed = try cli.run(&repo, &.{"restack"});
         defer killed.deinit();
         try testing.expect(killed.code != 0);
         _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
-        if (std.mem.eql(u8, fault, "before:1")) {
-            try cli.expectSuccess(&repo, &.{"undo"});
-        } else if (!std.mem.eql(u8, fault, "after:3")) {
+        if (std.mem.eql(u8, fault, "before:archive")) {
+            try repo.expectNoRef(layout.oplog_ref);
             try cli.expectSuccess(&repo, &.{"continue"});
         }
-        const restored = try positions(&repo);
-        defer testing.allocator.free(restored);
-        try testing.expectEqualStrings(before, restored);
-        try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
-        try edit.run(&repo.git, .abort);
+        try fixture.noSession(&repo);
+        try repo.expectOutput(&.{ "cat-file", "-t", layout.oplog_ref }, "commit");
+        var log = try edit.readLog(&repo.git);
+        defer log.deinit();
+        try testing.expect(log.steps.len != 0);
     }
 }
 
-test "finish abort and quit atomically archive their final checkpoints" {
-    for ([_][]const u8{ "restack", "abort", "quit" }) |command| {
+test "abort and quit archive their final checkpoints atomically" {
+    for ([_][]const u8{ "abort", "quit" }) |command| {
         for ([_][]const u8{ "before:archive", "after:archive" }) |fault| {
             var repo = try Repo.init();
             defer repo.deinit();
-            try fixture.setup(&repo);
-            try edit.run(&repo.git, .{ .jump = "models" });
-            try repo.write("model", "corrected\n");
-            try repo.commitAll("correction");
+            try fixture.conflictSetup(&repo);
+            try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .restack));
+            // a committed resolution leaves nothing for either command to refuse
+            try repo.write("shared", "resolved\n");
+            try repo.exec(&.{ "add", "shared" });
+            try repo.exec(&.{ "commit", "-q", "--no-edit" });
             try cli.installFaultShim(&repo);
             try repo.env.put("STAKRR_TEST_FAULT", fault);
             const args: []const []const u8 = &.{command};
@@ -276,8 +217,7 @@ test "finish abort and quit atomically archive their final checkpoints" {
             _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
             if (std.mem.eql(u8, fault, "before:archive")) {
                 try repo.expectNoRef(layout.oplog_ref);
-                const retry: []const []const u8 = if (std.mem.eql(u8, command, "restack")) &.{"continue"} else args;
-                try cli.expectSuccess(&repo, retry);
+                try cli.expectSuccess(&repo, args);
             }
             try fixture.noSession(&repo);
             try repo.expectOutput(&.{ "cat-file", "-t", layout.oplog_ref }, "commit");

@@ -1,4 +1,4 @@
-//! Private edit model and v1/v2 checkpoint codec. All returned slices belong to
+//! Private edit model and checkpoint codec. All returned slices belong to
 //! the caller's command arena. No Git mutation occurs while loading state.
 const std = @import("std");
 const git_mod = @import("git.zig");
@@ -28,7 +28,6 @@ pub const Node = struct {
 };
 
 pub const Replay = struct {
-    destination: ?usize,
     plan_oid: []const u8,
     plan_len: usize,
     next: usize = 0,
@@ -36,8 +35,8 @@ pub const Replay = struct {
 };
 
 pub const Phase = union(enum) {
-    switching: ?usize,
-    editing,
+    /// published; only the return to the original branch remains
+    switching,
     detaching: Replay,
     replay: Replay,
     conflict: Replay,
@@ -50,9 +49,6 @@ pub const PhaseTag = std.meta.Tag(Phase);
 pub const Rollback = struct {
     expected: []const []const u8,
     target: []const []const u8,
-    active: usize,
-    return_ref: []const u8,
-    end: bool,
 };
 
 pub const Outcome = enum { active, finished, aborted, quit, undone };
@@ -63,9 +59,9 @@ pub const Session = struct {
     outcome: Outcome = .active,
     operation: Operation = .edit,
     rollback: ?Rollback = null,
-    undo_cursor: ?[]const u8 = null,
     id: []const u8,
     owner: []const u8,
+    /// the branch checked out when the session began; restored at the end
     origin: []const u8,
     /// raw persisted state, compared byte-for-byte before each transition
     config: []const u8,
@@ -126,14 +122,6 @@ pub const Session = struct {
         }
         return boundary;
     }
-
-    pub fn destination(self: *const Session) ?usize {
-        if (self.rollback) |rollback| return if (rollback.end) null else rollback.active;
-        return switch (self.phase) {
-            .switching => |target| target,
-            else => if (self.replay()) |progress| progress.destination else null,
-        };
-    }
 };
 
 pub const Loaded = struct {
@@ -152,7 +140,6 @@ const WireSession = struct {
     outcome: Outcome = .active,
     operation: Operation = .edit,
     rollback: ?Rollback = null,
-    undo_cursor: ?[]const u8 = null,
     id: []const u8,
     owner: []const u8,
     origin: []const u8,
@@ -160,7 +147,6 @@ const WireSession = struct {
     anchor: []const u8,
     nodes: []Node,
     active: usize,
-    destination: ?usize,
     phase: PhaseTag,
     plan_oid: ?[]const u8 = null,
     plan_len: usize = 0,
@@ -175,7 +161,6 @@ pub fn encode(allocator: std.mem.Allocator, s: *const Session) ![]u8 {
         .outcome = s.outcome,
         .operation = s.operation,
         .rollback = s.rollback,
-        .undo_cursor = s.undo_cursor,
         .id = s.id,
         .owner = s.owner,
         .origin = s.origin,
@@ -183,7 +168,6 @@ pub fn encode(allocator: std.mem.Allocator, s: *const Session) ![]u8 {
         .anchor = s.anchor,
         .nodes = s.nodes,
         .active = s.active,
-        .destination = if (s.phase == .editing) s.active else s.destination(),
         .phase = std.meta.activeTag(s.phase),
         .plan_oid = if (progress) |p| p.plan_oid else null,
         .plan_len = if (progress) |p| p.plan_len else 0,
@@ -211,9 +195,8 @@ pub fn loadAt(git: *const Git, oid: []const u8) !Loaded {
 /// read-only callers; anything that resumes a session must use `loadAt`.
 pub fn loadMetadata(git: *const Git, oid: []const u8) !Loaded {
     const kind = try git.output(&.{ "cat-file", "-t", oid });
-    const is_commit = std.mem.eql(u8, kind, "commit");
-    if (!is_commit and !std.mem.eql(u8, kind, "blob")) return error.InvalidEditSession;
-    const path = if (is_commit) try std.fmt.allocPrint(git.allocator, "{s}:session.json", .{oid}) else oid;
+    if (!std.mem.eql(u8, kind, "commit")) return error.InvalidEditSession;
+    const path = try std.fmt.allocPrint(git.allocator, "{s}:session.json", .{oid});
     const raw = git.outputRaw(&.{ "cat-file", "blob", path }) catch |err| switch (err) {
         error.GitFailed => return error.InvalidEditSession,
         else => return err,
@@ -222,16 +205,16 @@ pub fn loadMetadata(git: *const Git, oid: []const u8) !Loaded {
         WireSession,
         git.allocator,
         raw,
-        .{ .allocate = .alloc_always },
+        .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
     ) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidEditSession,
     };
 
     const wire = parsed.value;
-    if (wire.version != (if (is_commit) @as(u8, 2) else 1)) return error.InvalidEditSession;
+    if (wire.version != 2) return error.InvalidEditSession;
     if (wire.oplog_parent) |parent| if (!validOid(parent, oid.len)) return error.InvalidEditSession;
-    if (is_commit and wire.plan_oid != null) {
+    if (wire.plan_oid != null) {
         const plan_path = try std.fmt.allocPrint(git.allocator, "{s}:plan", .{oid});
         const actual = git.output(&.{ "rev-parse", "--verify", plan_path }) catch return error.InvalidEditSession;
         if (!std.mem.eql(u8, actual, wire.plan_oid.?)) return error.InvalidEditSession;
@@ -245,15 +228,10 @@ pub fn loadMetadata(git: *const Git, oid: []const u8) !Loaded {
     if (wire.nodes.len < 2 or wire.active >= wire.nodes.len - 1)
         return error.InvalidEditSession;
     if (wire.next > wire.plan_len) return error.InvalidEditSession;
-    if (wire.destination) |index| {
-        if (index >= wire.nodes.len - 1) return error.InvalidEditSession;
-    }
 
-    if (wire.undo_cursor) |cursor| if (!validOid(cursor, oid.len)) return error.InvalidEditSession;
     if (wire.rollback) |rollback| {
         if (wire.phase != .aborting and wire.phase != .aborted) return error.InvalidEditSession;
-        if (rollback.expected.len != wire.nodes.len or rollback.target.len != wire.nodes.len or
-            rollback.active >= wire.nodes.len - 1 or !git_mod.isSafeBranchRef(rollback.return_ref))
+        if (rollback.expected.len != wire.nodes.len or rollback.target.len != wire.nodes.len)
             return error.InvalidEditSession;
         for (rollback.expected, rollback.target) |from, to|
             if (!validOid(from, oid.len) or !validOid(to, oid.len)) return error.InvalidEditSession;
@@ -285,7 +263,6 @@ pub fn loadMetadata(git: *const Git, oid: []const u8) !Loaded {
     if (wire.plan_oid) |plan| {
         if (!validOid(plan, oid.len)) return error.InvalidEditSession;
         progress = .{
-            .destination = wire.destination,
             .plan_oid = plan,
             .plan_len = wire.plan_len,
             .next = wire.next,
@@ -294,12 +271,7 @@ pub fn loadMetadata(git: *const Git, oid: []const u8) !Loaded {
     } else if (wire.plan_len != 0 or wire.next != 0) return error.InvalidEditSession;
 
     const phase: Phase = switch (wire.phase) {
-        .switching => .{ .switching = wire.destination },
-        .editing => phase: {
-            if (progress != null or wire.destination != wire.active)
-                return error.InvalidEditSession;
-            break :phase .editing;
-        },
+        .switching => .switching,
         .detaching => phase: {
             const p = progress orelse return error.InvalidEditSession;
             if (p.next != 0) return error.InvalidEditSession;
@@ -320,11 +292,10 @@ pub fn loadMetadata(git: *const Git, oid: []const u8) !Loaded {
         .aborted => .aborted,
     };
     const s: Session = .{
-        .oplog_parent = if (wire.version == 1) try git.readRef(layout.oplog_ref) else wire.oplog_parent,
+        .oplog_parent = wire.oplog_parent,
         .outcome = wire.outcome,
         .operation = wire.operation,
         .rollback = wire.rollback,
-        .undo_cursor = wire.undo_cursor,
         .id = wire.id,
         .owner = wire.owner,
         .origin = wire.origin,
@@ -356,17 +327,11 @@ pub fn previous(git: *const Git, oid: []const u8) !?[]const u8 {
 pub fn create(git: *const Git, s: *const Session, old: ?[]const u8, retain: []const []const u8, label: []const u8) ![]u8 {
     var entries: std.ArrayList(Git.TreeEntry) = .empty;
     var parents: std.ArrayList([]const u8) = .empty;
-    var predecessor = old orelse s.oplog_parent;
+    const predecessor = old orelse s.oplog_parent;
     if (predecessor) |oid| {
         const kind = try git.output(&.{ "cat-file", "-t", oid });
-        if (std.mem.eql(u8, kind, "commit")) {
-            try parents.append(git.allocator, oid);
-        } else if (std.mem.eql(u8, kind, "blob")) {
-            // Migrating an in-flight v1 session also retains its raw journal.
-            try entries.append(git.allocator, .{ .name = "legacy", .oid = oid });
-            predecessor = s.oplog_parent;
-            if (s.oplog_parent) |oplog| try parents.append(git.allocator, oplog);
-        } else return error.InvalidEditSession;
+        if (!std.mem.eql(u8, kind, "commit")) return error.InvalidEditSession;
+        try parents.append(git.allocator, oid);
     }
     const rescue = if (retain.len != 0) retain[0] else if (s.replay()) |p| p.before else s.workNode().published_oid;
     try parents.append(git.allocator, rescue);
@@ -374,7 +339,7 @@ pub fn create(git: *const Git, s: *const Session, old: ?[]const u8, retain: []co
         const kind = try git.output(&.{ "cat-file", "-t", oid });
         if (std.mem.eql(u8, kind, "commit")) try parents.append(git.allocator, oid);
     }
-    // A newly migrated v1 session may have no retained commit parents yet.
+    // every boundary the checkpoint refers to stays reachable
     for (s.nodes) |node| {
         try parents.appendSlice(git.allocator, &.{ node.original_oid, node.published_oid, node.pending_oid });
     }

@@ -15,6 +15,7 @@ pub const Command = union(enum) {
     cut: struct { name: []const u8, at: ?[]const u8 = null },
     reset: stack.ResetOptions,
     navigate: stack.Direction,
+    go: []const u8,
     edit: edit.Request,
     fix: fix.Options,
 };
@@ -113,11 +114,11 @@ pub fn parseArgs(args: []const []const u8) ParseError!Command {
 
     if (eql(command, "go")) {
         if (rest.len != 1) return error.InvalidArguments;
-        return .{ .edit = .{ .jump = try value(rest[0]) } };
+        return .{ .go = try value(rest[0]) };
     }
 
     inline for (.{
-        .{ "restack", edit.Request{ .jump = null } },
+        .{ "restack", edit.Request.restack },
         .{ "continue", edit.Request.continue_edit },
         .{ "abort", edit.Request.abort },
         .{ "quit", edit.Request.quit },
@@ -213,11 +214,8 @@ test "parseArgs: up and down" {
 }
 
 test "parseArgs: go and session verbs" {
-    try testing.expect((try parseArgs(&.{ "stakrr", "restack" })).edit.jump == null);
-    try testing.expectEqualStrings(
-        "models",
-        (try parseArgs(&.{ "stakrr", "go", "models" })).edit.jump.?,
-    );
+    try testing.expectEqual(edit.Request.restack, (try parseArgs(&.{ "stakrr", "restack" })).edit);
+    try testing.expectEqualStrings("models", (try parseArgs(&.{ "stakrr", "go", "models" })).go);
     try testing.expectEqual(
         edit.Request.continue_edit,
         (try parseArgs(&.{ "stakrr", "continue" })).edit,

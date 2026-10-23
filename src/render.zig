@@ -16,15 +16,15 @@ pub fn plural(n: usize, one: []const u8, many: []const u8) []const u8 {
 const help_commands = [_]struct { name: []const u8, args: []const u8, about: []const u8 }{
     .{ .name = "init", .args = "--base <branch>", .about = "adopt current branch as rolling work" },
     .{ .name = "status", .args = "", .about = "display layers and unstacked commits" },
-    .{ .name = "undo", .args = "", .about = "reverse the last jump or finished edit" },
+    .{ .name = "undo", .args = "", .about = "reverse the last restack, fix or undo" },
     .{ .name = "log", .args = "", .about = "show edit history and rescue commits" },
     .{ .name = "cut", .args = "<name> [--at <rev>]", .about = "create the next layer" },
     .{ .name = "fix", .args = "[<cut>] -m <msg>|--amend", .about = "fold staged changes into a cut, replaying descendants" },
-    .{ .name = "go", .args = "<cut>", .about = "edit a cut, replaying descendants as you move" },
-    .{ .name = "restack", .args = "", .about = "replay descendants and return to the original branch" },
-    .{ .name = "continue", .args = "", .about = "resume a pending replay or checkout" },
-    .{ .name = "abort", .args = "", .about = "restore the pre-edit stack" },
-    .{ .name = "quit", .args = "", .about = "drop the edit session, keeping HEAD and branches" },
+    .{ .name = "go", .args = "<cut>", .about = "switch to a cut and edit it with ordinary commits" },
+    .{ .name = "restack", .args = "", .about = "replay what sits above a cut you committed on" },
+    .{ .name = "continue", .args = "", .about = "resume a restack after a conflict" },
+    .{ .name = "abort", .args = "", .about = "abandon a restack and restore the stack" },
+    .{ .name = "quit", .args = "", .about = "drop a pending restack, keeping HEAD and branches" },
     .{
         .name = "reset",
         .args = "[--delete-layers]",
@@ -95,10 +95,20 @@ pub fn printStatus(
             layer.commits,
             plural(layer.commits, "commit", "commits"),
         });
+        if (layer.stale()) {
+            try w.writeAll("  ");
+            try term.styled(out, .warn, "stale", .{});
+        }
         try w.writeByte('\n');
     }
 
     try printFooter(out, config.base_ref, current, width, snapshot.layers.len);
+    for (snapshot.layers) |layer| {
+        if (!layer.stale()) continue;
+        try w.writeAll("\n  stale layers have commits above their recorded boundary;\n" ++
+            "  stakrr restack replays what sits above them\n");
+        break;
+    }
 }
 
 /// The stack as an active edit session sees it, with the pending transition.
@@ -108,8 +118,7 @@ pub fn printEditStatus(out: Terminal, status: edit.Status, current: ?[]const u8)
     try term.styled(out, .dim, "edit", .{});
     try w.writeAll("   ");
     try term.styled(out, .accent, "{s}", .{shortRef(status.branches[status.active])});
-    if (status.phase != .editing)
-        try w.print(" ({s}) → {s}", .{ @tagName(status.phase), shortRef(status.destination) });
+    try w.print(" ({s}) → {s}", .{ @tagName(status.phase), shortRef(status.destination) });
     try w.writeByte('\n');
     if (status.progress) |progress| {
         try term.styled(out, .dim, "replay", .{});
@@ -137,12 +146,10 @@ pub fn printEditStatus(out: Terminal, status: edit.Status, current: ?[]const u8)
     try printFooter(out, status.base, current, width, status.branches.len - 1);
     // every command that can move this phase forward, back, or out
     switch (status.phase) {
-        .editing => try w.writeAll("\n  commit fixes, then stakrr go <cut> to move or stakrr restack to finish\n" ++
-            "  stakrr abort restores the pre-edit stack\n"),
         .conflict => try w.writeAll("\n  resolve conflicts, git add, then stakrr continue\n" ++
             "  to give up, commit the resolution, then stakrr abort\n"),
         else => try w.writeAll("\n  stakrr continue\n" ++
-            "  stakrr abort restores the pre-edit stack\n" ++
+            "  stakrr abort restores the stack from before the restack\n" ++
             "  stakrr quit leaves HEAD and branches as they are\n"),
     }
 }

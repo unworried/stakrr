@@ -10,7 +10,7 @@ for arg do
     [ "$arg" != 'stakrr: edit checkpoint' ] || checkpoint=true
     [ "$arg" != 'cherry-pick' ] || pick=true
     case "$arg" in
-        'stakrr: finish edit'|'stakrr: abort edit'|'stakrr: quit edit'|'stakrr: undo edit') archive=true ;;
+        'stakrr: restack'|'stakrr: abort restack'|'stakrr: quit edit'|'stakrr: undo edit') archive=true ;;
     esac
 done
 [ "$update" = true ] || archive=false

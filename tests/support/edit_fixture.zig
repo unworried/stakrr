@@ -3,7 +3,6 @@ const std = @import("std");
 const testing = std.testing;
 const stakrr = @import("stakrr");
 const stack = stakrr.stack;
-const edit = stakrr.edit;
 const layout = stakrr.layout;
 const Repo = @import("repo.zig").Repo;
 
@@ -26,16 +25,32 @@ pub fn setup(repo: *const Repo) !void {
     try repo.commitAll("rolling");
 }
 
-/// `setup` plus a top cut whose change to `shared` conflicts with an
-/// in-progress edit of models
+/// `setup` plus a top cut whose change to `shared` conflicts with a commit on
+/// models. Ends on stakrr/models with that commit made; restacking conflicts.
 pub fn conflictSetup(repo: *const Repo) !void {
     try setup(repo);
     try repo.write("shared", "upper\n");
     try repo.commitAll("upper shared");
     try stack.cut(&repo.git, "conflict", null);
-    try edit.run(&repo.git, .{ .jump = "models" });
+    try on(repo, "models");
     try repo.write("shared", "edited\n");
     try repo.commitAll("edit shared");
+}
+
+/// check out a layer's branch so the next commits land on it
+pub fn on(repo: *const Repo, layer: []const u8) !void {
+    const branch = try std.fmt.allocPrint(testing.allocator, "stakrr/{s}", .{layer});
+    defer testing.allocator.free(branch);
+    try repo.exec(&.{ "switch", "-q", branch });
+}
+
+/// commit a correction to `model` on the models layer, then return to the rolling
+/// branch, ready to restack
+pub fn correctModels(repo: *const Repo) !void {
+    try on(repo, "models");
+    try repo.write("model", "corrected\n");
+    try repo.commitAll("correction");
+    try repo.exec(&.{ "switch", "-q", "work" });
 }
 
 /// the `setup` stack is intact and inspectable
@@ -58,14 +73,9 @@ pub fn expectRecoverable(repo: *const Repo, oid: []const u8) !void {
     try testing.expect(std.mem.indexOf(u8, objects, oid) != null);
 }
 
-/// Both v1 blobs and v2 commits can be used to test the checkpoint codec.
+/// the session JSON stored in a checkpoint commit
 pub fn checkpointJson(repo: *const Repo, oid: []const u8) ![]u8 {
-    const kind = try repo.git.output(&.{ "cat-file", "-t", oid });
-    defer testing.allocator.free(kind);
-    const path = if (std.mem.eql(u8, kind, "commit"))
-        try std.fmt.allocPrint(testing.allocator, "{s}:session.json", .{oid})
-    else
-        try testing.allocator.dupe(u8, oid);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}:session.json", .{oid});
     defer testing.allocator.free(path);
     return repo.git.outputRaw(&.{ "cat-file", "blob", path });
 }

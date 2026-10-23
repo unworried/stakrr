@@ -163,12 +163,11 @@ test "fix refuses without staged changes, a layer, or the work branch" {
     try expectUnchanged(&repo, before);
 }
 
-test "fix is blocked while an edit session is active" {
+test "fix is blocked while a restack is pending" {
     var repo = try Repo.init();
     defer repo.deinit();
-    try fixture.setup(&repo);
-    try stakrr.edit.run(&repo.git, .{ .jump = "models" });
-    try stage(&repo, "model", "fixed\n");
+    try fixture.conflictSetup(&repo);
+    try testing.expectError(error.ReplayConflict, stakrr.edit.run(&repo.git, .restack));
 
     try testing.expectError(
         error.EditInProgress,
@@ -191,4 +190,23 @@ test "cli: fix reports the layer and the replayed commits" {
     defer empty.deinit();
     try testing.expectEqual(@as(?u8, 1), empty.code);
     try testing.expect(std.mem.indexOf(u8, empty.stderr, "nothing staged") != null);
+}
+
+test "fix refuses while a layer has commits that are not restacked" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try fixture.setup(&repo);
+    try fixture.on(&repo, "models");
+    try repo.write("model", "committed on the layer\n");
+    try repo.commitAll("extra");
+    try repo.exec(&.{ "switch", "-q", "work" });
+    const before = try positions(&repo);
+    defer testing.allocator.free(before);
+    try stage(&repo, "api", "fixed api\n");
+
+    try testing.expectError(
+        error.StaleLayers,
+        fix.fix(&repo.git, .{ .layer = "api", .how = .{ .message = "x" } }),
+    );
+    try expectUnchanged(&repo, before);
 }

@@ -398,6 +398,7 @@ test "inspect rejects two layers on the same commit" {
     defer testing.allocator.free(b);
     try stack.cut(&repo.git, "p1", null);
     try repo.exec(&.{ "branch", "stakrr/dup", b });
+    try repo.exec(&.{ "update-ref", layout.record_prefix ++ "dup", b });
 
     try testing.expectError(
         error.InvalidLayerBoundary,
@@ -489,4 +490,62 @@ test "navigate handles an empty stack and rejects branches outside it" {
     try testing.expectError(error.NotOnStackBranch, stack.navigate(&repo.git, .down));
     try repo.exec(&.{ "switch", "-q", "--detach" });
     try testing.expectError(error.DetachedHead, stack.navigate(&repo.git, .up));
+}
+
+test "inspect reports a layer committed on past its recorded boundary as stale" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try repo.initStack();
+    defer testing.allocator.free(base);
+    const b = try repo.commit("B");
+    defer testing.allocator.free(b);
+    try stack.cut(&repo.git, "p1", null);
+    const c = try repo.commit("C");
+    defer testing.allocator.free(c);
+
+    try repo.exec(&.{ "switch", "-q", "stakrr/p1" });
+    const extra = try repo.commit("extra");
+    defer testing.allocator.free(extra);
+    try repo.exec(&.{ "switch", "-q", "work" });
+
+    var snapshot = try stack.inspect(&repo.git);
+    defer snapshot.deinit();
+    try testing.expectEqual(@as(usize, 1), snapshot.layers.len);
+    try testing.expect(snapshot.layers[0].stale());
+    try testing.expectEqualStrings(b, snapshot.layers[0].oid);
+    try testing.expectEqualStrings(extra, snapshot.layers[0].branch_oid);
+    try testing.expectEqual(@as(usize, 1), snapshot.unstacked_commits);
+    try testing.expectError(error.StaleLayers, stack.cut(&repo.git, "p2", null));
+}
+
+test "inspect rejects a layer without a recorded boundary" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try repo.initStack();
+    defer testing.allocator.free(base);
+    const b = try repo.commit("B");
+    defer testing.allocator.free(b);
+    try stack.cut(&repo.git, "p1", null);
+    try repo.exec(&.{ "update-ref", "-d", layout.record_prefix ++ "p1" });
+
+    try testing.expectError(error.InvalidStack, stack.inspect(&repo.git));
+}
+
+test "go switches to a layer by its short name" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try repo.initStack();
+    defer testing.allocator.free(base);
+    const b = try repo.commit("B");
+    defer testing.allocator.free(b);
+    try stack.cut(&repo.git, "p1", null);
+    const c = try repo.commit("C");
+    defer testing.allocator.free(c);
+
+    try stack.go(&repo.git, "p1");
+    try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/p1");
+    try testing.expectError(error.UnknownCut, stack.go(&repo.git, "nope"));
 }

@@ -165,7 +165,7 @@ test "cli: navigation and status follow the checked-out branch" {
     try testing.expect(std.mem.indexOf(u8, detached.stdout, "▸") == null);
 }
 
-test "cli: edit confirmations and status share terminal conventions" {
+test "cli: restack confirmations and status share terminal conventions" {
     var repo = try Repo.init();
     defer repo.deinit();
     try setup(&repo);
@@ -178,15 +178,19 @@ test "cli: edit confirmations and status share terminal conventions" {
     const started = try stakrr(&repo, &.{ "go", "p1" });
     defer started.deinit();
     try testing.expectEqual(@as(?u8, 0), started.code);
-    try testing.expectEqualStrings("editing stakrr/p1\n", started.stdout);
+    try testing.expectEqualStrings("switched to stakrr/p1\n", started.stdout);
+    const idle = try stakrr(&repo, &.{"restack"});
+    defer idle.deinit();
+    try testing.expectEqual(@as(?u8, 0), idle.code);
+    try testing.expectEqualStrings("nothing to restack\n", idle.stdout);
+
+    // a commit on the layer makes it stale until restacked
+    const extra = try repo.commit("extra");
+    testing.allocator.free(extra);
     const status = try stakrr(&repo, &.{"status"});
     defer status.deinit();
-    try testing.expectEqualStrings(
-        "stack  main → work\nedit   stakrr/p1\n\n  │ work\n  ▸ stakrr/p1   editing\n  └ main        base\n\n  1 layer\n\n" ++
-            "  commit fixes, then stakrr go <cut> to move or stakrr restack to finish\n" ++
-            "  stakrr abort restores the pre-edit stack\n",
-        status.stdout,
-    );
+    try testing.expect(std.mem.indexOf(u8, status.stdout, "stakrr/p1   1 commit  stale\n") != null);
+    try testing.expect(std.mem.indexOf(u8, status.stdout, "stakrr restack replays what sits above them\n") != null);
     try repo.env.put("CLICOLOR_FORCE", "1");
     const colored = try stakrr(&repo, &.{"status"});
     defer colored.deinit();
@@ -197,12 +201,10 @@ test "cli: edit confirmations and status share terminal conventions" {
     try testing.expectEqualStrings(status.stdout, plain.stdout);
     const finished = try stakrr(&repo, &.{"restack"});
     defer finished.deinit();
-    try testing.expectEqualStrings("edit completed; returned to work\n", finished.stdout);
-    const restarted = try stakrr(&repo, &.{ "go", "p1" });
-    defer restarted.deinit();
-    const aborted = try stakrr(&repo, &.{"abort"});
-    defer aborted.deinit();
-    try testing.expectEqualStrings("edit aborted; returned to work\nretained edits: stakrr log (refs/stakrr/oplog)\n", aborted.stdout);
+    try testing.expectEqualStrings("restack completed; returned to stakrr/p1\n", finished.stdout);
+    const settled = try stakrr(&repo, &.{"status"});
+    defer settled.deinit();
+    try testing.expect(std.mem.indexOf(u8, settled.stdout, "stale") == null);
 }
 
 test "cli: conflict status shows detached replay and a resolution hint" {
@@ -236,7 +238,7 @@ test "cli: conflict status shows detached replay and a resolution hint" {
     try testing.expectEqual(@as(?u8, 0), status.code);
     const expected = try std.fmt.allocPrint(
         testing.allocator,
-        "stack  main → work\nedit   stakrr/p1 (conflict) → work\nreplay 1/1 stopped at {s} upper\n\n" ++
+        "stack  main → work\nedit   stakrr/p1 (conflict) → stakrr/p1\nreplay 1/1 stopped at {s} upper\n\n" ++
             "  │ work\n  │ stakrr/p1   conflict\n  └ main        base\n\n  1 layer\n\n" ++
             "  resolve conflicts, git add, then stakrr continue\n" ++
             "  to give up, commit the resolution, then stakrr abort\n",
@@ -244,4 +246,13 @@ test "cli: conflict status shows detached replay and a resolution hint" {
     );
     defer testing.allocator.free(expected);
     try testing.expectEqualStrings(expected, status.stdout);
+
+    try repo.exec(&.{ "checkout", "--ours", "shared" });
+    try repo.exec(&.{ "add", "shared" });
+    const aborted = try stakrr(&repo, &.{"abort"});
+    defer aborted.deinit();
+    try testing.expectEqualStrings(
+        "restack aborted; returned to stakrr/p1\nretained edits: stakrr log (refs/stakrr/oplog)\n",
+        aborted.stdout,
+    );
 }

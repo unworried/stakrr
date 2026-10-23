@@ -27,6 +27,8 @@ pub const Error = git_mod.Error || coordination.Error || error{
     InvalidCutBoundary,
     CutOutsideWork,
     NotOnStackBranch,
+    UnknownCut,
+    StaleLayers,
 };
 
 /// Validated branch pair from the persisted state, borrowing from it.
@@ -44,10 +46,17 @@ pub const Config = struct {
 
 pub const Layer = struct {
     ref_name: []const u8,
+    /// the recorded boundary: where the stack last published this layer
     oid: []const u8,
+    /// the branch tip; it differs from `oid` once commits were made on the layer
+    branch_oid: []const u8,
 
     // commits since the previous layer boundary
     commits: usize,
+
+    pub fn stale(self: Layer) bool {
+        return !std.mem.eql(u8, self.oid, self.branch_oid);
+    }
 };
 
 /// Owned view of the stack. Every slice stays valid until deinit.
@@ -86,6 +95,9 @@ pub fn initStack(
     var existing_layers = try git.listRefs(layout.layer_prefix);
     defer existing_layers.deinit(allocator);
     if (existing_layers.refs.len != 0) return error.ExistingStackRefs;
+    var existing_records = try git.listRefs(layout.record_prefix);
+    defer existing_records.deinit(allocator);
+    if (existing_records.refs.len != 0) return error.ExistingStackRefs;
     for ([_][]const u8{ layout.tip_ref, layout.anchor_ref }) |ref_name| {
         const existing = try git.readRef(ref_name);
         defer if (existing) |oid| allocator.free(oid);
@@ -196,7 +208,7 @@ fn loadConfig(git: *const Git) !Config {
 }
 
 // Inspection alone needs cumulative depths to sort boundaries by ancestry.
-const Boundary = struct { ref_name: []const u8, oid: []const u8, depth: usize };
+const Boundary = struct { ref_name: []const u8, oid: []const u8, branch_oid: []const u8, depth: usize };
 
 pub fn inspect(parent_git: *const Git) !Snapshot {
     try parent_git.ensureWorkTree();
@@ -228,19 +240,28 @@ pub fn inspect(parent_git: *const Git) !Snapshot {
     for (history.commits, 1..) |oid, depth| try depths.put(allocator, oid, depth);
     const chain_len = history.commits.len;
 
-    // discover branches owned by stakrr
+    // discover branches owned by stakrr, and where each was last published
     const listed = try git.listRefs(layout.layer_prefix);
+    const records = try git.listRefs(layout.record_prefix);
+    if (records.refs.len != listed.refs.len) return error.InvalidStack;
 
     var layers: std.ArrayList(Boundary) = .empty;
 
     for (listed.refs) |ref| {
-        // every layer must sit on the chain between the anchor and work
-        const depth = depths.get(ref.oid) orelse
+        const record = try layout.recordRef(allocator, ref.name);
+        const recorded = for (records.refs) |candidate| {
+            if (std.mem.eql(u8, candidate.name, record)) break candidate.oid;
+        } else return error.InvalidStack;
+
+        // every recorded boundary must sit on the chain between the anchor and
+        // work; the branch itself may have moved on since
+        const depth = depths.get(recorded) orelse
             return error.InvalidStack;
 
         try layers.append(allocator, .{
             .ref_name = ref.name,
-            .oid = ref.oid,
+            .oid = recorded,
+            .branch_oid = ref.oid,
             .depth = depth,
         });
     }
@@ -265,6 +286,7 @@ pub fn inspect(parent_git: *const Git) !Snapshot {
         out.* = .{
             .ref_name = layer.ref_name,
             .oid = layer.oid,
+            .branch_oid = layer.branch_oid,
             .commits = layer.depth - previous_depth,
         };
 
@@ -344,6 +366,7 @@ pub fn cut(
         return error.NotOnWorkBranch;
 
     for (snapshot.layers) |layer| {
+        if (layer.stale()) return error.StaleLayers;
         if (refsConflict(layer.ref_name, new_ref))
             return error.LayerExists;
     }
@@ -395,7 +418,10 @@ pub const LayerCreation = struct {
 
 /// Create a boundary and advance the stack guard in one compare-and-swap.
 pub fn createLayerRef(git: *const Git, expected: LayerCreation) !void {
-    var updates: [5]Git.RefUpdate = undefined;
+    const record = try layout.recordRef(git.allocator, expected.layer.name);
+    defer git.allocator.free(record);
+
+    var updates: [6]Git.RefUpdate = undefined;
     updates[0] = .{ .verify = expected.anchor };
     updates[1] = .{ .verify = expected.work };
     var count: usize = 2;
@@ -404,6 +430,8 @@ pub fn createLayerRef(git: *const Git, expected: LayerCreation) !void {
         count += 1;
     }
     updates[count] = .{ .create = expected.layer };
+    count += 1;
+    updates[count] = .{ .create = .{ .name = record, .oid = expected.layer.oid } };
     count += 1;
     updates[count] = if (expected.previous) |previous|
         .{ .update = .{
@@ -451,6 +479,10 @@ pub fn reset(git: *const Git, options: ResetOptions) !ResetResult {
                 .{ .delete = .{ .name = ref_name, .oid = oid } },
             );
     }
+
+    var records = try git.listRefs(layout.record_prefix);
+    defer records.deinit(allocator);
+    for (records.refs) |ref| try updates.append(allocator, .{ .delete = ref });
 
     const layer_count = layers.refs.len;
     if (delete_layers) for (layers.refs) |ref| {
@@ -502,7 +534,7 @@ pub fn navigate(git: *const Git, direction: Direction) !bool {
     defer guard.close(git.io);
     if (try git.readRef(layout.session_ref)) |oid| {
         git.allocator.free(oid);
-        return @import("edit.zig").navigateLocked(git, direction);
+        return error.EditInProgress;
     }
     var snapshot = try inspect(git);
     defer snapshot.deinit();
@@ -523,4 +555,23 @@ pub fn navigate(git: *const Git, direction: Direction) !bool {
 
     try git.switchBranch(navigationRef(&snapshot, target_index));
     return true;
+}
+
+/// Switch to a layer's branch by its short name. Commits made there are picked
+/// up by the next restack.
+pub fn go(git: *const Git, name: []const u8) !void {
+    const guard = try coordination.lock(git);
+    defer guard.close(git.io);
+    if (try git.readRef(layout.session_ref)) |oid| {
+        git.allocator.free(oid);
+        return error.EditInProgress;
+    }
+    var snapshot = try inspect(git);
+    defer snapshot.deinit();
+    for (snapshot.layers) |layer| {
+        const short = layout.layerName(layer.ref_name) orelse continue;
+        if (!std.mem.eql(u8, short, name)) continue;
+        return git.switchBranch(layer.ref_name);
+    }
+    return error.UnknownCut;
 }
