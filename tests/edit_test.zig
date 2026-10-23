@@ -198,8 +198,6 @@ test "active sessions reject every competing stakrr mutation" {
     try testing.expectError(error.EditInProgress, stack.cut(&repo.git, "new", null));
     try testing.expectError(error.EditInProgress, stack.reset(&repo.git, .{ .delete_layers = true }));
     try testing.expectError(error.EditInProgress, stack.initStack(&repo.git, "main"));
-    try testing.expectError(error.EditInProgress, stack.navigate(&repo.git, .up));
-    try testing.expectError(error.EditInProgress, stack.navigate(&repo.git, .down));
     try edit.run(&repo.git, .abort);
 }
 
@@ -512,4 +510,29 @@ test "modify delete conflict can resolve to a deletion without resurrecting the 
     defer repo.git.freeResult(result);
     try testing.expect(!result.term.success());
     try valid(&repo);
+}
+
+test "up and down replay edits and traverse active cuts before finishing" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try setup(&repo);
+    try edit.run(&repo.git, .{ .jump = "api" });
+    try repo.write("api", "corrected api\n");
+    try repo.commitAll("correct api");
+    try testing.expect(try stack.navigate(&repo.git, .down));
+    try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
+    try repo.expectOutput(&.{ "show", "work:api" }, "corrected api");
+    try testing.expect(!try stack.navigate(&repo.git, .down));
+    try repo.write("model", "corrected model\n");
+    try repo.commitAll("correct model");
+    try testing.expect(try stack.navigate(&repo.git, .up));
+    try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/api");
+    var status = (try edit.readStatus(&repo.git)).?;
+    defer status.deinit();
+    try testing.expectEqual(@as(usize, 1), status.active);
+    try repo.expectOutput(&.{ "show", "HEAD:model" }, "corrected model");
+    try testing.expect(try stack.navigate(&repo.git, .up));
+    try noSession(&repo);
+    try valid(&repo);
+    try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/work");
 }

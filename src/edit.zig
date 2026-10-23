@@ -78,6 +78,10 @@ pub fn run(original_git: *const Git, request: Request) !void {
     const git = &context.git;
     const guard = try coordination.lock(git);
     defer guard.close(git.io);
+    return runLocked(git, request);
+}
+
+fn runLocked(git: *const Git, request: Request) !void {
     if (request == .quit) return quitSession(git);
     var loaded = (try checkpoint.load(git)) orelse {
         const name = switch (request) {
@@ -108,6 +112,27 @@ pub fn run(original_git: *const Git, request: Request) !void {
         .abort, .quit => unreachable,
     }
     try advance(git, &loaded);
+}
+
+/// Called by stack navigation while holding the shared mutation lock.
+pub fn navigateLocked(original_git: *const Git, direction: stack.Direction) !bool {
+    var context: Context = undefined;
+    context.init(original_git);
+    defer context.deinit();
+    const git = &context.git;
+    const loaded = (try checkpoint.load(git)) orelse return error.NoEditSession;
+    const s = &loaded.session;
+    try checkOwner(git, s);
+    try checkRefs(git, s);
+    if (s.phase != .editing) return error.EditNeedsContinue;
+    try requireBranch(git, s.nodes[s.active].ref_name);
+    const target: ?usize = switch (direction) {
+        .up => if (s.active == s.nodes.len - 2) null else s.active + 1,
+        .down => if (s.active == 0) return false else s.active - 1,
+    };
+    const name = if (target) |i| layout.layerName(s.nodes[i].ref_name).? else null;
+    try runLocked(git, .{ .jump = name });
+    return true;
 }
 
 pub fn readStatus(original_git: *const Git) !?Status {

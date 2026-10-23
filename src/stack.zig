@@ -498,8 +498,12 @@ fn navigationRef(snapshot: *const Snapshot, index: usize) []const u8 {
 
 /// Returns false when already at the requested end of the stack.
 pub fn navigate(git: *const Git, direction: Direction) !bool {
-    const guard = try coordination.lockStack(git);
+    const guard = try coordination.lock(git);
     defer guard.close(git.io);
+    if (try git.readRef(layout.session_ref)) |oid| {
+        git.allocator.free(oid);
+        return @import("edit.zig").navigateLocked(git, direction);
+    }
     var snapshot = try inspect(git);
     defer snapshot.deinit();
 
