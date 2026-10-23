@@ -366,7 +366,6 @@ pub const Git = struct {
     pub const RefUpdate = union(enum) {
         verify: ExpectedRef,
         /// Idempotent recovery pin; name contains its immutable object ID.
-        retain: ExpectedRef,
         create: ExpectedRef,
         /// compare-and-swap `name` from `old` to `new`
         update: struct { name: []const u8, new: []const u8, old: []const u8 },
@@ -387,10 +386,6 @@ pub const Git = struct {
 
         try w.writeAll("start\n");
         for (updates) |update| switch (update) {
-            .retain => |ref| {
-                try checkUpdate(ref.name, &.{ref.oid});
-                try w.print("update {s} {s}\n", .{ ref.name, ref.oid });
-            },
             .verify => |ref| {
                 try checkUpdate(ref.name, &.{ref.oid});
                 try w.print("verify {s} {s}\n", .{ ref.name, ref.oid });
