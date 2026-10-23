@@ -501,11 +501,15 @@ pub const Git = struct {
         data: []const u8,
         format: ObjectFormat,
     ) ![]u8 {
-        var header_buffer: ["blob ".len + 20 + 1]u8 = undefined;
+        return self.writeObject("blob", data, format);
+    }
+
+    fn writeObject(self: *const Git, kind: []const u8, data: []const u8, format: ObjectFormat) ![]u8 {
+        var header_buffer: [32]u8 = undefined;
         const header = try std.fmt.bufPrint(
             &header_buffer,
-            "blob {d}\x00",
-            .{data.len},
+            "{s} {d}\x00",
+            .{ kind, data.len },
         );
         var digest: [32]u8 = undefined;
         const len: usize = if (format == .sha1) blk: {
@@ -521,7 +525,7 @@ pub const Git = struct {
             hash.final(&digest);
             break :blk 32;
         };
-        try self.input(&.{ "hash-object", "-w", "--stdin" }, data);
+        try self.input(&.{ "hash-object", "-w", "-t", kind, "--stdin" }, data);
         const hex = try self.allocator.alloc(u8, len * 2);
         const alphabet = "0123456789abcdef";
         for (digest[0..len], 0..) |byte, i| {
@@ -529,6 +533,57 @@ pub const Git = struct {
             hex[2 * i + 1] = alphabet[byte & 15];
         }
         return hex;
+    }
+
+    pub const TreeEntry = struct { name: []const u8, oid: []const u8, tree: bool = false };
+
+    /// Write a tree of blobs/subtrees without touching the worktree's index.
+    pub fn writeTree(self: *const Git, entries: []const TreeEntry) ![]u8 {
+        const sorted = try self.allocator.dupe(TreeEntry, entries);
+        defer self.allocator.free(sorted);
+        std.mem.sort(TreeEntry, sorted, {}, struct {
+            fn less(_: void, a: TreeEntry, b: TreeEntry) bool {
+                const common = @min(a.name.len, b.name.len);
+                const order = std.mem.order(u8, a.name[0..common], b.name[0..common]);
+                if (order != .eq) return order == .lt;
+                const a_next: u8 = if (a.name.len > common) a.name[common] else if (a.tree) '/' else 0;
+                const b_next: u8 = if (b.name.len > common) b.name[common] else if (b.tree) '/' else 0;
+                return a_next < b_next;
+            }
+        }.less);
+        var data: Io.Writer.Allocating = .init(self.allocator);
+        defer data.deinit();
+        const format = try self.objectFormat();
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        defer names.deinit(self.allocator);
+        for (sorted) |entry| {
+            if (entry.name.len == 0 or std.mem.indexOfAny(u8, entry.name, "/\x00\n") != null)
+                return error.InvalidRefName;
+            if ((try names.getOrPut(self.allocator, entry.name)).found_existing) return error.InvalidRefName;
+            if (!isOid(entry.oid) or entry.oid.len != (if (format == .sha1) @as(usize, 40) else 64))
+                return error.InvalidOid;
+            try data.writer.print("{s} {s}\x00", .{ if (entry.tree) "40000" else "100644", entry.name });
+            var binary: [32]u8 = undefined;
+            const bytes = std.fmt.hexToBytes(&binary, entry.oid) catch return error.InvalidOid;
+            try data.writer.writeAll(bytes);
+        }
+        return self.writeObject("tree", data.written(), format);
+    }
+
+    /// Create a checkpoint commit, preserving parent order and bypassing hooks/signing.
+    pub fn commitTree(self: *const Git, tree: []const u8, parents: []const []const u8, label: []const u8) ![]u8 {
+        if (!isOid(tree)) return error.InvalidOid;
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(self.allocator);
+        try args.appendSlice(self.allocator, &.{ "-c", "commit.gpgsign=false", "commit-tree", tree, "-m", label });
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(self.allocator);
+        for (parents) |parent| {
+            if (!isOid(parent)) return error.InvalidOid;
+            if ((try seen.getOrPut(self.allocator, parent)).found_existing) continue;
+            try args.appendSlice(self.allocator, &.{ "-p", parent });
+        }
+        return self.output(args.items);
     }
 
     pub fn switchBranch(self: *const Git, ref_name: []const u8) !void {

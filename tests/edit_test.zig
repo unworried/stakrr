@@ -292,6 +292,9 @@ test "sessions belong to one worktree and share the mutation guard" {
     try edit.run(&repo.git, .{ .jump = "models" });
     try testing.expectError(error.WrongEditWorktree, edit.run(&other, .abort));
     try testing.expectError(error.WrongEditWorktree, edit.run(&other, .continue_edit));
+    try testing.expectError(error.WrongEditWorktree, edit.run(&other, .quit));
+    try testing.expectError(error.WrongEditWorktree, edit.run(&other, .undo));
+    try testing.expectError(error.WrongEditWorktree, stack.navigate(&other, .up));
     try testing.expectError(error.EditInProgress, stack.reset(&other, .{}));
     try edit.run(&repo.git, .abort);
 }

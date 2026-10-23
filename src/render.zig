@@ -16,10 +16,12 @@ pub fn plural(n: usize, one: []const u8, many: []const u8) []const u8 {
 const help_commands = [_]struct { name: []const u8, args: []const u8, about: []const u8 }{
     .{ .name = "init", .args = "--base <branch>", .about = "adopt current branch as rolling work" },
     .{ .name = "status", .args = "", .about = "display layers and unstacked commits" },
+    .{ .name = "undo", .args = "", .about = "reverse the last completed edit" },
+    .{ .name = "log", .args = "", .about = "show edit history and rescue commits" },
     .{ .name = "cut", .args = "<name> [--at <rev>]", .about = "create the next layer" },
     .{
         .name = "edit",
-        .args = "[<cut>|--continue|--abort|--quit]",
+        .args = "[<cut>|--continue|--abort|--quit|--undo]",
         .about = "edit a cut and replay descendants",
     },
     .{
@@ -216,4 +218,13 @@ fn printFooter(out: Terminal, base: []const u8, current: ?[]const u8, width: usi
 
 fn isCurrent(current: ?[]const u8, ref_name: []const u8) bool {
     return if (current) |ref| std.mem.eql(u8, ref, ref_name) else false;
+}
+
+pub fn printLog(out: Terminal, log: edit.Log) !void {
+    if (log.steps.len == 0) return out.writer.writeAll("no edit history\n");
+    for (log.steps) |step| {
+        try out.writer.print("{s} {s}", .{ step.time, step.label });
+        for (step.moves) |move| try out.writer.print("; {s} {s} → {s}", .{ shortRef(move.name), move.before, move.after });
+        try out.writer.print("; rescue {s}\n", .{step.rescue});
+    }
 }

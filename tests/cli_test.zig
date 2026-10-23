@@ -202,7 +202,7 @@ test "cli: edit confirmations and status share terminal conventions" {
     defer restarted.deinit();
     const aborted = try stakrr(&repo, &.{ "edit", "--abort" });
     defer aborted.deinit();
-    try testing.expectEqualStrings("edit aborted; returned to work\nretained edits: git for-each-ref refs/stakrr/recovery/\n", aborted.stdout);
+    try testing.expectEqualStrings("edit aborted; returned to work\nretained edits: stakrr log (refs/stakrr/oplog)\n", aborted.stdout);
 }
 
 test "cli: conflict status shows detached replay and a resolution hint" {

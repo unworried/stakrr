@@ -53,11 +53,21 @@ pub fn noSession(repo: *const Repo) !void {
 }
 
 pub fn expectRecoverable(repo: *const Repo, oid: []const u8) !void {
-    const refs = try repo.git.output(
-        &.{ "for-each-ref", "--format=%(objectname)", layout.recovery_prefix },
-    );
-    defer testing.allocator.free(refs);
-    try testing.expect(std.mem.indexOf(u8, refs, oid) != null);
+    const objects = try repo.git.output(&.{ "rev-list", "--objects", "--all" });
+    defer testing.allocator.free(objects);
+    try testing.expect(std.mem.indexOf(u8, objects, oid) != null);
+}
+
+/// Both v1 blobs and v2 commits can be used to test the checkpoint codec.
+pub fn checkpointJson(repo: *const Repo, oid: []const u8) ![]u8 {
+    const kind = try repo.git.output(&.{ "cat-file", "-t", oid });
+    defer testing.allocator.free(kind);
+    const path = if (std.mem.eql(u8, kind, "commit"))
+        try std.fmt.allocPrint(testing.allocator, "{s}:session.json", .{oid})
+    else
+        try testing.allocator.dupe(u8, oid);
+    defer testing.allocator.free(path);
+    return repo.git.outputRaw(&.{ "cat-file", "blob", path });
 }
 
 /// a linked worktree at .git/<path> on `branch`; the caller closes its cwd

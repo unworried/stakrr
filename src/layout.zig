@@ -12,10 +12,13 @@ pub const tip_ref = "refs/stakrr/tip";
 /// the stack's starting commit; also keeps it reachable for gc
 pub const anchor_ref = "refs/stakrr/anchor";
 
-/// blob journal of the active edit session
+/// commit journal of the active edit session
 pub const session_ref = "refs/stakrr/edit";
 
-/// commits retained by edit checkpoints: <prefix><session id>/<oid>
+/// completed edit histories, linked through checkpoint parents
+pub const oplog_ref = "refs/stakrr/oplog";
+
+/// legacy objects retained by v1 edit checkpoints: <prefix><session id>/<oid>
 pub const recovery_prefix = "refs/stakrr/recovery/";
 
 /// git config key holding "<version> <base_ref> <work_ref>"

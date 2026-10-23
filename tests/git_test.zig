@@ -375,3 +375,31 @@ test "history reports merges as non-linear" {
     defer merged.deinit(testing.allocator);
     try testing.expect(!merged.linear);
 }
+
+test "writeTree and commitTree preserve object format parent order and the index" {
+    for ([_][]const u8{ "sha1", "sha256" }) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+        const first = try repo.commit("first");
+        defer testing.allocator.free(first);
+        const second = try repo.commit("second");
+        defer testing.allocator.free(second);
+        const blob = try repo.git.writeBlob("journal\n");
+        defer testing.allocator.free(blob);
+        const before_index = try repo.git.output(&.{ "ls-files", "--stage" });
+        defer testing.allocator.free(before_index);
+        const tree = try repo.git.writeTree(&.{ .{ .name = "session.json", .oid = blob }, .{ .name = "plan", .oid = blob } });
+        defer testing.allocator.free(tree);
+        const checkpoint = try repo.git.commitTree(tree, &.{ first, second, first }, "readable checkpoint label");
+        defer testing.allocator.free(checkpoint);
+        const parents = try std.fmt.allocPrint(testing.allocator, "{s} {s}", .{ first, second });
+        defer testing.allocator.free(parents);
+        try repo.expectOutput(&.{ "show", "--no-patch", "--format=%P", checkpoint }, parents);
+        try repo.expectOutput(&.{ "show", "--no-patch", "--format=%s", checkpoint }, "readable checkpoint label");
+        const path = try std.fmt.allocPrint(testing.allocator, "{s}:session.json", .{checkpoint});
+        defer testing.allocator.free(path);
+        try repo.expectOutput(&.{ "show", path }, "journal");
+        try repo.expectOutput(&.{ "ls-files", "--stage" }, before_index);
+        try repo.expectRef("HEAD", second);
+    }
+}

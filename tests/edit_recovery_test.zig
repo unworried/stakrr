@@ -19,7 +19,15 @@ const linked = fixture.linked;
 fn replaceCheckpoint(repo: *const Repo, value: std.json.Value) ![]u8 {
     const raw = try std.json.Stringify.valueAlloc(testing.allocator, value, .{});
     defer testing.allocator.free(raw);
-    const oid = try repo.git.writeBlob(raw);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const git = repo.git.withAllocator(arena.allocator());
+    var entries: std.ArrayList(stakrr.git.Git.TreeEntry) = .empty;
+    try entries.append(git.allocator, .{ .name = "session.json", .oid = try git.writeBlob(raw) });
+    if (value.object.get("plan_oid")) |plan| {
+        if (plan == .string) try entries.append(git.allocator, .{ .name = "plan", .oid = plan.string });
+    }
+    const oid = try repo.git.commitTree(try git.writeTree(entries.items), &.{}, "test checkpoint");
     errdefer testing.allocator.free(oid);
     try repo.exec(&.{ "update-ref", layout.session_ref, oid });
     return oid;
@@ -218,16 +226,13 @@ test "continue and abort reject an inconsistent replay plan before changing Git 
 
     const checkpoint = (try repo.git.readRef(layout.session_ref)).?;
     defer testing.allocator.free(checkpoint);
-    const raw = try repo.git.output(&.{ "cat-file", "blob", checkpoint });
+    const raw = try fixture.checkpointJson(&repo, checkpoint);
     defer testing.allocator.free(raw);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, raw, .{});
     defer parsed.deinit();
     parsed.value.object.getPtr("plan_len").?.integer += 1;
-    const invalid = try std.json.Stringify.valueAlloc(testing.allocator, parsed.value, .{});
-    defer testing.allocator.free(invalid);
-    const invalid_oid = try repo.git.writeBlob(invalid);
+    const invalid_oid = try replaceCheckpoint(&repo, parsed.value);
     defer testing.allocator.free(invalid_oid);
-    try repo.exec(&.{ "update-ref", layout.session_ref, invalid_oid });
 
     const head = try repo.git.resolveCommit("HEAD");
     defer testing.allocator.free(head);
@@ -250,7 +255,7 @@ test "every checkpoint phase rejects inconsistent state before changing Git" {
     try pausedBeforeDetach(&repo);
     const checkpoint = (try repo.git.readRef(layout.session_ref)).?;
     defer testing.allocator.free(checkpoint);
-    const raw = try repo.git.outputRaw(&.{ "cat-file", "blob", checkpoint });
+    const raw = try fixture.checkpointJson(&repo, checkpoint);
     defer testing.allocator.free(raw);
     const phases = [_][]const u8{
         "switching",
@@ -305,7 +310,7 @@ test "invalid replay plans are rejected before detach and before a clean abort" 
     try pausedBeforeDetach(&repo);
     const checkpoint = (try repo.git.readRef(layout.session_ref)).?;
     defer testing.allocator.free(checkpoint);
-    const raw = try repo.git.outputRaw(&.{ "cat-file", "blob", checkpoint });
+    const raw = try fixture.checkpointJson(&repo, checkpoint);
     defer testing.allocator.free(raw);
     for ([_]bool{ false, true }) |reverse| {
         var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, raw, .{});
@@ -346,7 +351,7 @@ test "replay plans cannot omit a commit between cut boundaries" {
     try pausedBeforeDetach(&repo);
     const checkpoint = (try repo.git.readRef(layout.session_ref)).?;
     defer testing.allocator.free(checkpoint);
-    const raw = try repo.git.outputRaw(&.{ "cat-file", "blob", checkpoint });
+    const raw = try fixture.checkpointJson(&repo, checkpoint);
     defer testing.allocator.free(raw);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, raw, .{});
     defer parsed.deinit();
@@ -421,7 +426,7 @@ test "legacy v1 switching checkpoints may retain a completed replay plan" {
     var repo = try Repo.init();
     defer repo.deinit();
     try pausedBeforeDetach(&repo);
-    const before = try repo.git.outputRaw(&.{ "cat-file", "blob", layout.session_ref });
+    const before = try fixture.checkpointJson(&repo, layout.session_ref);
     defer testing.allocator.free(before);
     var original = try std.json.parseFromSlice(std.json.Value, testing.allocator, before, .{});
     defer original.deinit();
@@ -430,7 +435,7 @@ test "legacy v1 switching checkpoints may retain a completed replay plan" {
     defer stopped.deinit();
     try testing.expect(stopped.code != 0);
     _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
-    const raw = try repo.git.outputRaw(&.{ "cat-file", "blob", layout.session_ref });
+    const raw = try fixture.checkpointJson(&repo, layout.session_ref);
     defer testing.allocator.free(raw);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, raw, .{});
     defer parsed.deinit();
@@ -443,14 +448,18 @@ test "legacy v1 switching checkpoints may retain a completed replay plan" {
     const head = try repo.git.resolveCommit("HEAD");
     defer testing.allocator.free(head);
     parsed.value.object.getPtr("before").?.* = .{ .string = head };
-    const legacy = try replaceCheckpoint(&repo, parsed.value);
+    parsed.value.object.getPtr("version").?.* = .{ .integer = 1 };
+    const legacy_raw = try std.json.Stringify.valueAlloc(testing.allocator, parsed.value, .{});
+    defer testing.allocator.free(legacy_raw);
+    const legacy = try repo.git.writeBlob(legacy_raw);
+    try repo.exec(&.{ "update-ref", layout.session_ref, legacy });
     defer testing.allocator.free(legacy);
     try edit.run(&repo.git, .continue_edit);
     try valid(&repo);
     try noSession(&repo);
 }
 
-test "a non-blob edit checkpoint reports invalid session without changing refs" {
+test "an unrelated commit checkpoint reports invalid session without changing refs" {
     var repo = try Repo.init();
     defer repo.deinit();
     try setup(&repo);

@@ -93,8 +93,10 @@ No implicit commits or stashes are made. Checkouts refuse to overwrite ignored
 files. Before replaying descendants, preserve and remove **all ignored files**,
 including unrelated build output: Git's rename handling can write paths absent
 from the incoming commit's diff. Unchanged cuts can still be navigated with
-unrelated ignored files present. During a session, `init`, `cut`, `reset`, `up`
-and `down` are blocked in every worktree. Use `edit <cut>` to move between cuts instead.
+unrelated ignored files present. During a session, `init`, `cut` and `reset`
+are blocked in every worktree.
+`up` and `down` replay changes and move to the adjacent cut; `up` from the
+top cut finishes the session. `down` stops at the bottom cut.
 
 On a conflict, the pending destination and session remain saved:
 
@@ -114,17 +116,31 @@ ordinary commits you create while editing keep your normal Git configuration.
 `stakrr edit --abort` restores the stack from before the **entire** session,
 including changes incorporated during earlier jumps. It requires clean work:
 commit or otherwise preserve conflict resolutions and other uncommitted changes
-first. It never runs `reset --hard` or discards files. Original boundaries and
-observed edit/replay commits remain pinned under `refs/stakrr/recovery/`, even
-after abort or successful completion. Abort prints a reminder to inspect them:
+first. It never runs `reset --hard` or discards files. `stakrr edit --undo`
+returns to the previous editing checkpoint, reversing the last jump and its
+branch changes while keeping the session open. Repeating it walks back through
+earlier jumps. Both commands retain the work they reverse in the operation log.
+
+After finishing an edit, `stakrr undo` restores the branch positions from before
+the session. It refuses if a managed branch or guard has moved since the edit,
+if work is uncommitted, or if an affected branch is checked out in another
+worktree. An undo is recorded as an operation too: run `stakrr undo` again to
+undo that undo. Interrupted restorations resume with `stakrr edit --continue`.
+
+`stakrr log` lists checkpoints newest first, including an active session. Each
+line gives an ISO 8601 timestamp, a readable step label, the before → after OIDs
+of moved branches, and a rescue commit:
 
 ```sh
-git for-each-ref --format='%(refname) %(objecttype)' refs/stakrr/recovery/
-git branch rescue <recovery-ref-that-points-to-a-commit>
+stakrr log
+git branch rescue <commit-from-the-rescue-column>
 ```
 
-Recovery refs also retain replay-plan blobs; only commit refs can become rescue
-branches. Retention is intentional and has no automatic expiry. Direct Git
+Completed sessions remain reachable from `refs/stakrr/oplog`. Checkpoints keep
+original boundaries and observed edit/replay commits reachable even after
+`git gc --prune=now`. No new `refs/stakrr/recovery/*` refs are written; existing
+v1 recovery refs remain available through `git for-each-ref refs/stakrr/recovery/`.
+Retention is intentional and has no automatic expiry. Direct Git
 commands in other processes do not take stakrr's lock; avoid concurrent manual
 branch updates or worktree changes during an edit. Detected external changes
 stop the operation and name the ref or HEAD that moved, with the commands to
@@ -139,8 +155,9 @@ hint: restore it: git update-ref refs/heads/stakrr/api 1a2b3c4... 9f8e7d6...
 
 To keep the changed state instead, `stakrr edit --quit` drops the session like
 `git rebase --quit`: HEAD, the index, files and branches stay as they are, and
-HEAD plus the checkpoint are pinned under `refs/stakrr/recovery/`. It also
-leaves a corrupt checkpoint. Afterwards `stakrr status` may need `stakrr reset`.
+HEAD plus the checkpoint are retained in `refs/stakrr/oplog` (inspect them with
+`stakrr log`). It also works when the checkpoint is corrupt. Afterwards
+`stakrr status` may need `stakrr reset`.
 
 ## // model
 
@@ -175,9 +192,11 @@ leaves a corrupt checkpoint. Afterwards `stakrr status` may need `stakrr reset`.
 | ● | `stakrr edit [<cut>]` | edit a cut, replay descendants, or finish and return to origin |
 | ● | `stakrr edit --continue` | resume a pending replay or checkout |
 | ● | `stakrr edit --abort` | restore the entire pre-session stack and return to origin |
+| ● | `stakrr edit --undo` | reverse the last jump and return to its editing checkpoint |
+| ● | `stakrr log` | list edit checkpoints, branch moves and rescue commits |
 | ● | `stakrr edit --quit` | drop the session, leaving HEAD and every branch as they are |
 | ○ | `stakrr submit` | publish review branches, excluding rolling work |
-| ○ | `stakrr undo` | restore the previous stakrr operation |
+| ● | `stakrr undo` | reverse the last finished edit, including an undo |
 
 <sub>● shipped · ○ planned for m2</sub>
 
@@ -189,15 +208,31 @@ leaves a corrupt checkpoint. Afterwards `stakrr status` may need `stakrr reset`.
 | `refs/stakrr/anchor` | the base commit at `init`, which also keeps it reachable for gc |
 | `refs/stakrr/tip` | concurrency guard at the highest layer, compare-and-swapped in the same ref transaction as each new layer |
 | `refs/heads/stakrr/*` | layer branches |
-| `refs/stakrr/edit` | versioned session checkpoint blob, shared by all worktrees and bound to one owner |
-| `refs/stakrr/recovery/<session>/<oid>` | retained original boundaries, edit/replay commits and immutable replay plans |
+| `refs/stakrr/edit` | v2 checkpoint commit for the active session, shared by all worktrees and bound to one owner |
+| `refs/stakrr/oplog` | latest completed checkpoint, retaining previous sessions and undo operations |
+| `refs/stakrr/recovery/<session>/<oid>` | legacy v1 recovery objects; still readable, no longer created |
 | `<git-common-dir>/stakrr.lock` | advisory lock held for each stakrr mutation; released automatically on process exit |
+
+Each v2 checkpoint tree contains `session.json`, an immutable replay `plan`
+when needed, and the previous checkpoint and rescue metadata. Its first parent
+is the previous checkpoint; additional parents retain original and rewritten
+commits, as in `git stash`. The session ref advances in the same compare-and-swap
+transaction as branch publication. Finishing, aborting or quitting updates the
+oplog and deletes the active ref in one transaction. In-progress v1 blob
+checkpoints remain readable and migrate on their next checkpoint.
 
 don't edit the internal refs by hand. an aborted cut leaves every ref
 unchanged. stakrr runs the `git` on your `PATH` and inherits the environment
 (`GIT_DIR` and friends).
 
 ## // recovery
+
+During an edit, inspect `stakrr status` and use `stakrr edit --continue` after a
+crash. Use `stakrr edit --undo` to reverse a jump, `--abort` to restore the whole
+session, or `--quit` to keep the current Git state and leave the session. Preserve
+uncommitted work first. `stakrr log` shows retained commits both during and after
+a session; create a rescue branch from the listed commit before experimenting.
+Older recovery refs remain visible with `git for-each-ref refs/stakrr/recovery/`.
 
 Outside a managed edit, `status` and `cut` refuse to run when the stack no longer matches the rolling
 branch: after rebasing work past the base, deleting a layer branch, or upgrading
@@ -217,7 +252,7 @@ worktree.
 
 ```
 m1  safe rolling stacks      ■■■□  init · cut · status · reset, no history rewrites
-m2  publishing + recovery    □□□□  submit via gh stack · operation journal · undo
+m2  publishing + recovery    ■■■□  operation journal · log · undo · submit via gh stack (planned)
 m3  patch-level extraction   □□□□  move hunks into a lower layer · replay descendants
 ```
 

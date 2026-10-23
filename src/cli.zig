@@ -9,6 +9,8 @@ pub const Command = union(enum) {
     version,
     init: struct { base: []const u8 },
     status,
+    log,
+    undo,
     cut: struct { name: []const u8, at: ?[]const u8 = null },
     reset: stack.ResetOptions,
     navigate: stack.Direction,
@@ -37,6 +39,16 @@ pub fn parseArgs(args: []const []const u8) ParseError!Command {
         if (rest.len == 1 and std.mem.startsWith(u8, rest[0], "--base="))
             return .{ .init = .{ .base = try value(rest[0]["--base=".len..]) } };
         return error.InvalidArguments;
+    }
+
+    if (eql(command, "undo")) {
+        if (rest.len != 0) return error.InvalidArguments;
+        return .undo;
+    }
+
+    if (eql(command, "log")) {
+        if (rest.len != 0) return error.InvalidArguments;
+        return .log;
     }
 
     if (eql(command, "status")) {
@@ -74,6 +86,7 @@ pub fn parseArgs(args: []const []const u8) ParseError!Command {
         if (rest.len != 1) return error.InvalidArguments;
         if (eql(rest[0], "--continue")) return .{ .edit = .continue_edit };
         if (eql(rest[0], "--abort")) return .{ .edit = .abort };
+        if (eql(rest[0], "--undo")) return .{ .edit = .undo };
         if (eql(rest[0], "--quit")) return .{ .edit = .quit };
         return .{ .edit = .{ .jump = try value(rest[0]) } };
     }
@@ -185,4 +198,15 @@ test "parseArgs: edit transitions are mutually exclusive" {
         parseArgs(&.{ "stakrr", "edit", "models", "--abort" }),
     );
     try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "edit", "--unknown" }));
+}
+
+test "parseArgs: log and undo reject extra arguments" {
+    try testing.expectEqual(Command.log, try parseArgs(&.{ "stakrr", "log" }));
+    try testing.expectEqual(Command.undo, try parseArgs(&.{ "stakrr", "undo" }));
+    try testing.expectEqual(edit.Request.undo, (try parseArgs(&.{ "stakrr", "edit", "--undo" })).edit);
+    for ([_][]const []const u8{
+        &.{ "stakrr", "log", "extra" },
+        &.{ "stakrr", "undo", "extra" },
+        &.{ "stakrr", "edit", "--undo", "--abort" },
+    }) |args| try testing.expectError(error.InvalidArguments, parseArgs(args));
 }
