@@ -227,7 +227,7 @@ test "state changes name the drifted ref or HEAD and how to restore it" {
     defer testing.allocator.free(base);
 
     try repo.exec(&.{ "branch", "-f", "stakrr/api", "main" });
-    const moved = try cli.run(&repo, &.{"edit"});
+    const moved = try cli.run(&repo, &.{"restack"});
     defer moved.deinit();
     try testing.expectEqual(@as(?u8, 1), moved.code);
     const keep = try std.fmt.allocPrint(testing.allocator, "git branch rescue/stakrr/api {s}", .{base});

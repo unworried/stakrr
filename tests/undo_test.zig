@@ -36,7 +36,7 @@ test "edit undo restores the previous editing checkpoint and can walk back furth
     try repo.write("api", "corrected api\n");
     try repo.commitAll("correct api");
     try edit.run(&repo.git, .{ .jump = "models" });
-    try cli.expectSuccess(&repo, &.{ "edit", "--undo" });
+    try cli.expectSuccess(&repo, &.{"undo"});
     try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/api");
     const restored = try positions(&repo);
     defer testing.allocator.free(restored);
@@ -143,7 +143,7 @@ test "v2 journal retains checkpoints plans and edited commits through immediate 
     defer testing.allocator.free(correction);
     try cli.installFaultShim(&repo);
     try repo.env.put("STAKRR_TEST_FAULT", "after:1");
-    const killed = try cli.run(&repo, &.{"edit"});
+    const killed = try cli.run(&repo, &.{"restack"});
     defer killed.deinit();
     try testing.expect(killed.code != 0);
     _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
@@ -155,7 +155,7 @@ test "v2 journal retains checkpoints plans and edited commits through immediate 
     try repo.exec(&.{ "reflog", "expire", "--expire=now", "--all" });
     try repo.exec(&.{ "gc", "--prune=now" });
     try repo.expectOutput(&.{ "cat-file", "-t", plan }, "blob");
-    try cli.expectSuccess(&repo, &.{ "edit", "--continue" });
+    try cli.expectSuccess(&repo, &.{"continue"});
     try edit.undo(&repo.git);
     try repo.exec(&.{ "reflog", "expire", "--expire=now", "--all" });
     try repo.exec(&.{ "gc", "--prune=now" });
@@ -216,7 +216,7 @@ test "undo restoration resumes around every boundary transaction" {
         if (std.mem.eql(u8, fault, "before:1")) {
             try cli.expectSuccess(&repo, &.{"undo"});
         } else if (!std.mem.eql(u8, fault, "after:archive")) {
-            try cli.expectSuccess(&repo, &.{ "edit", "--continue" });
+            try cli.expectSuccess(&repo, &.{"continue"});
         }
         const restored = try positions(&repo);
         defer testing.allocator.free(restored);
@@ -241,14 +241,14 @@ test "local undo resumes after either side of each restoration checkpoint" {
         try edit.run(&repo.git, .{ .jump = "api" });
         try cli.installFaultShim(&repo);
         try repo.env.put("STAKRR_TEST_FAULT", fault);
-        const killed = try cli.run(&repo, &.{ "edit", "--undo" });
+        const killed = try cli.run(&repo, &.{"undo"});
         defer killed.deinit();
         try testing.expect(killed.code != 0);
         _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
         if (std.mem.eql(u8, fault, "before:1")) {
-            try cli.expectSuccess(&repo, &.{ "edit", "--undo" });
+            try cli.expectSuccess(&repo, &.{"undo"});
         } else if (!std.mem.eql(u8, fault, "after:3")) {
-            try cli.expectSuccess(&repo, &.{ "edit", "--continue" });
+            try cli.expectSuccess(&repo, &.{"continue"});
         }
         const restored = try positions(&repo);
         defer testing.allocator.free(restored);
@@ -259,7 +259,7 @@ test "local undo resumes after either side of each restoration checkpoint" {
 }
 
 test "finish abort and quit atomically archive their final checkpoints" {
-    for ([_][]const u8{ "finish", "--abort", "--quit" }) |command| {
+    for ([_][]const u8{ "restack", "abort", "quit" }) |command| {
         for ([_][]const u8{ "before:archive", "after:archive" }) |fault| {
             var repo = try Repo.init();
             defer repo.deinit();
@@ -269,14 +269,14 @@ test "finish abort and quit atomically archive their final checkpoints" {
             try repo.commitAll("correction");
             try cli.installFaultShim(&repo);
             try repo.env.put("STAKRR_TEST_FAULT", fault);
-            const args: []const []const u8 = if (std.mem.eql(u8, command, "finish")) &.{"edit"} else &.{ "edit", command };
+            const args: []const []const u8 = &.{command};
             const killed = try cli.run(&repo, args);
             defer killed.deinit();
             try testing.expect(killed.code != 0);
             _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
             if (std.mem.eql(u8, fault, "before:archive")) {
                 try repo.expectNoRef(layout.oplog_ref);
-                const retry: []const []const u8 = if (std.mem.eql(u8, command, "finish")) &.{ "edit", "--continue" } else args;
+                const retry: []const []const u8 = if (std.mem.eql(u8, command, "restack")) &.{"continue"} else args;
                 try cli.expectSuccess(&repo, retry);
             }
             try fixture.noSession(&repo);

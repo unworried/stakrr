@@ -81,14 +81,21 @@ pub fn parseArgs(args: []const []const u8) ParseError!Command {
         } };
     }
 
-    if (eql(command, "edit")) {
-        if (rest.len == 0) return .{ .edit = .{ .jump = null } };
+    if (eql(command, "go")) {
         if (rest.len != 1) return error.InvalidArguments;
-        if (eql(rest[0], "--continue")) return .{ .edit = .continue_edit };
-        if (eql(rest[0], "--abort")) return .{ .edit = .abort };
-        if (eql(rest[0], "--undo")) return .{ .edit = .undo };
-        if (eql(rest[0], "--quit")) return .{ .edit = .quit };
         return .{ .edit = .{ .jump = try value(rest[0]) } };
+    }
+
+    inline for (.{
+        .{ "restack", edit.Request{ .jump = null } },
+        .{ "continue", edit.Request.continue_edit },
+        .{ "abort", edit.Request.abort },
+        .{ "quit", edit.Request.quit },
+    }) |entry| {
+        if (eql(command, entry[0])) {
+            if (rest.len != 0) return error.InvalidArguments;
+            return .{ .edit = entry[1] };
+        }
     }
 
     if (eql(command, "reset")) {
@@ -175,38 +182,37 @@ test "parseArgs: up and down" {
     try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "up", "2" }));
 }
 
-test "parseArgs: edit transitions are mutually exclusive" {
-    try testing.expect((try parseArgs(&.{ "stakrr", "edit" })).edit.jump == null);
+test "parseArgs: go and session verbs" {
+    try testing.expect((try parseArgs(&.{ "stakrr", "restack" })).edit.jump == null);
     try testing.expectEqualStrings(
         "models",
-        (try parseArgs(&.{ "stakrr", "edit", "models" })).edit.jump.?,
+        (try parseArgs(&.{ "stakrr", "go", "models" })).edit.jump.?,
     );
     try testing.expectEqual(
         edit.Request.continue_edit,
-        (try parseArgs(&.{ "stakrr", "edit", "--continue" })).edit,
+        (try parseArgs(&.{ "stakrr", "continue" })).edit,
     );
-    try testing.expectEqual(
-        edit.Request.abort,
-        (try parseArgs(&.{ "stakrr", "edit", "--abort" })).edit,
-    );
-    try testing.expectEqual(
-        edit.Request.quit,
-        (try parseArgs(&.{ "stakrr", "edit", "--quit" })).edit,
-    );
-    try testing.expectError(
-        error.InvalidArguments,
-        parseArgs(&.{ "stakrr", "edit", "models", "--abort" }),
-    );
-    try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "edit", "--unknown" }));
+    try testing.expectEqual(edit.Request.abort, (try parseArgs(&.{ "stakrr", "abort" })).edit);
+    try testing.expectEqual(edit.Request.quit, (try parseArgs(&.{ "stakrr", "quit" })).edit);
+    for ([_][]const []const u8{
+        &.{ "stakrr", "go" },
+        &.{ "stakrr", "go", "models", "api" },
+        &.{ "stakrr", "go", "--abort" },
+        &.{ "stakrr", "abort", "now" },
+        &.{ "stakrr", "restack", "models" },
+    }) |args| try testing.expectError(error.InvalidArguments, parseArgs(args));
+}
+
+test "parseArgs: the old edit command is gone" {
+    try testing.expectError(error.UnknownCommand, parseArgs(&.{ "stakrr", "edit" }));
+    try testing.expectError(error.UnknownCommand, parseArgs(&.{ "stakrr", "edit", "--abort" }));
 }
 
 test "parseArgs: log and undo reject extra arguments" {
     try testing.expectEqual(Command.log, try parseArgs(&.{ "stakrr", "log" }));
     try testing.expectEqual(Command.undo, try parseArgs(&.{ "stakrr", "undo" }));
-    try testing.expectEqual(edit.Request.undo, (try parseArgs(&.{ "stakrr", "edit", "--undo" })).edit);
     for ([_][]const []const u8{
         &.{ "stakrr", "log", "extra" },
         &.{ "stakrr", "undo", "extra" },
-        &.{ "stakrr", "edit", "--undo", "--abort" },
     }) |args| try testing.expectError(error.InvalidArguments, parseArgs(args));
 }

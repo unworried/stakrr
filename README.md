@@ -72,13 +72,13 @@ Use ordinary Git commits or amendments on a cut. Descendants replay when you
 jump to another cut or finish the session:
 
 ```sh
-stakrr edit models
+stakrr go models
 # edit files...
 git add model.zig
 git commit -m "fix validation"    # git commit --amend also works
-stakrr edit api                  # replay, then switch to stakrr/api
+stakrr go api                    # replay, then switch to stakrr/api
 # edit and commit more if needed...
-stakrr edit                      # replay and return to the original branch
+stakrr restack                   # replay and return to the original branch
 ```
 
 An unchanged cut only needs a checkout. A changed cut replays each descendant
@@ -104,20 +104,20 @@ On a conflict, the pending destination and session remain saved:
 stakrr status
 # resolve conflicts, using git rm for a deletion if appropriate...
 git add <resolved-files>
-stakrr edit --continue
+stakrr continue
 ```
 
-`--continue` works after restarting stakrr. A manually committed resolution also
+`stakrr continue` works after restarting stakrr. A manually committed resolution also
 works. Replay temporarily uses detached HEAD; do not switch branches during it.
 The rewritten boundaries, rolling branch and internal tip are published together
 only after replay completes. Automated replay commits bypass hooks and signing;
 ordinary commits you create while editing keep your normal Git configuration.
 
-`stakrr edit --abort` restores the stack from before the **entire** session,
+`stakrr abort` restores the stack from before the **entire** session,
 including changes incorporated during earlier jumps. It requires clean work:
 commit or otherwise preserve conflict resolutions and other uncommitted changes
-first. It never runs `reset --hard` or discards files. `stakrr edit --undo`
-returns to the previous editing checkpoint, reversing the last jump and its
+first. It never runs `reset --hard` or discards files. `stakrr undo`
+(inside a session) returns to the previous editing checkpoint, reversing the last jump and its
 branch changes while keeping the session open. Repeating it walks back through
 earlier jumps. Both commands retain the work they reverse in the operation log.
 
@@ -125,7 +125,7 @@ After finishing an edit, `stakrr undo` restores the branch positions from before
 the session. It refuses if a managed branch or guard has moved since the edit,
 if work is uncommitted, or if an affected branch is checked out in another
 worktree. An undo is recorded as an operation too: run `stakrr undo` again to
-undo that undo. Interrupted restorations resume with `stakrr edit --continue`.
+undo that undo. Interrupted restorations resume with `stakrr continue`.
 
 `stakrr log` lists checkpoints newest first, including an active session. Each
 line gives an ISO 8601 timestamp, a readable step label, the before → after OIDs
@@ -153,7 +153,7 @@ hint: keep it:    git branch rescue/stakrr/api 9f8e7d6...
 hint: restore it: git update-ref refs/heads/stakrr/api 1a2b3c4... 9f8e7d6...
 ```
 
-To keep the changed state instead, `stakrr edit --quit` drops the session like
+To keep the changed state instead, `stakrr quit` drops the session like
 `git rebase --quit`: HEAD, the index, files and branches stay as they are, and
 HEAD plus the checkpoint are retained in `refs/stakrr/oplog` (inspect them with
 `stakrr log`). It also works when the checkpoint is corrupt. Afterwards
@@ -189,14 +189,14 @@ HEAD plus the checkpoint are retained in `refs/stakrr/oplog` (inspect them with
 | ● | `stakrr status` | draw the stack: layers, commit counts, unstacked work |
 | ● | `stakrr reset [--delete-layers]` | forget the stack so it can be re-initialised |
 | ● | `stakrr version` | print the version |
-| ● | `stakrr edit [<cut>]` | edit a cut, replay descendants, or finish and return to origin |
-| ● | `stakrr edit --continue` | resume a pending replay or checkout |
-| ● | `stakrr edit --abort` | restore the entire pre-session stack and return to origin |
-| ● | `stakrr edit --undo` | reverse the last jump and return to its editing checkpoint |
+| ● | `stakrr go <cut>` | edit a cut, replaying descendants when you move |
+| ● | `stakrr restack` | replay descendants and return to the original branch |
+| ● | `stakrr continue` | resume a pending replay or checkout |
+| ● | `stakrr abort` | restore the entire pre-session stack and return to origin |
 | ● | `stakrr log` | list edit checkpoints, branch moves and rescue commits |
-| ● | `stakrr edit --quit` | drop the session, leaving HEAD and every branch as they are |
+| ● | `stakrr quit` | drop the session, leaving HEAD and every branch as they are |
 | ○ | `stakrr submit` | publish review branches, excluding rolling work |
-| ● | `stakrr undo` | reverse the last finished edit, including an undo |
+| ● | `stakrr undo` | reverse the last jump in a session, or the last finished edit (including an undo) |
 
 <sub>● shipped · ○ planned for m2</sub>
 
@@ -227,9 +227,9 @@ unchanged. stakrr runs the `git` on your `PATH` and inherits the environment
 
 ## // recovery
 
-During an edit, inspect `stakrr status` and use `stakrr edit --continue` after a
-crash. Use `stakrr edit --undo` to reverse a jump, `--abort` to restore the whole
-session, or `--quit` to keep the current Git state and leave the session. Preserve
+During an edit, inspect `stakrr status` and use `stakrr continue` after a
+crash. Use `stakrr undo` to reverse a jump, `abort` to restore the whole
+session, or `quit` to keep the current Git state and leave the session. Preserve
 uncommitted work first. `stakrr log` shows retained commits both during and after
 a session; create a rescue branch from the listed commit before experimenting.
 Older recovery refs remain visible with `git for-each-ref refs/stakrr/recovery/`.

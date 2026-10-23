@@ -77,6 +77,13 @@ fn runCommand(
             try render.printStatus(out, snapshot, current);
         },
         .undo => {
+            // one verb: an open session undoes its last jump, otherwise the last finished edit
+            const in_session = blk: {
+                var view = try edit.readStatus(git) orelse break :blk false;
+                view.deinit();
+                break :blk true;
+            };
+            if (in_session) return runCommand(git, out, .{ .edit = .undo });
             try edit.undo(git);
             try stdout.writeAll("edit undone; use 'stakrr undo' to undo this undo\n");
         },
@@ -187,7 +194,7 @@ fn userError(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MutationInProgress => "another stakrr mutation is running",
         error.EditInProgress => "an edit session is active " ++
-            "(finish with 'stakrr edit' or 'stakrr edit --abort')",
+            "(finish with 'stakrr restack' or 'stakrr abort')",
         error.BranchOccupied => "a required branch is checked out in another worktree",
         error.DirtyWorkTree => "preserve uncommitted changes before proceeding",
         error.IgnoredFilesPresent => "preserve and remove ignored files before replaying descendants",
@@ -196,14 +203,14 @@ fn userError(err: anyerror) ?[]const u8 {
         error.UnknownCut => "cut not found (use its short name)",
         error.WrongEditWorktree => "this edit session belongs to another worktree",
         error.InvalidEditSession => "invalid edit checkpoint; " ++
-            "leave it with 'stakrr edit --quit', which retains it in the operation log",
+            "leave it with 'stakrr quit', which retains it in the operation log",
         error.EditStateChanged => "Git refs or HEAD changed outside the edit workflow; " ++
-            "restore them, or keep them and leave with 'stakrr edit --quit'",
-        error.ReplayConflict => "replay conflict: resolve files, git add them, then run 'stakrr edit --continue'; " ++
-            "preserve uncommitted work before '--abort'",
+            "restore them, or keep them and leave with 'stakrr quit'",
+        error.ReplayConflict => "replay conflict: resolve files, git add them, then run 'stakrr continue'; " ++
+            "preserve uncommitted work before 'stakrr abort'",
         error.NoUndo => "no edit step is available to undo",
-        error.NoPendingEdit => "no transition is pending (use 'stakrr edit [<cut>]' to leave the active cut)",
-        error.EditNeedsContinue => "use 'stakrr edit --continue' to complete the pending transition",
+        error.NoPendingEdit => "no transition is pending (use 'stakrr restack' to leave the active cut)",
+        error.EditNeedsContinue => "use 'stakrr continue' to complete the pending transition",
         error.InvalidEditedHistory => "edited cut must contain linear commits above its previous boundary",
         error.InvalidArguments => "invalid arguments (run 'stakrr help')",
         error.UnknownCommand => "unknown command (run 'stakrr help')",

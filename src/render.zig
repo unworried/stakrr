@@ -16,14 +16,14 @@ pub fn plural(n: usize, one: []const u8, many: []const u8) []const u8 {
 const help_commands = [_]struct { name: []const u8, args: []const u8, about: []const u8 }{
     .{ .name = "init", .args = "--base <branch>", .about = "adopt current branch as rolling work" },
     .{ .name = "status", .args = "", .about = "display layers and unstacked commits" },
-    .{ .name = "undo", .args = "", .about = "reverse the last completed edit" },
+    .{ .name = "undo", .args = "", .about = "reverse the last jump or finished edit" },
     .{ .name = "log", .args = "", .about = "show edit history and rescue commits" },
     .{ .name = "cut", .args = "<name> [--at <rev>]", .about = "create the next layer" },
-    .{
-        .name = "edit",
-        .args = "[<cut>|--continue|--abort|--quit|--undo]",
-        .about = "edit a cut and replay descendants",
-    },
+    .{ .name = "go", .args = "<cut>", .about = "edit a cut, replaying descendants as you move" },
+    .{ .name = "restack", .args = "", .about = "replay descendants and return to the original branch" },
+    .{ .name = "continue", .args = "", .about = "resume a pending replay or checkout" },
+    .{ .name = "abort", .args = "", .about = "restore the pre-edit stack" },
+    .{ .name = "quit", .args = "", .about = "drop the edit session, keeping HEAD and branches" },
     .{
         .name = "reset",
         .args = "[--delete-layers]",
@@ -136,13 +136,13 @@ pub fn printEditStatus(out: Terminal, status: edit.Status, current: ?[]const u8)
     try printFooter(out, status.base, current, width, status.branches.len - 1);
     // every command that can move this phase forward, back, or out
     switch (status.phase) {
-        .editing => try w.writeAll("\n  commit fixes, then stakrr edit <cut> to move or stakrr edit to finish\n" ++
-            "  stakrr edit --abort restores the pre-edit stack\n"),
-        .conflict => try w.writeAll("\n  resolve conflicts, git add, then stakrr edit --continue\n" ++
-            "  to give up, commit the resolution, then stakrr edit --abort\n"),
-        else => try w.writeAll("\n  stakrr edit --continue\n" ++
-            "  stakrr edit --abort restores the pre-edit stack\n" ++
-            "  stakrr edit --quit leaves HEAD and branches as they are\n"),
+        .editing => try w.writeAll("\n  commit fixes, then stakrr go <cut> to move or stakrr restack to finish\n" ++
+            "  stakrr abort restores the pre-edit stack\n"),
+        .conflict => try w.writeAll("\n  resolve conflicts, git add, then stakrr continue\n" ++
+            "  to give up, commit the resolution, then stakrr abort\n"),
+        else => try w.writeAll("\n  stakrr continue\n" ++
+            "  stakrr abort restores the pre-edit stack\n" ++
+            "  stakrr quit leaves HEAD and branches as they are\n"),
     }
 }
 
@@ -173,7 +173,7 @@ pub fn printDriftHints(out: Terminal, drift: edit.Drift) !void {
         try keepHint(out, name, actual);
         try hint(out, "remove it: git update-ref -d {s} {s}", .{ name, actual });
     }
-    try hint(out, "then rerun the stakrr edit command, or keep it and leave: stakrr edit --quit", .{});
+    try hint(out, "then rerun the stakrr command, or keep it and leave: stakrr quit", .{});
 }
 
 fn keepHint(out: Terminal, name: []const u8, actual: []const u8) !void {

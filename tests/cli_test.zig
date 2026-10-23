@@ -175,7 +175,7 @@ test "cli: edit confirmations and status share terminal conventions" {
     testing.allocator.free(oid);
     const cut = try stakrr(&repo, &.{ "cut", "p1" });
     defer cut.deinit();
-    const started = try stakrr(&repo, &.{ "edit", "p1" });
+    const started = try stakrr(&repo, &.{ "go", "p1" });
     defer started.deinit();
     try testing.expectEqual(@as(?u8, 0), started.code);
     try testing.expectEqualStrings("editing stakrr/p1\n", started.stdout);
@@ -183,8 +183,8 @@ test "cli: edit confirmations and status share terminal conventions" {
     defer status.deinit();
     try testing.expectEqualStrings(
         "stack  main → work\nedit   stakrr/p1\n\n  │ work\n  ▸ stakrr/p1   editing\n  └ main        base\n\n  1 layer\n\n" ++
-            "  commit fixes, then stakrr edit <cut> to move or stakrr edit to finish\n" ++
-            "  stakrr edit --abort restores the pre-edit stack\n",
+            "  commit fixes, then stakrr go <cut> to move or stakrr restack to finish\n" ++
+            "  stakrr abort restores the pre-edit stack\n",
         status.stdout,
     );
     try repo.env.put("CLICOLOR_FORCE", "1");
@@ -195,12 +195,12 @@ test "cli: edit confirmations and status share terminal conventions" {
     const plain = try stakrr(&repo, &.{"status"});
     defer plain.deinit();
     try testing.expectEqualStrings(status.stdout, plain.stdout);
-    const finished = try stakrr(&repo, &.{"edit"});
+    const finished = try stakrr(&repo, &.{"restack"});
     defer finished.deinit();
     try testing.expectEqualStrings("edit completed; returned to work\n", finished.stdout);
-    const restarted = try stakrr(&repo, &.{ "edit", "p1" });
+    const restarted = try stakrr(&repo, &.{ "go", "p1" });
     defer restarted.deinit();
-    const aborted = try stakrr(&repo, &.{ "edit", "--abort" });
+    const aborted = try stakrr(&repo, &.{"abort"});
     defer aborted.deinit();
     try testing.expectEqualStrings("edit aborted; returned to work\nretained edits: stakrr log (refs/stakrr/oplog)\n", aborted.stdout);
 }
@@ -221,13 +221,13 @@ test "cli: conflict status shows detached replay and a resolution hint" {
     try repo.exec(&.{ "add", "shared" });
     const upper = try repo.commit("upper");
     defer testing.allocator.free(upper);
-    const started = try stakrr(&repo, &.{ "edit", "p1" });
+    const started = try stakrr(&repo, &.{ "go", "p1" });
     defer started.deinit();
     try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "shared", .data = "edited\n" });
     try repo.exec(&.{ "add", "shared" });
     const edited = try repo.commit("edited");
     testing.allocator.free(edited);
-    const conflict = try stakrr(&repo, &.{"edit"});
+    const conflict = try stakrr(&repo, &.{"restack"});
     defer conflict.deinit();
     try testing.expectEqual(@as(?u8, 1), conflict.code);
     try testing.expectEqualStrings("", conflict.stdout);
@@ -238,8 +238,8 @@ test "cli: conflict status shows detached replay and a resolution hint" {
         testing.allocator,
         "stack  main → work\nedit   stakrr/p1 (conflict) → work\nreplay 1/1 stopped at {s} upper\n\n" ++
             "  │ work\n  │ stakrr/p1   conflict\n  └ main        base\n\n  1 layer\n\n" ++
-            "  resolve conflicts, git add, then stakrr edit --continue\n" ++
-            "  to give up, commit the resolution, then stakrr edit --abort\n",
+            "  resolve conflicts, git add, then stakrr continue\n" ++
+            "  to give up, commit the resolution, then stakrr abort\n",
         .{upper[0..7]},
     );
     defer testing.allocator.free(expected);

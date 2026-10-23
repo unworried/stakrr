@@ -40,7 +40,7 @@ fn pausedBeforeDetach(repo: *Repo) !void {
     try repo.commitAll("correction");
     try cli.installFaultShim(repo);
     try repo.env.put("STAKRR_TEST_FAULT", "after:1");
-    const stopped = try cli.run(repo, &.{"edit"});
+    const stopped = try cli.run(repo, &.{"restack"});
     defer stopped.deinit();
     try testing.expect(stopped.code != 0);
     _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
@@ -73,14 +73,14 @@ test "replay resumes after process death on either side of every ref checkpoint"
             const fault = try std.fmt.allocPrint(testing.allocator, "{s}:{d}", .{ side, checkpoint });
             defer testing.allocator.free(fault);
             try repo.env.put("STAKRR_TEST_FAULT", fault);
-            const killed = try cli.run(&repo, &.{"edit"});
+            const killed = try cli.run(&repo, &.{"restack"});
             defer killed.deinit();
             try testing.expect(killed.code != 0);
             _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
             if (checkpoint == 1 and std.mem.eql(u8, side, "before")) {
-                try cli.expectSuccess(&repo, &.{"edit"});
+                try cli.expectSuccess(&repo, &.{"restack"});
             } else {
-                try cli.expectSuccess(&repo, &.{ "edit", "--continue" });
+                try cli.expectSuccess(&repo, &.{"continue"});
             }
             try noSession(&repo);
             try valid(&repo);
@@ -103,11 +103,11 @@ test "a successful cherry-pick interrupted before journaling is incorporated exa
     try repo.commitAll("correction");
     try cli.installFaultShim(&repo);
     try repo.env.put("STAKRR_TEST_FAULT", "pick");
-    const killed = try cli.run(&repo, &.{"edit"});
+    const killed = try cli.run(&repo, &.{"restack"});
     defer killed.deinit();
     try testing.expect(killed.code != 0);
     _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
-    try cli.expectSuccess(&repo, &.{ "edit", "--continue" });
+    try cli.expectSuccess(&repo, &.{"continue"});
     try repo.expectOutput(
         &.{ "log", "--format=%s", "--reverse", "main..work" },
         "models\ncorrection\napi\ndelete obsolete\nrolling",
@@ -119,7 +119,7 @@ test "conflicts continue after restarting the CLI process" {
     var repo = try Repo.init();
     defer repo.deinit();
     try conflictSetup(&repo);
-    const conflict = try cli.run(&repo, &.{ "edit", "api" });
+    const conflict = try cli.run(&repo, &.{ "go", "api" });
     defer conflict.deinit();
     try testing.expect(conflict.code != 0);
     const status = try cli.run(&repo, &.{"status"});
@@ -128,9 +128,9 @@ test "conflicts continue after restarting the CLI process" {
     try testing.expect(std.mem.indexOf(u8, status.stdout, "models (conflict)") != null);
     try repo.write("shared", "resolved\n");
     try repo.exec(&.{ "add", "shared" });
-    try cli.expectSuccess(&repo, &.{ "edit", "--continue" });
+    try cli.expectSuccess(&repo, &.{"continue"});
     try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/api");
-    try cli.expectSuccess(&repo, &.{"edit"});
+    try cli.expectSuccess(&repo, &.{"restack"});
     try noSession(&repo);
 }
 
@@ -158,11 +158,11 @@ test "abort and its restoration transaction resume after process death" {
             const fault = try std.fmt.allocPrint(testing.allocator, "{s}:{d}", .{ side, checkpoint });
             defer testing.allocator.free(fault);
             try repo.env.put("STAKRR_TEST_FAULT", fault);
-            const killed = try cli.run(&repo, &.{ "edit", "--abort" });
+            const killed = try cli.run(&repo, &.{"abort"});
             defer killed.deinit();
             try testing.expect(killed.code != 0);
             _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
-            try cli.expectSuccess(&repo, &.{ "edit", "--abort" });
+            try cli.expectSuccess(&repo, &.{"abort"});
             var restored = try repo.git.listRefs("refs/heads/stakrr/");
             defer restored.deinit(testing.allocator);
             try testing.expectEqualStrings(refs.raw, restored.raw);
@@ -186,7 +186,7 @@ test "branch occupancy appearing during replay blocks publication" {
     try repo.commitAll("correction");
     try cli.installFaultShim(&repo);
     try repo.env.put("STAKRR_TEST_FAULT", "after:6");
-    const killed = try cli.run(&repo, &.{"edit"});
+    const killed = try cli.run(&repo, &.{"restack"});
     defer killed.deinit();
     try testing.expect(killed.code != 0);
     _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
@@ -431,7 +431,7 @@ test "legacy v1 switching checkpoints may retain a completed replay plan" {
     var original = try std.json.parseFromSlice(std.json.Value, testing.allocator, before, .{});
     defer original.deinit();
     try repo.env.put("STAKRR_TEST_FAULT", "after:7");
-    const stopped = try cli.run(&repo, &.{ "edit", "--continue" });
+    const stopped = try cli.run(&repo, &.{"continue"});
     defer stopped.deinit();
     try testing.expect(stopped.code != 0);
     _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
@@ -505,7 +505,7 @@ test "quit drops only the journal of drifted and corrupt sessions" {
     defer testing.allocator.free(corrupt);
     try repo.exec(&.{ "update-ref", layout.session_ref, corrupt });
     try testing.expectError(error.InvalidEditSession, edit.run(&repo.git, .abort));
-    try cli.expectSuccess(&repo, &.{ "edit", "--quit" });
+    try cli.expectSuccess(&repo, &.{"quit"});
     try noSession(&repo);
     try expectRecoverable(&repo, corrupt);
 }
@@ -529,9 +529,9 @@ test "pending edit status offers continue without conflict instructions" {
     defer result.deinit();
     try testing.expectEqual(@as(?u8, 0), result.code);
     try testing.expect(std.mem.indexOf(u8, result.stdout, "(detaching) → work") != null);
-    try testing.expect(std.mem.indexOf(u8, result.stdout, "\n  stakrr edit --continue\n") != null);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "\n  stakrr continue\n") != null);
     try testing.expect(std.mem.indexOf(u8, result.stdout, "\nreplay 0/3 done\n") != null);
-    try testing.expect(std.mem.indexOf(u8, result.stdout, "  stakrr edit --quit leaves") != null);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "  stakrr quit leaves") != null);
     try testing.expect(std.mem.indexOf(u8, result.stdout, "resolve conflicts") == null);
     try testing.expect(std.mem.indexOf(u8, result.stdout, "recovery:") == null);
     try testing.expect(std.mem.indexOf(u8, result.stdout, "worktree:") == null);
