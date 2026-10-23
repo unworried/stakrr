@@ -19,6 +19,7 @@ const help_commands = [_]struct { name: []const u8, args: []const u8, about: []c
     .{ .name = "undo", .args = "", .about = "reverse the last jump or finished edit" },
     .{ .name = "log", .args = "", .about = "show edit history and rescue commits" },
     .{ .name = "cut", .args = "<name> [--at <rev>]", .about = "create the next layer" },
+    .{ .name = "fix", .args = "[<cut>] -m <msg>|--amend", .about = "fold staged changes into a cut, replaying descendants" },
     .{ .name = "go", .args = "<cut>", .about = "edit a cut, replaying descendants as you move" },
     .{ .name = "restack", .args = "", .about = "replay descendants and return to the original branch" },
     .{ .name = "continue", .args = "", .about = "resume a pending replay or checkout" },

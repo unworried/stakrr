@@ -3,6 +3,7 @@ const std = @import("std");
 const stakrr = @import("stakrr");
 const stack = stakrr.stack;
 const edit = stakrr.edit;
+const fix = stakrr.fix;
 
 pub const Command = union(enum) {
     help,
@@ -15,6 +16,7 @@ pub const Command = union(enum) {
     reset: stack.ResetOptions,
     navigate: stack.Direction,
     edit: edit.Request,
+    fix: fix.Options,
 };
 
 pub const ParseError = error{ InvalidArguments, UnknownCommand };
@@ -78,6 +80,34 @@ pub fn parseArgs(args: []const []const u8) ParseError!Command {
         return .{ .cut = .{
             .name = name orelse return error.InvalidArguments,
             .at = at,
+        } };
+    }
+
+    if (eql(command, "fix")) {
+        var layer: ?[]const u8 = null;
+        var message: ?[]const u8 = null;
+        var amend = false;
+        var i: usize = 0;
+        while (i < rest.len) : (i += 1) {
+            const arg = rest[i];
+            if (eql(arg, "--amend")) {
+                if (amend) return error.InvalidArguments;
+                amend = true;
+            } else if (eql(arg, "-m")) {
+                i += 1;
+                if (message != null or i == rest.len or rest[i].len == 0) return error.InvalidArguments;
+                message = rest[i];
+            } else if (layer == null) {
+                layer = try value(arg);
+            } else {
+                return error.InvalidArguments;
+            }
+        }
+        // exactly one way of recording the change
+        if (amend == (message != null)) return error.InvalidArguments;
+        return .{ .fix = .{
+            .layer = layer,
+            .how = if (message) |text| .{ .message = text } else .amend,
         } };
     }
 
@@ -200,6 +230,29 @@ test "parseArgs: go and session verbs" {
         &.{ "stakrr", "go", "--abort" },
         &.{ "stakrr", "abort", "now" },
         &.{ "stakrr", "restack", "models" },
+    }) |args| try testing.expectError(error.InvalidArguments, parseArgs(args));
+}
+
+test "parseArgs: fix needs a layer-optional message or --amend" {
+    const a = try parseArgs(&.{ "stakrr", "fix", "-m", "tidy" });
+    try testing.expect(a.fix.layer == null);
+    try testing.expectEqualStrings("tidy", a.fix.how.message);
+
+    const b = try parseArgs(&.{ "stakrr", "fix", "models", "--amend" });
+    try testing.expectEqualStrings("models", b.fix.layer.?);
+    try testing.expectEqual(fix.How.amend, b.fix.how);
+
+    const c = try parseArgs(&.{ "stakrr", "fix", "-m", "tidy", "models" });
+    try testing.expectEqualStrings("models", c.fix.layer.?);
+
+    for ([_][]const []const u8{
+        &.{ "stakrr", "fix" },
+        &.{ "stakrr", "fix", "models" },
+        &.{ "stakrr", "fix", "-m", "x", "--amend" },
+        &.{ "stakrr", "fix", "-m" },
+        &.{ "stakrr", "fix", "-m", "" },
+        &.{ "stakrr", "fix", "a", "b", "--amend" },
+        &.{ "stakrr", "fix", "--amend", "--amend" },
     }) |args| try testing.expectError(error.InvalidArguments, parseArgs(args));
 }
 
