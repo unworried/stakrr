@@ -63,6 +63,24 @@ stakrr cut api                   # everything since, up to the tip, becomes stak
 stakrr status
 ```
 
+## // fixing earlier cuts
+
+To fold changes into a lower cut without leaving your rolling branch, stage them
+and run `stakrr fix`:
+
+```sh
+git add model.zig
+stakrr fix models -m "validate input"   # new commit on stakrr/models
+stakrr fix models --amend               # or amend its last commit
+stakrr fix -m "tidy"                    # the highest cut when none is named
+```
+
+Everything above the cut is replayed with in-memory merges, so unstaged edits and
+the worktree are never touched, and the staged changes end up in history instead
+of the index. If the change conflicts with the cut or a later commit, or replaying
+it would not reproduce your index, nothing changes; use `stakrr go <cut>` to
+resolve it by hand. `stakrr undo` reverses a fix. Needs Git 2.38 or newer.
+
 ## // editing earlier cuts
 
 Edit commands print a short confirmation. Use `stakrr status` for the full stack,
@@ -189,6 +207,7 @@ HEAD plus the checkpoint are retained in `refs/stakrr/oplog` (inspect them with
 | ● | `stakrr status` | draw the stack: layers, commit counts, unstacked work |
 | ● | `stakrr reset [--delete-layers]` | forget the stack so it can be re-initialised |
 | ● | `stakrr version` | print the version |
+| ● | `stakrr fix [<cut>] -m <msg>\|--amend` | fold staged changes into a cut and replay what sits above it |
 | ● | `stakrr go <cut>` | edit a cut, replaying descendants when you move |
 | ● | `stakrr restack` | replay descendants and return to the original branch |
 | ● | `stakrr continue` | resume a pending replay or checkout |
