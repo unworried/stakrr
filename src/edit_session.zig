@@ -197,7 +197,19 @@ pub fn load(git: *const Git) !?Loaded {
     return try loadAt(git, oid);
 }
 
+/// Load a checkpoint and, for replay phases, validate its plan before any
+/// caller changes HEAD or refs.
 pub fn loadAt(git: *const Git, oid: []const u8) !Loaded {
+    var loaded = try loadMetadata(git, oid);
+    // Plans are checked for every phase that can resume a replay, including
+    // detaching and aborting.
+    if (loaded.session.replay() != null) loaded.plan = try loadReplayPlan(git, &loaded.session);
+    return loaded;
+}
+
+/// Decode and validate a checkpoint without reading its replay plan. For
+/// read-only callers; anything that resumes a session must use `loadAt`.
+pub fn loadMetadata(git: *const Git, oid: []const u8) !Loaded {
     const kind = try git.output(&.{ "cat-file", "-t", oid });
     const is_commit = std.mem.eql(u8, kind, "commit");
     if (!is_commit and !std.mem.eql(u8, kind, "blob")) return error.InvalidEditSession;
@@ -307,7 +319,7 @@ pub fn loadAt(git: *const Git, oid: []const u8) !Loaded {
         .aborting => .{ .aborting = progress },
         .aborted => .aborted,
     };
-    var s: Session = .{
+    const s: Session = .{
         .oplog_parent = if (wire.version == 1) try git.readRef(layout.oplog_ref) else wire.oplog_parent,
         .outcome = wire.outcome,
         .operation = wire.operation,
@@ -323,10 +335,7 @@ pub fn loadAt(git: *const Git, oid: []const u8) !Loaded {
         .active = wire.active,
         .phase = phase,
     };
-    // Plans are checked for every phase that can resume a replay, including
-    // detaching and aborting, before any caller changes HEAD or refs.
-    const plan = if (s.replay() != null) try loadReplayPlan(git, &s) else null;
-    return .{ .oid = oid, .session = s, .plan = plan };
+    return .{ .oid = oid, .session = s, .plan = null };
 }
 
 /// Previous journal checkpoint, kept as the first parent when it is a commit.
