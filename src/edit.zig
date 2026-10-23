@@ -187,6 +187,14 @@ pub const Log = struct {
     }
 };
 
+/// Log reads never resume a session, so the replay plan is not validated.
+fn decodeCheckpoint(git: *const Git, oid: []const u8) !?Loaded {
+    return checkpoint.loadMetadata(git, oid) catch |err| switch (err) {
+        error.InvalidEditSession => null,
+        else => return err,
+    };
+}
+
 /// Newest first, including an in-progress session and previous operations.
 pub fn readLog(original_git: *const Git) !Log {
     var context: Context = undefined;
@@ -196,6 +204,7 @@ pub fn readLog(original_git: *const Git) !Log {
     try git.ensureWorkTree();
     var cursor: ?[]const u8 = (try git.readRef(layout.session_ref)) orelse try git.readRef(layout.oplog_ref);
     var steps: std.ArrayList(Log.Step) = .empty;
+    var carried: ??Loaded = null;
     while (cursor) |oid| {
         const kind = try git.output(&.{ "cat-file", "-t", oid });
         if (!eql(kind, "commit")) break; // legacy v1 checkpoint
@@ -207,14 +216,10 @@ pub fn readLog(original_git: *const Git) !Log {
         const metadata = try git.output(&.{ "show", "--no-patch", "--format=%cI%x09%s", oid });
         const separator = std.mem.indexOfScalar(u8, metadata, '\t') orelse return error.InvalidEditSession;
         const previous = try checkpoint.previous(git, oid);
-        const current = checkpoint.loadAt(git, oid) catch |err| switch (err) {
-            error.InvalidEditSession => null,
-            else => return err,
-        };
-        const before = if (previous) |parent| checkpoint.loadAt(git, parent) catch |err| switch (err) {
-            error.InvalidEditSession => null,
-            else => return err,
-        } else null;
+        // The parent decoded for one step is the next step's checkpoint.
+        const current = carried orelse try decodeCheckpoint(git, oid);
+        const before = if (previous) |parent| try decodeCheckpoint(git, parent) else null;
+        carried = if (previous != null) @as(??Loaded, before) else null;
         var moves: std.ArrayList(Log.Move) = .empty;
         if (current) |after| {
             if (before) |prior| {
