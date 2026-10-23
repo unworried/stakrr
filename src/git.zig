@@ -581,6 +581,48 @@ pub const Git = struct {
         return self.output(args.items);
     }
 
+    /// Three-way merge of two commits in memory; neither the index nor the
+    /// worktree is touched. Returns the merged tree, or null when the merge
+    /// conflicts. Needs Git 2.38 or newer.
+    pub fn mergeTree(self: *const Git, base: []const u8, ours: []const u8, theirs: []const u8) !?[]u8 {
+        if (!isOid(base) or !isOid(ours) or !isOid(theirs)) return error.InvalidOid;
+        const merge_base = try std.fmt.allocPrint(self.allocator, "--merge-base={s}", .{base});
+        defer self.allocator.free(merge_base);
+        return self.query(&.{ "merge-tree", "--write-tree", "--no-messages", merge_base, ours, theirs }, 1);
+    }
+
+    /// A copy of `source` with another tree and a single parent. Author,
+    /// committer and message are kept; signatures are dropped because they
+    /// would no longer verify.
+    pub fn rewriteCommit(self: *const Git, source: []const u8, tree: []const u8, parent: []const u8) ![]u8 {
+        if (!isOid(source) or !isOid(tree) or !isOid(parent)) return error.InvalidOid;
+        const raw = try self.outputRaw(&.{ "cat-file", "commit", source });
+        defer self.allocator.free(raw);
+        const split = std.mem.indexOf(u8, raw, "\n\n") orelse return error.InvalidGitOutput;
+
+        var data: std.ArrayList(u8) = .empty;
+        defer data.deinit(self.allocator);
+        const links = try std.fmt.allocPrint(self.allocator, "tree {s}\nparent {s}\n", .{ tree, parent });
+        defer self.allocator.free(links);
+        try data.appendSlice(self.allocator, links);
+
+        var skipping = false;
+        var lines = std.mem.splitScalar(u8, raw[0..split], '\n');
+        while (lines.next()) |line| {
+            // a header continues on lines that start with a space
+            if (line.len == 0 or line[0] != ' ') {
+                skipping = for ([_][]const u8{ "tree ", "parent ", "gpgsig", "mergetag" }) |name| {
+                    if (std.mem.startsWith(u8, line, name)) break true;
+                } else false;
+            }
+            if (skipping) continue;
+            try data.appendSlice(self.allocator, line);
+            try data.append(self.allocator, '\n');
+        }
+        try data.appendSlice(self.allocator, raw[split + 1 ..]);
+        return self.writeObject("commit", data.items, try self.objectFormat());
+    }
+
     pub fn switchBranch(self: *const Git, ref_name: []const u8) !void {
         if (!isSafeBranchRef(ref_name)) return error.InvalidRefName;
 
