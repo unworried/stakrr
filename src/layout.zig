@@ -22,7 +22,6 @@ pub const session_ref = "refs/stakrr/edit";
 /// completed edit histories, linked through checkpoint parents
 pub const oplog_ref = "refs/stakrr/oplog";
 
-
 /// git config key holding "<version> <base_ref> <work_ref>"
 pub const state_key = "stakrr.state";
 pub const state_version = "v1";

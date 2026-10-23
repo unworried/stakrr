@@ -276,6 +276,19 @@ test "configGet rejects duplicate values" {
     );
 }
 
+test "configGet rejects trailing empty values and embedded newlines" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    for ([_][]const u8{ "", "\n", "\r\n" }) |suffix| {
+        try repo.exec(&.{ "config", "--local", "--replace-all", layout.state_key, "v1 refs/heads/main refs/heads/work" });
+        try repo.exec(&.{ "config", "--local", "--add", layout.state_key, suffix });
+        try testing.expectError(error.InvalidGitConfig, repo.git.configGet(layout.state_key));
+    }
+    try repo.exec(&.{ "config", "--local", "--replace-all", layout.state_key, "v1 refs/heads/main refs/heads/work\n" });
+    try testing.expectError(error.InvalidGitConfig, repo.git.configGet(layout.state_key));
+}
+
 test "configGet rejects empty values" {
     var repo = try Repo.init();
     defer repo.deinit();

@@ -26,6 +26,8 @@ test "fix adds a commit to a lower layer and replays everything above it" {
     var repo = try Repo.init();
     defer repo.deinit();
     try fixture.setup(&repo);
+    var before = try repo.git.listRefs(layout.branch_prefix);
+    defer before.deinit(testing.allocator);
     try stage(&repo, "model", "fixed\n");
 
     var result = try fix.fix(&repo.git, .{ .layer = "models", .how = .{ .message = "tweak model" } });
@@ -46,6 +48,48 @@ test "fix adds a commit to a lower layer and replays everything above it" {
     try repo.expectOutput(&.{ "status", "--porcelain" }, "");
     try fixture.noSession(&repo);
     try fixture.valid(&repo);
+
+    // A fix has just one checkpoint, so its moves must be available even
+    // when there is no previous operation to compare with.
+    var log = try stakrr.edit.readLog(&repo.git);
+    defer log.deinit();
+    try testing.expectEqual(@as(usize, 1), log.steps.len);
+    try testing.expectEqual(@as(usize, 3), log.steps[0].moves.len);
+    for (log.steps[0].moves) |move| {
+        try testing.expect(!std.mem.eql(u8, move.before, move.after));
+        try repo.expectRef(move.name, move.after);
+        const old = for (before.refs) |ref| {
+            if (std.mem.eql(u8, ref.name, move.name)) break ref.oid;
+        } else return error.TestExpectedRef;
+        try testing.expectEqualStrings(old, move.before);
+    }
+}
+
+test "fix log starts from the actual refs after work between operations" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try fixture.setup(&repo);
+    try stage(&repo, "model", "first fix\n");
+    var first = try fix.fix(&repo.git, .{ .layer = "models", .how = .{ .message = "first" } });
+    defer first.deinit(testing.allocator);
+
+    try repo.write("tail", "new rolling work\n");
+    try repo.commitAll("new work");
+    const old_work = try repo.git.resolveCommit("work");
+    defer testing.allocator.free(old_work);
+    try stage(&repo, "model", "second fix\n");
+    var second = try fix.fix(&repo.git, .{ .layer = "models", .how = .{ .message = "second" } });
+    defer second.deinit(testing.allocator);
+
+    var log = try stakrr.edit.readLog(&repo.git);
+    defer log.deinit();
+    for (log.steps[0].moves) |move| {
+        if (!std.mem.eql(u8, move.name, "refs/heads/work")) continue;
+        try testing.expectEqualStrings(old_work, move.before);
+        try repo.expectRef(move.name, move.after);
+        return;
+    }
+    return error.TestExpectedRef;
 }
 
 test "fix amends the last commit of a layer and keeps its message" {

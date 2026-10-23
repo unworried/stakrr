@@ -126,14 +126,14 @@ pub const Git = struct {
     }
 
     /// execute a command that must succeed
-    /// returns an owned, newline-trimmed copy of stdout
+    /// returns owned, newline-trimmed stdout
     pub fn output(
         self: *const Git,
         args: []const []const u8,
     ) ![]u8 {
         const bytes = try self.outputRaw(args);
-        defer self.allocator.free(bytes);
-        return self.allocator.dupe(u8, std.mem.trimEnd(u8, bytes, "\r\n"));
+        errdefer self.allocator.free(bytes);
+        return self.allocator.realloc(bytes, std.mem.trimEnd(u8, bytes, "\r\n").len);
     }
 
     /// Successful stdout, unchanged. The caller owns the returned bytes.
@@ -150,11 +150,12 @@ pub const Git = struct {
     /// end in newlines, unlike ordinary text output.
     pub fn path(self: *const Git, args: []const []const u8) ![]u8 {
         const result = try self.run(args);
-        defer self.freeResult(result);
+        defer self.allocator.free(result.stderr);
+        errdefer self.allocator.free(result.stdout);
         if ((try exitCode(result)) != 0) return self.fail(result.stderr);
         if (result.stdout.len == 0 or result.stdout[result.stdout.len - 1] != '\n')
             return error.InvalidGitOutput;
-        return self.allocator.dupe(u8, result.stdout[0 .. result.stdout.len - 1]);
+        return self.allocator.realloc(result.stdout, result.stdout.len - 1);
     }
 
     /// execute a Git command that must succeed without retaining stdout
@@ -169,11 +170,15 @@ pub const Git = struct {
     /// null on `absent`; any other status fails with diagnostics.
     pub fn query(self: *const Git, args: []const []const u8, absent: u8) !?[]u8 {
         const result = try self.run(args);
-        defer self.freeResult(result);
+        defer self.allocator.free(result.stderr);
+        errdefer self.allocator.free(result.stdout);
         const code = try exitCode(result);
-        if (code == absent) return null;
+        if (code == absent) {
+            self.allocator.free(result.stdout);
+            return null;
+        }
         if (code != 0) return self.fail(result.stderr);
-        return try self.allocator.dupe(u8, std.mem.trimEnd(u8, result.stdout, "\r\n"));
+        return try self.allocator.realloc(result.stdout, std.mem.trimEnd(u8, result.stdout, "\r\n").len);
     }
 
     /// True on success, false on exit status `no`; any other status fails.
@@ -307,15 +312,17 @@ pub const Git = struct {
         self: *const Git,
         key: []const u8,
     ) !?[]u8 {
-        const value = (try self.query(&.{ "config", "--local", "--get-all", key }, 1)) orelse
+        const value = (try self.query(&.{ "config", "--null", "--local", "--get-all", key }, 1)) orelse
             return null;
         errdefer self.allocator.free(value);
 
-        // stakrr expects exactly one config value
-        if (value.len == 0 or std.mem.indexOfScalar(u8, value, '\n') != null)
+        // Preserve value boundaries: trimming newlines could hide a trailing
+        // empty value or a newline embedded in the persisted state.
+        if (value.len <= 1 or value[value.len - 1] != 0 or
+            std.mem.indexOfAny(u8, value[0 .. value.len - 1], "\x00\r\n") != null)
             return error.InvalidGitConfig;
 
-        return value;
+        return try self.allocator.realloc(value, value.len - 1);
     }
 
     /// remove every value of a local config key; returns false if unset
@@ -405,7 +412,10 @@ pub const Git = struct {
         };
         try w.writeAll("prepare\ncommit\n");
 
-        try self.updateRefStdin(message, transaction.written());
+        try self.input(
+            &.{ "update-ref", "--create-reflog", "-m", message, "--stdin" },
+            transaction.written(),
+        );
     }
 
     fn checkUpdate(name: []const u8, oids: []const []const u8) Error!void {
@@ -414,17 +424,6 @@ pub const Git = struct {
         for (oids) |oid| {
             if (!isOid(oid)) return error.InvalidOid;
         }
-    }
-
-    fn updateRefStdin(
-        self: *const Git,
-        message: []const u8,
-        transaction: []const u8,
-    ) !void {
-        try self.input(
-            &.{ "update-ref", "--create-reflog", "-m", message, "--stdin" },
-            transaction,
-        );
     }
 
     /// Feed stdin without a shell. Stdout is ignored; blob IDs are
@@ -600,11 +599,9 @@ pub const Git = struct {
         defer self.allocator.free(raw);
         const split = std.mem.indexOf(u8, raw, "\n\n") orelse return error.InvalidGitOutput;
 
-        var data: std.ArrayList(u8) = .empty;
-        defer data.deinit(self.allocator);
-        const links = try std.fmt.allocPrint(self.allocator, "tree {s}\nparent {s}\n", .{ tree, parent });
-        defer self.allocator.free(links);
-        try data.appendSlice(self.allocator, links);
+        var data: Io.Writer.Allocating = .init(self.allocator);
+        defer data.deinit();
+        try data.writer.print("tree {s}\nparent {s}\n", .{ tree, parent });
 
         var skipping = false;
         var lines = std.mem.splitScalar(u8, raw[0..split], '\n');
@@ -616,11 +613,11 @@ pub const Git = struct {
                 } else false;
             }
             if (skipping) continue;
-            try data.appendSlice(self.allocator, line);
-            try data.append(self.allocator, '\n');
+            try data.writer.writeAll(line);
+            try data.writer.writeByte('\n');
         }
-        try data.appendSlice(self.allocator, raw[split + 1 ..]);
-        return self.writeObject("commit", data.items, try self.objectFormat());
+        try data.writer.writeAll(raw[split + 1 ..]);
+        return self.writeObject("commit", data.written(), try self.objectFormat());
     }
 
     pub fn switchBranch(self: *const Git, ref_name: []const u8) !void {

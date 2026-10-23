@@ -323,10 +323,10 @@ test "invalid replay plans are rejected before detach and before a clean abort" 
     defer testing.allocator.free(checkpoint);
     const raw = try fixture.checkpointJson(&repo, checkpoint);
     defer testing.allocator.free(raw);
-    for ([_]bool{ false, true }) |reverse| {
+    for ([_]enum { length, reverse, duplicate, malformed, extra }{ .length, .reverse, .duplicate, .malformed, .extra }) |corruption| {
         var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, raw, .{});
         defer parsed.deinit();
-        if (reverse) {
+        if (corruption != .length) {
             const oid = parsed.value.object.get("plan_oid").?.string;
             const plan = try repo.git.output(&.{ "cat-file", "blob", oid });
             defer testing.allocator.free(plan);
@@ -334,10 +334,16 @@ test "invalid replay plans are rejected before detach and before a clean abort" 
             defer commits.deinit(testing.allocator);
             var lines = std.mem.tokenizeScalar(u8, plan, '\n');
             while (lines.next()) |line| try commits.append(testing.allocator, line);
-            std.mem.reverse([]const u8, commits.items);
-            const reversed = try std.mem.join(testing.allocator, "\n", commits.items);
-            defer testing.allocator.free(reversed);
-            const bad_plan = try repo.git.writeBlob(reversed);
+            switch (corruption) {
+                .reverse => std.mem.reverse([]const u8, commits.items),
+                .duplicate => commits.items[0] = commits.items[1],
+                .malformed => commits.items[0] = "not-an-oid",
+                .extra => try commits.append(testing.allocator, commits.items[0]),
+                .length => unreachable,
+            }
+            const changed = try std.mem.join(testing.allocator, "\n", commits.items);
+            defer testing.allocator.free(changed);
+            const bad_plan = try repo.git.writeBlob(changed);
             defer testing.allocator.free(bad_plan);
             parsed.value.object.getPtr("plan_oid").?.* = .{ .string = bad_plan };
             const invalid = try replaceCheckpoint(&repo, parsed.value);

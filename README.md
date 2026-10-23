@@ -220,6 +220,9 @@ or HEAD changed outside stakrr.
 
 ## // internals
 
+See [Git command flows](docs/git-flow.md) for each command's ordered checks,
+Git mutations, publication transactions and recovery behavior.
+
 | ref | holds |
 | --- | --- |
 | `git config stakrr.state` | `v1 <base_ref> <work_ref>`. one stack per repository, shared by all worktrees |

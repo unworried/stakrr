@@ -249,7 +249,7 @@ fn userError(err: anyerror) ?[]const u8 {
             "(run 'stakrr reset')",
         error.InvalidStack, error.InvalidLayerBoundary => "stack refs are inconsistent with the rolling branch " ++
             "(run 'stakrr reset' to start over)",
-        error.NotOnWorkBranch => "cut must run on the rolling work branch",
+        error.NotOnWorkBranch => "this command must run on the rolling work branch",
         error.InvalidLayerName => "invalid layer name",
         error.LayerExists => "a layer with that name already exists or conflicts with one",
         error.LayerCheckedOut => "cannot delete layers while a layer branch is checked out",

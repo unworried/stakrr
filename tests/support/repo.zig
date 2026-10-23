@@ -67,8 +67,7 @@ pub const Repo = struct {
         self: *const Repo,
         args: []const []const u8,
     ) !void {
-        const output = try self.git.output(args);
-        defer self.git.allocator.free(output);
+        try self.git.exec(args);
     }
 
     /// make an empty commit, returning its owned oid

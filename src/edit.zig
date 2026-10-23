@@ -186,16 +186,21 @@ pub fn readLog(original_git: *const Git) !Log {
         carried = if (previous != null) @as(??Loaded, before) else null;
         var moves: std.ArrayList(Log.Move) = .empty;
         if (current) |after| {
-            if (before) |prior| {
-                for (after.session.nodes, 0..) |node, i| {
-                    for (prior.session.nodes, 0..) |old, j| {
-                        if (!eql(node.ref_name, old.ref_name)) continue;
-                        const from = prior.session.expectedOid(j);
-                        const to = after.session.expectedOid(i);
-                        if (!eql(from, to)) try moves.append(git.allocator, .{ .name = node.ref_name, .before = from, .after = to });
-                        break;
+            for (after.session.nodes, 0..) |node, i| {
+                // A new operation starts from its saved original refs. Only
+                // checkpoints within that operation describe its earlier steps.
+                var from = node.original_oid;
+                if (before) |prior| {
+                    if (eql(prior.session.id, after.session.id)) {
+                        for (prior.session.nodes, 0..) |old, j| {
+                            if (!eql(node.ref_name, old.ref_name)) continue;
+                            from = prior.session.expectedOid(j);
+                            break;
+                        }
                     }
                 }
+                const to = after.session.expectedOid(i);
+                if (!eql(from, to)) try moves.append(git.allocator, .{ .name = node.ref_name, .before = from, .after = to });
             }
         }
         try steps.append(git.allocator, .{

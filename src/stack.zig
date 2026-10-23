@@ -85,7 +85,7 @@ pub fn initStack(
     const allocator = git.allocator;
     // lock() also validates the working tree.
 
-    // 2. refuse existing initialisation
+    // refuse existing initialisation
     if (try git.configGet(layout.state_key)) |existing| {
         allocator.free(existing);
         return error.AlreadyInitialized;
@@ -104,7 +104,7 @@ pub fn initStack(
         if (existing != null) return error.ExistingStackRefs;
     }
 
-    // 3. identify rolling branch and base
+    // identify rolling branch and base
     const work_ref = try git.currentBranch();
     defer allocator.free(work_ref);
 
@@ -125,29 +125,28 @@ pub fn initStack(
     if (std.mem.eql(u8, work_ref, base_ref))
         return error.BaseEqualsWork;
 
-    // 4. resolve both branch tips
+    // resolve both branch tips
     const base_oid = (try git.readRef(base_ref)) orelse
         return error.BaseNotFound;
     defer allocator.free(base_oid);
     const work_oid = try git.resolveCommit(work_ref);
     defer allocator.free(work_oid);
 
-    // 5. check ancestry
+    // check ancestry
     if (!try git.isAncestor(base_oid, work_oid))
         return error.BaseNotAncestor;
 
-    // 6. reject merge commits
-    // FIXME: m2
+    // reject merge commits
     var history = try git.history(base_oid, work_oid);
     defer history.deinit(allocator);
     if (!history.linear) return error.MergeCommitsUnsupported;
 
-    // 7. claim the anchor; `create` fails if a concurrent init won the race
+    // claim the anchor; `create` fails if a concurrent init won the race
     const anchor: Git.ExpectedRef = .{ .name = layout.anchor_ref, .oid = base_oid };
     try git.transact("stakrr: init", &.{.{ .create = anchor }});
     errdefer git.transact("stakrr: init rollback", &.{.{ .delete = anchor }}) catch {};
 
-    // 8. persist the branch pair
+    // persist the branch pair
     const state = try std.fmt.allocPrint(
         allocator,
         layout.state_version ++ " {s} {s}",
@@ -207,9 +206,6 @@ fn loadConfig(git: *const Git) !Config {
     };
 }
 
-// Inspection alone needs cumulative depths to sort boundaries by ancestry.
-const Boundary = struct { ref_name: []const u8, oid: []const u8, branch_oid: []const u8, depth: usize };
-
 pub fn inspect(parent_git: *const Git) !Snapshot {
     try parent_git.ensureWorkTree();
 
@@ -233,7 +229,6 @@ pub fn inspect(parent_git: *const Git) !Snapshot {
     const history = try git.history(config.anchor_oid, work_oid);
 
     // only supports linear history
-    // FIXME: m2
     if (!history.linear) return error.MergeCommitsUnsupported;
 
     var depths: std.StringHashMapUnmanaged(usize) = .empty;
@@ -245,31 +240,31 @@ pub fn inspect(parent_git: *const Git) !Snapshot {
     const records = try git.listRefs(layout.record_prefix);
     if (records.refs.len != listed.refs.len) return error.InvalidStack;
 
-    var layers: std.ArrayList(Boundary) = .empty;
-
-    for (listed.refs) |ref| {
-        const record = try layout.recordRef(allocator, ref.name);
-        const recorded = for (records.refs) |candidate| {
-            if (std.mem.eql(u8, candidate.name, record)) break candidate.oid;
-        } else return error.InvalidStack;
+    // Both listings have the same suffix order. Match them in one pass,
+    // keeping cumulative depths in `commits` until the layers are sorted.
+    const layers = try allocator.alloc(Layer, listed.refs.len);
+    for (listed.refs, records.refs, layers) |ref, record, *layer| {
+        if (!std.mem.eql(u8, layout.layerName(ref.name).?, record.name[layout.record_prefix.len..]))
+            return error.InvalidStack;
+        const recorded = record.oid;
 
         // every recorded boundary must sit on the chain between the anchor and
         // work; the branch itself may have moved on since
         const depth = depths.get(recorded) orelse
             return error.InvalidStack;
 
-        try layers.append(allocator, .{
+        layer.* = .{
             .ref_name = ref.name,
             .oid = recorded,
             .branch_oid = ref.oid,
-            .depth = depth,
-        });
+            .commits = depth,
+        };
     }
 
     // order by distance from anchor, not branch name
-    std.mem.sort(Boundary, layers.items, {}, struct {
-        fn lessThan(_: void, a: Boundary, b: Boundary) bool {
-            return a.depth < b.depth;
+    std.mem.sort(Layer, layers, {}, struct {
+        fn lessThan(_: void, a: Layer, b: Layer) bool {
+            return a.commits < b.commits;
         }
     }.lessThan);
 
@@ -277,26 +272,20 @@ pub fn inspect(parent_git: *const Git) !Snapshot {
     var previous_oid = config.anchor_oid;
     var previous_depth: usize = 0;
 
-    const result = try allocator.alloc(Layer, layers.items.len);
-    for (layers.items, result) |layer, *out| {
+    for (layers) |*layer| {
+        const depth = layer.commits;
         // each layer must introduce at least one commit
-        if (layer.depth <= previous_depth)
+        if (depth <= previous_depth)
             return error.InvalidLayerBoundary;
 
-        out.* = .{
-            .ref_name = layer.ref_name,
-            .oid = layer.oid,
-            .branch_oid = layer.branch_oid,
-            .commits = layer.depth - previous_depth,
-        };
-
+        layer.commits = depth - previous_depth;
         previous_oid = layer.oid;
-        previous_depth = layer.depth;
+        previous_depth = depth;
     }
 
     // the private tip guard must match the highest committed layer
     const tip = try git.readRef(layout.tip_ref);
-    if (layers.items.len == 0) {
+    if (layers.len == 0) {
         if (tip != null) return error.InvalidStack;
     } else {
         const tip_oid = tip orelse return error.InvalidStack;
@@ -305,7 +294,7 @@ pub fn inspect(parent_git: *const Git) !Snapshot {
 
     return .{
         .config = config,
-        .layers = result,
+        .layers = layers,
         .work_oid = work_oid,
         .unstacked_commits = chain_len - previous_depth,
         .base_moved = !std.mem.eql(
@@ -530,12 +519,8 @@ fn navigationRef(snapshot: *const Snapshot, index: usize) []const u8 {
 
 /// Returns false when already at the requested end of the stack.
 pub fn navigate(git: *const Git, direction: Direction) !bool {
-    const guard = try coordination.lock(git);
+    const guard = try coordination.lockStack(git);
     defer guard.close(git.io);
-    if (try git.readRef(layout.session_ref)) |oid| {
-        git.allocator.free(oid);
-        return error.EditInProgress;
-    }
     var snapshot = try inspect(git);
     defer snapshot.deinit();
 
@@ -560,12 +545,8 @@ pub fn navigate(git: *const Git, direction: Direction) !bool {
 /// Switch to a layer's branch by its short name. Commits made there are picked
 /// up by the next restack.
 pub fn go(git: *const Git, name: []const u8) !void {
-    const guard = try coordination.lock(git);
+    const guard = try coordination.lockStack(git);
     defer guard.close(git.io);
-    if (try git.readRef(layout.session_ref)) |oid| {
-        git.allocator.free(oid);
-        return error.EditInProgress;
-    }
     var snapshot = try inspect(git);
     defer snapshot.deinit();
     for (snapshot.layers) |layer| {

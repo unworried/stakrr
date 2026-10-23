@@ -28,6 +28,14 @@ checkpoint. Keep history inspection batched and publish refs with the journal
 in one compare-and-swap transaction. Recovery tests kill the process around
 those checkpoints; preserve their coverage when changing edit phases.
 
+## // command behavior
+
+[Git command flows](docs/git-flow.md) is the implementation contract for every
+shipped command. Follow its check order, allowed Git mutations, transaction
+boundaries and recovery rules. When changing behavior, update the matching flow
+and regression coverage in the same change. Keep the README focused on usage;
+keep the exact command flow in that one reference.
+
 ## // commits
 
 [conventional commits](https://www.conventionalcommits.org), lowercase,

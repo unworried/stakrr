@@ -362,31 +362,25 @@ fn loadReplayPlan(git: *const Git, s: *const Session) ![]const []const u8 {
         error.GitFailed => return error.InvalidEditSession,
         else => return err,
     };
-    var queue: std.ArrayList([]const u8) = .empty;
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    defer seen.deinit(git.allocator);
-    var commits = std.mem.tokenizeScalar(u8, plan, '\n');
-    while (commits.next()) |commit| {
-        if (!validOid(commit, s.id.len) or
-            (try seen.getOrPut(git.allocator, commit)).found_existing)
-            return error.InvalidEditSession;
-        try queue.append(git.allocator, commit);
-    }
-    if (queue.items.len != progress.plan_len) return error.InvalidEditSession;
+    defer git.allocator.free(plan);
 
-    // Boundaries alone cannot detect missing or reordered commits between cuts.
+    // Exact history comparison also rejects malformed and duplicate IDs;
+    // boundaries alone cannot detect missing or reordered commits between cuts.
     var history = try git.history(
         s.nodes[s.active].published_oid,
         s.workNode().published_oid,
     );
-    defer history.deinit(git.allocator);
-    if (history.commits.len != queue.items.len) return error.InvalidEditSession;
-    for (queue.items, history.commits) |commit, expected| {
+    errdefer history.deinit(git.allocator);
+    if (!history.linear or history.commits.len != progress.plan_len) return error.InvalidEditSession;
+    var commits = std.mem.tokenizeScalar(u8, plan, '\n');
+    for (history.commits) |expected| {
+        const commit = commits.next() orelse return error.InvalidEditSession;
         if (!std.mem.eql(u8, commit, expected)) return error.InvalidEditSession;
     }
+    if (commits.next() != null) return error.InvalidEditSession;
 
     // Every descendant boundary must occur in order, including coincident
     // work/top-cut tips. This also makes replay's advancing cursor safe.
-    if (s.boundaryAfter(queue.items) != s.nodes.len) return error.InvalidEditSession;
-    return queue.items;
+    if (s.boundaryAfter(history.commits) != s.nodes.len) return error.InvalidEditSession;
+    return history.commits;
 }
