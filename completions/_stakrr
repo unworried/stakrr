@@ -1,0 +1,79 @@
+#compdef stakrr
+
+_stakrr_cuts() {
+  local -a cuts
+  cuts=("${(@f)$(git for-each-ref --format='%(refname:strip=3)' refs/stakrr/layers/ 2>/dev/null)}")
+  _wanted cuts expl 'cut' compadd -a cuts
+}
+
+_stakrr_branches() {
+  local -a branches
+  branches=("${(@f)$(git for-each-ref --format='%(refname:strip=2)' refs/heads/ 2>/dev/null)}")
+  _wanted branches expl 'local branch' compadd -a branches
+}
+
+_stakrr_revisions() {
+  local -a revisions
+  revisions=(HEAD "${(@f)$(git for-each-ref --format='%(refname:short)' refs/heads/ refs/remotes/ refs/tags/ 2>/dev/null)}")
+  _wanted revisions expl 'revision' compadd -a revisions
+}
+
+local context state state_descr line
+local -A opt_args
+local -a commands
+
+commands=(
+  'init:Adopt the current branch as rolling work'
+  'cut:Cut the next layer'
+  'status:Show the stack'
+  'reset:Forget the stack'
+  'version:Print the version'
+  'fix:Fold staged changes into a cut'
+  'go:Switch to a cut'
+  'up:Move up the stack'
+  'down:Move down the stack'
+  'restack:Replay changes above a cut'
+  'continue:Resume a restack after a conflict'
+  'abort:Restore the stack before a pending restack'
+  'log:List edit checkpoints'
+  'quit:Drop a pending restack'
+  'undo:Reverse the last restack or fix'
+  'help:Show help'
+)
+
+_arguments -C \
+  '(- *)--help[Show help]' \
+  '(- *)-h[Show help]' \
+  '(- *)--version[Print the version]' \
+  '1:command:->command' \
+  '*::argument:->arguments' && return
+
+case $state in
+  command)
+    _describe 'command' commands
+    ;;
+  arguments)
+    case $words[1] in
+      init)
+        _arguments '--base=[Base branch]:local branch:_stakrr_branches'
+        ;;
+      go)
+        _arguments '1:cut:_stakrr_cuts'
+        ;;
+      fix)
+        _arguments \
+          '(-m)--amend[Amend the selected cut]' \
+          '(--amend)-m[Commit message]:message:' \
+          '1:cut:_stakrr_cuts'
+        ;;
+      cut)
+        _arguments \
+          '--at=[Commit boundary]:revision:_stakrr_revisions' \
+          '1:new cut name:'
+        ;;
+      reset)
+        _arguments '--delete-layers[Also delete layer branches]'
+        ;;
+    esac
+    ;;
+esac

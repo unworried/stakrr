@@ -179,6 +179,7 @@ fn publicationTransportFailure(fault: []const u8, expected_error: anyerror) !voi
         try before.expectUnchanged(&repo);
         if (result.code == null) std.debug.print("ref publication terminated abnormally:\n{s}\n", .{result.stderr});
         try expectDriverError(result, expected_error);
+        try expectAbsent(&repo, layout.transaction_ref);
 
         // The same request must succeed through real Git when the transport
         // fault is removed, ruling out an invalid transaction as the cause.
@@ -245,6 +246,7 @@ fn publicationCase(format: []const u8, kind: PublicationCase, inject: bool, lock
         }
         try expectDirect(&repo, "refs/stakrr/unrelated", new);
     }
+    try expectAbsent(&repo, layout.transaction_ref);
     if (lock_probe) {
         const status = try repo.tmp.dir.readFileAlloc(testing.io, repo.env.get("STAKRR_TEST_LOCK_MARKER").?, testing.allocator, .limited(32));
         defer testing.allocator.free(status);
@@ -319,6 +321,7 @@ fn resetRefCase(format: []const u8, name: []const u8, delete_layers: bool, dangl
     try before.expectUnchanged(&repo);
     try expectSymbolic(&repo, name);
     if (dangling) try expectAbsent(&repo, victim) else try expectDirect(&repo, victim, old);
+    try expectAbsent(&repo, layout.transaction_ref);
     try testing.expectError(error.SymbolicRef, result);
 }
 
@@ -529,6 +532,7 @@ test "reset refuses to delete the checked-out layer through branch aliases" {
 
             try testing.expectError(error.LayerCheckedOut, reset(&repo, true));
             try before.expectUnchanged(&repo);
+            try expectAbsent(&repo, layout.transaction_ref);
 
             // The aliases themselves must not prevent deletion once the layer
             // is no longer checked out.

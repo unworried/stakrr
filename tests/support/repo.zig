@@ -40,7 +40,8 @@ pub const Repo = struct {
             "init", "-q", "-b", "main", "--object-format", options.object_format,
         });
 
-        // never depend on identity/signing settings.
+        // never depend on identity/signing settings. keep in sync with
+        // scripts/mktemprepo.sh
         try repo.exec(&.{
             "config", "--local", "user.name", "Stakrr Test",
         });
@@ -66,8 +67,7 @@ pub const Repo = struct {
         self: *const Repo,
         args: []const []const u8,
     ) !void {
-        const output = try self.git.output(args);
-        defer self.git.allocator.free(output);
+        try self.git.exec(args);
     }
 
     /// make an empty commit, returning its owned oid

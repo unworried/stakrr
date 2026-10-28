@@ -28,7 +28,8 @@ history each time.
 
 - `gh stack` is slow, and i kept building stacks as an afterthought anyway
 - a cut only creates a branch. no rebases, no rewritten commits
-- every ref update is compare-and-swap, so a racing or aborted cut changes nothing
+- ref updates use compare-and-swap: refused cuts leave refs unchanged, and
+  interrupted publication can resume
 
 ## // install
 
@@ -36,7 +37,7 @@ grab a build from [releases](https://github.com/unworried/stakrr/releases),
 verify it and put it on your `PATH`:
 
 ```sh
-tag=v0.1.0
+tag=v0.1.1             # choose a published tag from the releases page
 target=aarch64-macos   # x86_64-macos · aarch64-linux-musl · x86_64-linux-musl
 curl -fsSLO https://github.com/unworried/stakrr/releases/download/$tag/stakrr-$tag-$target.tar.gz
 curl -fsSLO https://github.com/unworried/stakrr/releases/download/$tag/SHA256SUMS
@@ -50,6 +51,33 @@ or build from source with zig 0.17.0:
 zig build -Doptimize=ReleaseSafe   # → zig-out/bin/stakrr
 ```
 
+For zsh tab completion, add the repository's `completions` directory to your
+`fpath` in `~/.zshrc`, before `compinit`:
+
+```zsh
+fpath=(/absolute/path/to/stakrr/completions $fpath)
+autoload -Uz compinit
+compinit
+```
+
+If your shell framework already runs `compinit`, put the `fpath` line before
+loading the framework. Restart your shell after updating the configuration.
+Completion covers commands, flags, cut names for `go` and `fix`, local branches
+for `init --base`, and refs for `cut --at`.
+
+## // compatibility and limits
+
+- `fix` requires Git 2.40 or newer for `merge-tree --merge-base`.
+- Stack ref discovery requires Git's files ref storage (loose and packed refs).
+  Reftable storage is unsupported for commands that discover stack refs.
+- Base/work branches, layer branches and internal refs must be direct refs.
+  Symbolic managed refs are rejected; HEAD itself may remain symbolic.
+- `restack` requires a clean index and working tree with no untracked or ignored
+  files. Preserve and remove ignored files, including unrelated build output,
+  before replaying descendants; stakrr does not remove them for you.
+- This release supports local stack editing and recovery. Remote publication
+  (`submit`) and restacking onto a moved base remain planned.
+
 ## // usage
 
 ```sh
@@ -62,6 +90,115 @@ stakrr cut models --at HEAD~3    # oldest work becomes stakrr/models
 stakrr cut api                   # everything since, up to the tip, becomes stakrr/api
 stakrr status
 ```
+
+## // fixing earlier cuts
+
+To fold changes into a lower cut without leaving your rolling branch, stage them
+and run `stakrr fix`:
+
+```sh
+git add model.zig
+stakrr fix models -m "validate input"   # new commit on stakrr/models
+stakrr fix models --amend               # or amend its last commit
+stakrr fix -m "tidy"                    # the highest cut when none is named
+```
+
+Everything above the cut is replayed with in-memory merges, so unstaged edits and
+the worktree are never touched, and the staged changes end up in history instead
+of the index. If the change conflicts with the cut or a later commit, or replaying
+it would not reproduce your index, nothing changes; use `stakrr go <cut>` to
+resolve it by hand. `stakrr undo` reverses a fix. Needs Git 2.40 or newer.
+
+## // editing earlier cuts
+
+Use ordinary Git on a cut. Switch to its branch, commit or amend, then `restack`
+to replay everything above it:
+
+```sh
+stakrr go models                  # or: git switch stakrr/models
+# edit files...
+git add model.zig
+git commit -m "fix validation"    # git commit --amend also works
+stakrr restack                    # replay descendants; you stay where you are
+```
+
+Each cut records where it was last published (`refs/stakrr/layers/<name>`).
+A cut whose branch has moved past that record is *stale*: `stakrr status` marks
+it, and `restack` replays the commits above its old boundary onto the new one,
+including unstacked rolling work. Nothing happens until you restack, so you can
+commit as many times as you like first. Only one cut may be stale at a time;
+restack before changing another. `cut` and `fix` refuse while a cut is stale.
+
+Empty commits stay present; upper-layer deletions stay deletions, with normal Git
+conflicts if an edit changes a file deleted above it. A cut must keep at least one
+linear commit above its previous boundary. Changing earlier boundaries or merging
+branches inside an edit is unsupported.
+
+`restack` requires a clean index and working tree, including untracked files. No
+implicit commits or stashes are made. Before replaying, preserve and remove **all
+ignored files**, including unrelated build output: Git's rename handling can write
+paths absent from the incoming commit's diff. `go`, `up` and `down` only switch
+branches, so they work with unrelated ignored files present but refuse to
+overwrite them. While a restack is pending, `init`, `cut`, `fix`, `reset`, `go`,
+`up`, `down` and `undo` are blocked in every worktree.
+
+On a conflict, the restack stays pending and its state is saved:
+
+```sh
+stakrr status
+# resolve conflicts, using git rm for a deletion if appropriate...
+git add <resolved-files>
+stakrr continue
+```
+
+`stakrr continue` works after restarting stakrr. A manually committed resolution also
+works. Replay temporarily uses detached HEAD; do not switch branches during it, and
+you return to the branch you ran `restack` from. The rewritten boundaries, recorded
+boundaries, rolling branch and internal tip are published together only after replay
+completes. Automated replay commits bypass hooks and signing; ordinary commits you
+create keep your normal Git configuration.
+
+`stakrr abort` restores the stack from before the restack: every boundary and branch
+goes back to its recorded position, including the commits you made on the stale cut.
+Those commits stay reachable through the operation log (`stakrr log`). It requires
+clean work: commit or otherwise preserve conflict resolutions and other uncommitted
+changes first. It never runs `reset --hard` or discards files.
+
+After a restack or fix finishes, `stakrr undo` restores the branch positions from
+before it. It refuses if a managed branch or guard has moved since the edit,
+if work is uncommitted, or if an affected branch is checked out in another
+worktree. An undo is recorded as an operation too: run `stakrr undo` again to
+undo that undo. Interrupted restorations resume with `stakrr continue`.
+
+`stakrr log` lists checkpoints newest first, including an active session. Each
+line gives an ISO 8601 timestamp, a readable step label, the before → after OIDs
+of moved branches, and a rescue commit:
+
+```sh
+stakrr log
+git branch rescue <commit-from-the-rescue-column>
+```
+
+Completed sessions remain reachable from `refs/stakrr/oplog`. Checkpoints keep
+original boundaries and observed edit/replay commits reachable even after
+`git gc --prune=now`. Retention is intentional and has no automatic expiry. Direct Git
+commands in other processes do not take stakrr's lock; avoid concurrent manual
+branch updates or worktree changes during an edit. Detected external changes
+stop the operation and name the ref or HEAD that moved, with the commands to
+keep it on a rescue branch and restore the expected value:
+
+```sh
+error: Git refs or HEAD changed outside the edit workflow; ...
+hint: refs/heads/stakrr/api is at 9f8e7d6..., expected 1a2b3c4...
+hint: keep it:    git branch rescue/stakrr/api 9f8e7d6...
+hint: restore it: git update-ref refs/heads/stakrr/api 1a2b3c4... 9f8e7d6...
+```
+
+To keep the changed state instead, `stakrr quit` drops the pending restack like
+`git rebase --quit`: HEAD, the index, files and branches stay as they are, and
+HEAD plus the checkpoint are retained in `refs/stakrr/oplog` (inspect them with
+`stakrr log`). It also works when the checkpoint is corrupt. Afterwards
+`stakrr status` may need `stakrr reset`.
 
 ## // model
 
@@ -92,15 +229,27 @@ stakrr status
 | ● | `stakrr cut <name> [--at <rev>]` | cut the next layer at `<rev>`, the tip by default |
 | ● | `stakrr status` | draw the stack: layers, commit counts, unstacked work |
 | ● | `stakrr reset [--delete-layers]` | forget the stack so it can be re-initialised |
-| ● | `stakrr up` / `stakrr down` | switch between the base, layers, and rolling work |
 | ● | `stakrr version` | print the version |
-| ○ | `stakrr amend` | amend a lower layer and restack the descendants |
+| ● | `stakrr fix [<cut>] -m <msg>\|--amend` | fold staged changes into a cut and replay what sits above it |
+| ● | `stakrr go <cut>` | switch to a cut's branch to edit it with ordinary commits |
+| ● | `stakrr restack` | replay what sits above a cut you committed on |
+| ● | `stakrr continue` | resume a restack after a conflict |
+| ● | `stakrr abort` | restore the stack from before a pending restack |
+| ● | `stakrr log` | list edit checkpoints, branch moves and rescue commits |
+| ● | `stakrr quit` | drop a pending restack, leaving HEAD and every branch as they are |
 | ○ | `stakrr submit` | publish review branches, excluding rolling work |
-| ○ | `stakrr undo` | restore the previous stakrr operation |
+| ● | `stakrr undo` | reverse the last restack or fix, including an undo |
 
 <sub>● shipped · ○ planned for m2</sub>
 
+Exit codes: 0 success, 1 failure, 2 usage, 3 replay conflict pending, 4 tree not
+clean enough to proceed (dirty, ignored files, or a Git operation running), 5 refs
+or HEAD changed outside stakrr.
+
 ## // internals
+
+See [Git command flows](docs/git-flow.md) for each command's ordered checks,
+Git mutations, publication transactions and recovery behavior.
 
 | ref | holds |
 | --- | --- |
@@ -108,31 +257,62 @@ stakrr status
 | `refs/stakrr/anchor` | the base commit at `init`, which also keeps it reachable for gc |
 | `refs/stakrr/tip` | concurrency guard at the highest layer, compare-and-swapped in the same ref transaction as each new layer |
 | `refs/heads/stakrr/*` | layer branches |
+| `refs/stakrr/layers/<name>` | where each cut was last published; the cut's branch differing from it means it is stale |
+| `refs/stakrr/edit` | v2 checkpoint commit for the pending restack, shared by all worktrees and bound to one owner |
+| `refs/stakrr/oplog` | latest completed checkpoint, retaining previous sessions and undo operations |
+| `refs/stakrr/transaction` | pending ref publication, retaining old/new values until recovery completes |
+| `<git-common-dir>/stakrr.lock` | advisory lock held for each stakrr mutation; released automatically on process exit |
 
-don't edit the internal refs by hand. an aborted cut leaves every ref
+Each v2 checkpoint tree contains `session.json`, an immutable replay `plan`
+when needed, and the previous checkpoint and rescue metadata. Its first parent
+is the previous checkpoint; additional parents retain original and rewritten
+commits, as in `git stash`. The session ref advances in the same compare-and-swap
+transaction as branch publication. Finishing, aborting or quitting updates the
+oplog and deletes the active ref in one transaction.
+
+don't edit the internal refs by hand. a refused cut leaves every ref
 unchanged. stakrr runs the `git` on your `PATH` and inherits the environment
 (`GIT_DIR` and friends).
 
 ## // recovery
 
-`status` and `cut` refuse to run when the stack no longer matches the rolling
+During a restack, inspect `stakrr status` and use `stakrr continue` after a
+crash. Use `abort` to restore the stack from before the restack, or `quit` to
+keep the current Git state and drop it. Preserve
+uncommitted work first. `stakrr log` shows retained commits both during and after
+a session; create a rescue branch from the listed commit before experimenting.
+
+If Git is interrupted while publishing refs, stakrr retains the intended update.
+`status` and `log` report it; run `stakrr continue` to finish. The next mutating
+command also recovers it before proceeding. Recovery stops if a ref has an
+unexpected value or a branch that still needs moving is occupied in another
+worktree. Git lock files are preserved; remove a stale Git lock only after
+checking that no Git process owns it, then retry.
+
+Outside a managed edit, `status` and `cut` refuse to run when the stack no longer matches the rolling
 branch: after rebasing work past the base, deleting a layer branch, or upgrading
-from an incompatible state version. to start over:
+from an incompatible state version. To start over, preserve any layer branches
+you need under names outside `stakrr/*`, then remove the old stack and initialise
+again:
 
 ```sh
-stakrr reset                  # drop stakrr state, keep stakrr/* branches
-stakrr reset --delete-layers  # also delete the stakrr/* layer branches
+stakrr reset --delete-layers  # drop stack state and stakrr/* layer branches
 stakrr init --base main
 ```
 
+Use `stakrr reset` without `--delete-layers` to drop stack state while keeping
+the layer branches. Those branches must be renamed or removed before `init`
+can succeed.
+
 `reset` never touches the rolling branch, `HEAD`, the index or the working
-tree, and refuses to delete layers while one of them is checked out.
+tree, and refuses to delete layers while one of them is checked out in any
+worktree.
 
 ## // roadmap
 
 ```
-m1  safe rolling stacks      ■■■■  init · cut · status · reset, no history rewrites
-m2  publishing + recovery    □□□□  submit via gh stack · operation journal · undo
+m1  safe rolling stacks      ■■■□  init · cut · status · reset, no history rewrites
+m2  publishing + recovery    ■■■□  operation journal · log · undo · submit via gh stack (planned)
 m3  patch-level extraction   □□□□  move hunks into a lower layer · replay descendants
 ```
 
@@ -153,34 +333,3 @@ using it.
 ---
 
 <sub>[changelog](CHANGELOG.md) · [contributing](CONTRIBUTING.md) · [mit](LICENSE)</sub>
-
-## // editing earlier cuts
-
-Use `stakrr go <cut>` to switch to a layer, then commit or amend with Git.
-`stakrr status` marks changed layers as stale. Run `stakrr restack` to replay
-what follows the changed layer and return to the branch where you started.
-Only one layer may be stale at a time. Replaying descendants requires a clean
-worktree with no ignored files.
-
-For a conflict, resolve files, stage them, and run `stakrr continue`. Preserve
-uncommitted resolutions before `stakrr abort`, which restores the original
-recorded boundaries. `stakrr quit` drops a pending session while retaining HEAD,
-branches and recovery history; the stack may then need `stakrr reset`.
-
-`stakrr log` shows retained checkpoints and rescue commits. `stakrr undo`
-reverses the last completed restack or undo, provided its published refs still
-match. Sessions belong to their originating worktree.
-
-Exit codes are 0 success, 1 failure, 2 usage, 3 replay conflict pending,
-4 dirty or ignored work or an active Git operation, and 5 externally changed
-edit or publication state.
-
-## // fixing staged changes
-
-On the rolling work branch, stage a correction and run
-`stakrr fix <cut> -m "correction"`. Omit the cut to target the highest layer,
-or use `--amend` to keep that layer tip's metadata. Fix folds the staged tree
-into the target and replays descendants in object storage before publishing.
-Conflicts refuse publication. HEAD, the index tree and working files stay in
-place, preserving unstaged edits. `stakrr undo` restores the previous refs.
-Explicit-base merges require Git 2.40 or newer.

@@ -41,6 +41,7 @@ test "cut CAS refusal after intent creation does not leave recovery pending" {
             try repo.expectRef(ref.name, if (std.mem.eql(u8, ref.name, "refs/heads/work")) raced else ref.oid);
         }
         try repo.expectNoRef("refs/heads/stakrr/rolling");
+        try repo.expectNoRef(stakrr.layout.record_prefix ++ "rolling");
         try repo.expectNoRef(intent_ref);
         try expectSuccess(&repo, &.{"status"});
         try expectSuccess(&repo, &.{ "cut", "rolling" });
