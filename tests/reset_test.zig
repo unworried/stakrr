@@ -168,7 +168,7 @@ test "reset refuses to delete a layer checked out in another worktree" {
         try repo.exec(&.{ "worktree", "add", "-q", "linked\nbranch refs/heads/stakrr/other", "stakrr/p1" });
         if (detached) try repo.exec(&.{ "switch", "-q", "--detach", "HEAD" });
 
-        try testing.expectError(error.LayerCheckedOut, stack.reset(&repo.git, true));
+        try testing.expectError(error.BranchOccupied, stack.reset(&repo.git, true));
 
         // Refusal must leave both the shared state and the linked HEAD intact.
         var snapshot = try stack.inspect(&repo.git);
