@@ -129,6 +129,24 @@ test "cli: navigate between work, layers and base without moving their refs" {
     }
 }
 
+test "cli: status renders a detached HEAD without selecting a branch" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try setup(&repo);
+
+    const init = try stakrr(&repo, &.{ "init", "--base", "main" });
+    defer init.deinit();
+    try testing.expectEqual(@as(u8, 0), init.code);
+    try repo.exec(&.{ "switch", "--detach", "-q", "HEAD" });
+
+    const status = try stakrr(&repo, &.{"status"});
+    defer status.deinit();
+    try testing.expectEqual(@as(u8, 0), status.code);
+    try testing.expectEqualStrings("", status.stderr);
+    try testing.expect(std.mem.indexOf(u8, status.stdout, "stack  main → work") != null);
+    try testing.expect(std.mem.indexOf(u8, status.stdout, "▸") == null);
+}
+
 test "cli: failures print one clean message and exit non-zero" {
     var repo = try Repo.init();
     defer repo.deinit();

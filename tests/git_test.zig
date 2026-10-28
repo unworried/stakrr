@@ -37,7 +37,7 @@ test "ensureWorkTree rejects a bare repository" {
     );
 }
 
-test "ensureWorkTree rejects an invalid repository" {
+test "invalid repositories are failures rather than detached HEAD" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -50,17 +50,22 @@ test "ensureWorkTree rejects an invalid repository" {
     const env = try support.hermeticEnv();
     defer support.destroyEnv(env);
 
+    var diagnostics: stakrr_git.Diagnostics = .{};
     const git = Git{
         .allocator = testing.allocator,
         .io = testing.io,
         .cwd = tmp.dir,
         .environ_map = env,
+        .diagnostics = &diagnostics,
     };
 
     try testing.expectError(
         error.NotGitRepository,
         git.ensureWorkTree(),
     );
+    try testing.expectError(error.GitFailed, git.head());
+    try testing.expectError(error.GitFailed, git.currentBranch());
+    try testing.expect(diagnostics.stderr().len > 0);
 }
 
 test "currentBranch returns a full branch ref" {
@@ -75,6 +80,9 @@ test "currentBranch returns a full branch ref" {
         "refs/heads/main",
         branch,
     );
+    const head = (try repo.git.head()).?;
+    defer testing.allocator.free(head);
+    try testing.expectEqualStrings(branch, head);
 }
 
 test "currentBranch rejects detached HEAD" {
@@ -92,6 +100,53 @@ test "currentBranch rejects detached HEAD" {
         error.DetachedHead,
         repo.git.currentBranch(),
     );
+    try testing.expect((try repo.git.head()) == null);
+}
+
+test "query distinguishes missing values from fatal Git errors" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    var diagnostics: stakrr_git.Diagnostics = .{};
+    repo.git.diagnostics = &diagnostics;
+
+    const output = (try repo.git.query(&.{ "rev-parse", "--is-inside-work-tree" }, 1)).?;
+    defer testing.allocator.free(output);
+    try testing.expectEqualStrings("true", output);
+    try testing.expect((try repo.git.query(&.{ "config", "--local", "--get-all", "stakrr.missing" }, 1)) == null);
+    try testing.expectEqual(@as(usize, 0), diagnostics.stderr().len);
+
+    try testing.expectError(error.GitFailed, repo.git.query(&.{ "rev-parse", "--verify", "refs/heads/missing" }, 1));
+    try testing.expect(diagnostics.stderr().len > 0);
+}
+
+test "check distinguishes negative answers from fatal Git errors" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    var diagnostics: stakrr_git.Diagnostics = .{};
+    repo.git.diagnostics = &diagnostics;
+
+    try testing.expect(try repo.git.check(&.{ "diff", "--cached", "--quiet" }, 1));
+    try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "staged.txt", .data = "staged\n" });
+    try repo.exec(&.{ "add", "staged.txt" });
+    try testing.expect(!try repo.git.check(&.{ "diff", "--cached", "--quiet" }, 1));
+    try testing.expectEqual(@as(usize, 0), diagnostics.stderr().len);
+
+    try testing.expectError(error.GitFailed, repo.git.check(&.{ "rev-parse", "--verify", "refs/heads/missing" }, 1));
+    try testing.expect(diagnostics.stderr().len > 0);
+}
+
+test "configUnset reports absence and removes every configured value" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    try testing.expect(!try repo.git.configUnset("stakrr.state"));
+    try repo.exec(&.{ "config", "--local", "--add", "stakrr.state", "first" });
+    try repo.exec(&.{ "config", "--local", "--add", "stakrr.state", "second" });
+    try testing.expect(try repo.git.configUnset("stakrr.state"));
+    try testing.expect((try repo.git.configGet("stakrr.state")) == null);
+    try testing.expect(!try repo.git.configUnset("stakrr.state"));
 }
 
 test "resolveCommit resolves a branch to its commit" {

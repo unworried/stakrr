@@ -49,8 +49,14 @@ pub fn isOid(text: []const u8) bool {
 /// or control characters. Git applies its full naming rules on use.
 pub fn isSafeBranchRef(text: []const u8) bool {
     const prefix = layout.branch_prefix;
-    if (!std.mem.startsWith(u8, text, prefix) or text.len == prefix.len)
-        return false;
+    return std.mem.startsWith(u8, text, prefix) and
+        text.len != prefix.len and
+        isProtocolSafe(text);
+}
+
+/// No whitespace or control bytes, which would split argv words or
+/// update-ref stdin lines.
+fn isProtocolSafe(text: []const u8) bool {
     for (text) |c| {
         if (c <= ' ' or c == 0x7f) return false;
     }
@@ -72,17 +78,22 @@ pub const Git = struct {
         return if (self.cwd) |dir| .{ .dir = dir } else .inherit;
     }
 
+    /// `git` followed by `args`; the caller frees the slice, not its items.
+    fn argvFor(self: *const Git, args: []const []const u8) ![]const []const u8 {
+        const argv = try self.allocator.alloc([]const u8, args.len + 1);
+        argv[0] = "git";
+        @memcpy(argv[1..], args);
+        return argv;
+    }
+
     /// execute git and return its raw result
     /// the caller owns stdout and stderr
     pub fn run(
         self: *const Git,
         args: []const []const u8,
     ) !std.process.RunResult {
-        const argv = try self.allocator.alloc([]const u8, args.len + 1);
+        const argv = try self.argvFor(args);
         defer self.allocator.free(argv);
-
-        argv[0] = "git";
-        @memcpy(argv[1..], args);
 
         return std.process.run(self.allocator, self.io, .{
             .argv = argv,
@@ -137,6 +148,27 @@ pub const Git = struct {
         if ((try exitCode(result)) != 0) return self.fail(result.stderr);
     }
 
+    /// Return owned, newline-trimmed stdout on success and null on `absent`;
+    /// any other exit status fails with diagnostics.
+    pub fn query(self: *const Git, args: []const []const u8, absent: u8) !?[]u8 {
+        const result = try self.run(args);
+        defer self.freeResult(result);
+        const code = try exitCode(result);
+        if (code == absent) return null;
+        if (code != 0) return self.fail(result.stderr);
+        return try self.allocator.dupe(u8, std.mem.trimEnd(u8, result.stdout, "\r\n"));
+    }
+
+    /// True on success, false on exit status `no`; any other status fails.
+    pub fn check(self: *const Git, args: []const []const u8, no: u8) !bool {
+        const result = try self.run(args);
+        defer self.freeResult(result);
+        const code = try exitCode(result);
+        if (code == no) return false;
+        if (code != 0) return self.fail(result.stderr);
+        return true;
+    }
+
     pub fn checkRefFormat(self: *const Git, ref_name: []const u8) !void {
         const result = try self.run(&.{ "check-ref-format", ref_name });
         defer self.freeResult(result);
@@ -145,22 +177,13 @@ pub const Git = struct {
 
     /// read the exact ref oid. a missing ref is distinct from a git failure
     pub fn readRef(self: *const Git, ref_name: []const u8) !?[]u8 {
-        const result = try self.run(&.{
+        return self.query(&.{
             "rev-parse",
             "--verify",
             "--quiet",
             "--end-of-options",
             ref_name,
-        });
-        defer self.freeResult(result);
-        return switch (try exitCode(result)) {
-            0 => try self.allocator.dupe(
-                u8,
-                std.mem.trimEnd(u8, result.stdout, "\r\n"),
-            ),
-            1 => null,
-            else => self.fail(result.stderr),
-        };
+        }, 1);
     }
 
     /// true if the range contains a merge commit (linear stacks only)
@@ -211,24 +234,14 @@ pub const Git = struct {
             return error.NotWorkingTree;
     }
 
-    /// returns the full current branch ref
-    /// example: refs/heads/work
+    /// The full current branch ref, or null when HEAD is detached.
+    pub fn head(self: *const Git) !?[]u8 {
+        return self.query(&.{ "symbolic-ref", "--quiet", "HEAD" }, 1);
+    }
+
+    /// Like `head`, but a detached HEAD is an error.
     pub fn currentBranch(self: *const Git) ![]u8 {
-        const result = try self.run(&.{
-            "symbolic-ref",
-            "--quiet",
-            "HEAD",
-        });
-        defer self.freeResult(result);
-
-        if ((try exitCode(result)) != 0)
-            return error.DetachedHead;
-
-        return self.allocator.dupe(u8, std.mem.trimEnd(
-            u8,
-            result.stdout,
-            "\r\n",
-        ));
+        return (try self.head()) orelse error.DetachedHead;
     }
 
     /// resolve a revision to an actual commit oid
@@ -254,65 +267,27 @@ pub const Git = struct {
         a: []const u8,
         b: []const u8,
     ) !bool {
-        const result = try self.run(&.{
-            "merge-base",
-            "--is-ancestor",
-            "--end-of-options",
-            a,
-            b,
-        });
-        defer self.freeResult(result);
-
-        return switch (try exitCode(result)) {
-            0 => true,
-            1 => false,
-            else => self.fail(result.stderr),
-        };
+        return self.check(&.{ "merge-base", "--is-ancestor", "--end-of-options", a, b }, 1);
     }
 
     pub fn configGet(
         self: *const Git,
         key: []const u8,
     ) !?[]u8 {
-        const result = try self.run(&.{
-            "config", "--local", "--get-all", key,
-        });
-        defer self.freeResult(result);
-
-        switch (try exitCode(result)) {
-            1 => return null,
-            0 => {},
-            else => return self.fail(result.stderr),
-        }
-
-        const value = std.mem.trimEnd(
-            u8,
-            result.stdout,
-            "\r\n",
-        );
+        const value = (try self.query(&.{ "config", "--local", "--get-all", key }, 1)) orelse
+            return null;
+        errdefer self.allocator.free(value);
 
         // stakrr expects exactly one config value
-        if (value.len == 0 or
-            std.mem.indexOfScalar(u8, value, '\n') != null)
-        {
+        if (value.len == 0 or std.mem.indexOfScalar(u8, value, '\n') != null)
             return error.InvalidGitConfig;
-        }
 
-        return try self.allocator.dupe(u8, value);
+        return value;
     }
 
     /// remove every value of a local config key; returns false if unset
     pub fn configUnset(self: *const Git, key: []const u8) !bool {
-        const result = try self.run(&.{
-            "config", "--local", "--unset-all", key,
-        });
-        defer self.freeResult(result);
-
-        return switch (try exitCode(result)) {
-            0 => true,
-            5 => false,
-            else => self.fail(result.stderr),
-        };
+        return self.check(&.{ "config", "--local", "--unset-all", key }, 5);
     }
 
     pub fn listStackRefs(self: *const Git) ![]u8 {
@@ -399,26 +374,20 @@ pub const Git = struct {
     }
 
     fn checkUpdate(name: []const u8, oids: []const []const u8) Error!void {
-        if (!std.mem.startsWith(u8, name, "refs/")) return error.InvalidRefName;
-        for (name) |c| {
-            if (c <= ' ' or c == 0x7f) return error.InvalidRefName;
-        }
+        if (!std.mem.startsWith(u8, name, "refs/") or !isProtocolSafe(name))
+            return error.InvalidRefName;
         for (oids) |oid| {
             if (!isOid(oid)) return error.InvalidOid;
         }
     }
 
     fn updateRefStdin(self: *const Git, message: []const u8, transaction: []const u8) !void {
+        const argv = try self.argvFor(&.{
+            "update-ref", "--no-deref", "--create-reflog", "-m", message, "--stdin",
+        });
+        defer self.allocator.free(argv);
         var child = try std.process.spawn(self.io, .{
-            .argv = &.{
-                "git",
-                "update-ref",
-                "--no-deref",
-                "--create-reflog",
-                "-m",
-                message,
-                "--stdin",
-            },
+            .argv = argv,
             .cwd = self.childCwd(),
             .environ_map = self.environ_map,
             .stdin = .pipe,
