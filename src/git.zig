@@ -19,6 +19,9 @@ pub const Error = error{
     StreamTooLong,
     UnsupportedGitVersion,
     UnsupportedRefStorage,
+    InvalidRefTransaction,
+    RefTransactionChanged,
+    RefTransactionPending,
 };
 
 /// Optional sink for the stderr of the last failed Git command.
@@ -439,15 +442,43 @@ pub const Git = struct {
         delete: ExpectedRef,
     };
 
-    /// Publish direct refs with compare-and-swap checks in one Git transaction.
-    /// Validate ref types under the prepared transaction locks before commit.
-    /// Names must be Git-valid refs and every oid a full object id.
-    /// Individual ref writes are crash-atomic; a crash can partly publish.
+    /// Publish with compare-and-swap and retain intent across partial Git writes.
     pub fn transact(
         self: *const Git,
         message: []const u8,
         updates: []const RefUpdate,
     ) !void {
+        return @import("ref_transaction.zig").transact(self, message, updates);
+    }
+
+    pub fn recoverTransaction(self: *const Git) !bool {
+        return @import("ref_transaction.zig").recover(self);
+    }
+
+    pub fn requireNoPendingTransaction(self: *const Git) !void {
+        return @import("ref_transaction.zig").requirePublished(self);
+    }
+
+    /// One Git transaction. Only individual ref writes are crash-atomic.
+    /// The journal uses this primitive to avoid recursively journaling itself.
+    pub fn transactRaw(
+        self: *const Git,
+        message: []const u8,
+        updates: []const RefUpdate,
+    ) !void {
+        var refused = false;
+        return self.transactRawWithRefusal(message, updates, &refused);
+    }
+
+    /// A normal failure before preparation or a type-check abort confirms no
+    /// requested refs changed. Interrupted commits and I/O errors are uncertain.
+    pub fn transactRawWithRefusal(
+        self: *const Git,
+        message: []const u8,
+        updates: []const RefUpdate,
+        refused: *bool,
+    ) !void {
+        refused.* = false;
         var transaction: Io.Writer.Allocating = .init(self.allocator);
         defer transaction.deinit();
         const w = &transaction.writer;
@@ -474,16 +505,15 @@ pub const Git = struct {
         try w.writeAll("prepare\n");
 
         const publication = try self.inputRefTransaction(message, transaction.written(), updates);
-        defer self.freeResult(publication.result);
-        if (publication.rejected or !publication.result.term.success())
-            return self.fail(publication.result.stderr);
-    }
-
-    fn checkUpdate(name: []const u8, oids: []const []const u8) Error!void {
-        if (!std.mem.startsWith(u8, name, "refs/") or !isProtocolSafe(name))
-            return error.InvalidRefName;
-        for (oids) |oid| {
-            if (!isOid(oid)) return error.InvalidOid;
+        const result = publication.result;
+        defer self.freeResult(result);
+        if (publication.rejected or !result.term.success()) {
+            // Git acknowledges prepare before it processes commit. An ordinary
+            // fatal exit with only the start acknowledgement is a refusal,
+            // rather than an interrupted commit that may have written refs.
+            refused.* = publication.rejected or (result.term == .exited and result.term.exited == 128 and
+                std.mem.eql(u8, result.stdout, "start: ok\n"));
+            return self.fail(result.stderr);
         }
     }
 
@@ -558,6 +588,14 @@ pub const Git = struct {
 
     fn writePreparedInput(io: Io, pipe: Io.File, data: []const u8) !void {
         try pipe.writeStreamingAll(io, data);
+    }
+
+    pub fn checkUpdate(name: []const u8, oids: []const []const u8) Error!void {
+        if (!std.mem.startsWith(u8, name, "refs/") or !isProtocolSafe(name))
+            return error.InvalidRefName;
+        for (oids) |oid| {
+            if (!isOid(oid)) return error.InvalidOid;
+        }
     }
 
     /// atomically create a layer and advance the internal tip guard

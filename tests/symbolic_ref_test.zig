@@ -634,3 +634,126 @@ test "reset checks layers from a linked worktree of a bare repository" {
         try expectAbsent(&view, subject);
     }
 }
+
+const RecoveryCase = enum { update_old, update_new, create_old, create_new, delete_old, delete_new, journal, journal_dangling };
+const Change = struct { name: []const u8, old: ?[]const u8, new: ?[]const u8 };
+
+fn recovery(kind: RecoveryCase, inject: bool, race_label: ?[]const u8) !void {
+    try eachFormat(recoveryCase, .{ kind, inject, race_label });
+}
+
+fn recoveryCase(format: []const u8, kind: RecoveryCase, inject: bool, race_label: ?[]const u8) !void {
+    var repo = try Repo.initOptions(.{ .object_format = format });
+    defer repo.deinit();
+    const old = try repo.commit("old");
+    defer testing.allocator.free(old);
+    const new = try repo.commit("new");
+    defer testing.allocator.free(new);
+    const creating = kind == .create_old or kind == .create_new;
+    const deleting = kind == .delete_old or kind == .delete_new;
+    const published = kind == .update_new or kind == .create_new or kind == .delete_new;
+    const changes = [_]Change{
+        .{ .name = subject, .old = if (creating) null else old, .new = if (deleting) null else new },
+        .{ .name = "refs/stakrr/collateral", .old = old, .new = new },
+    };
+    const actual = if (published) changes[0].new else changes[0].old;
+    try restore(&repo, subject, actual);
+    // For cleanup races publication is already complete; cleanup must still
+    // refuse a symbolic journal, without deleting its unrelated target.
+    const cleanup = if (race_label) |label| std.mem.eql(u8, label, "stakrr: finish transaction") else false;
+    try restore(&repo, "refs/stakrr/collateral", if (cleanup) new else old);
+    const metadata = try std.json.Stringify.valueAlloc(testing.allocator, .{
+        .version = @as(u8, 1),
+        .label = "test symbolic recovery",
+        .changes = &changes,
+    }, .{});
+    defer testing.allocator.free(metadata);
+    const blob = try repo.git.writeBlob(metadata);
+    defer testing.allocator.free(blob);
+    const tree = try repo.git.writeTree(&.{.{ .name = "transaction.json", .oid = blob }});
+    defer testing.allocator.free(tree);
+    const saved = try repo.git.commitTree(tree, &.{ old, new }, "pending publication");
+    defer testing.allocator.free(saved);
+    try restore(&repo, layout.transaction_ref, saved);
+    const journal = kind == .journal or kind == .journal_dangling or cleanup;
+    const name = if (journal) layout.transaction_ref else subject;
+    const initial: ?[]const u8 = if (kind == .journal_dangling) null else if (journal) saved else actual;
+
+    if (inject) {
+        if (race_label) |label| try race(&repo, label, name);
+        try alias(&repo, name, initial);
+        var before = try Snapshot.capture(&repo);
+        defer before.deinit();
+        if (race_label != null) try restore(&repo, name, initial);
+
+        const result = try driver(&repo, &.{"recover"});
+        defer result.deinit();
+        if (race_label != null) try expectRaceFired(&repo);
+        try before.expectUnchanged(&repo);
+        try expectSymbolic(&repo, name);
+        if (initial) |oid| try expectDirect(&repo, victim, oid) else try expectAbsent(&repo, victim);
+        if (kind != .journal_dangling)
+            try repo.expectOutput(&.{ "rev-parse", "--verify", layout.transaction_ref }, saved);
+        // The recovery contract treats an unexpected ref identity like an
+        // unexpected OID (RefTransactionChanged).
+        try expectDriverError(result, if (race_label == null) error.RefTransactionChanged else error.GitFailed);
+
+        // Refusal must leave a usable intent. Repair only the substituted
+        // ref, then let real recovery finish the original operation.
+        _ = repo.env.swapRemove("STAKRR_TEST_SYMREF_LABEL");
+        try restore(&repo, name, if (journal) saved else initial);
+    }
+    const recovered = try driver(&repo, &.{"recover"});
+    defer recovered.deinit();
+    try testing.expectEqual(@as(?u8, 0), recovered.code);
+    if (changes[0].new) |oid| try expectDirect(&repo, subject, oid) else try expectAbsent(&repo, subject);
+    try expectDirect(&repo, "refs/stakrr/collateral", new);
+    try expectAbsent(&repo, layout.transaction_ref);
+    if (inject) {
+        if (initial) |oid| try expectDirect(&repo, victim, oid) else try expectAbsent(&repo, victim);
+    }
+}
+
+test "direct recovery controls accept old new and absent values" {
+    for (std.enums.values(RecoveryCase)) |kind| try recovery(kind, false, null);
+}
+
+test "recovery refuses a symbolic ref at the recorded old update value" {
+    try recovery(.update_old, true, null);
+}
+
+test "recovery refuses a symbolic ref at the already published update value" {
+    try recovery(.update_new, true, null);
+}
+
+test "recovery refuses a dangling symbolic ref where creation expected absence" {
+    try recovery(.create_old, true, null);
+}
+
+test "recovery refuses a symbolic ref at the already published creation value" {
+    try recovery(.create_new, true, null);
+}
+
+test "recovery refuses a symbolic ref awaiting deletion" {
+    try recovery(.delete_old, true, null);
+}
+
+test "recovery refuses a dangling symbolic ref where deletion was already published" {
+    try recovery(.delete_new, true, null);
+}
+
+test "recovery refuses a symbolic transaction journal" {
+    try recovery(.journal, true, null);
+}
+
+test "recovery refuses a dangling symbolic transaction journal instead of treating it as absent" {
+    try recovery(.journal_dangling, true, null);
+}
+
+test "recovery refuses symbolic substitution after comparing current refs" {
+    try recovery(.update_old, true, "test symbolic recovery");
+}
+
+test "recovery cleanup refuses a transaction journal substituted before deletion" {
+    try recovery(.update_new, true, "stakrr: finish transaction");
+}
