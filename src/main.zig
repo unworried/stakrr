@@ -5,6 +5,7 @@ const Git = stakrr.git.Git;
 const Diagnostics = stakrr.git.Diagnostics;
 const stack = stakrr.stack;
 const edit = stakrr.edit;
+const fix = stakrr.fix;
 const term = @import("term.zig");
 const Terminal = term.Terminal;
 const cli = @import("cli.zig");
@@ -110,6 +111,13 @@ fn runCommand(
             try stdout.writeByte('\n');
             if (request == .abort)
                 try stdout.writeAll("retained edits: stakrr log (" ++ stakrr.layout.oplog_ref ++ ")\n");
+        },
+        .fix => |options| {
+            var result = try fix.fix(git, options);
+            defer result.deinit(git.allocator);
+            try stdout.writeAll("fixed ");
+            try term.styled(out, .accent, "stakrr/{s}", .{result.layer});
+            try stdout.print("; replayed {d} {s}\n", .{ result.replayed, plural(result.replayed, "commit", "commits") });
         },
         .cut => |options| {
             try stack.cut(git, options.name, options.at);
@@ -289,7 +297,7 @@ test "exit codes distinguish usage, conflict, dirty tree and drift" {
 }
 
 test "every domain error has a user message" {
-    inline for (@typeInfo(stack.Error || edit.Error).error_set.error_names.?) |name| {
+    inline for (@typeInfo(stack.Error || edit.Error || fix.Error).error_set.error_names.?) |name| {
         try testing.expect(userError(@field(anyerror, name)) != null);
     }
 }

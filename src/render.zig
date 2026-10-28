@@ -16,9 +16,10 @@ pub fn plural(n: usize, one: []const u8, many: []const u8) []const u8 {
 const help_commands = [_]struct { name: []const u8, args: []const u8, about: []const u8 }{
     .{ .name = "init", .args = "--base <branch>", .about = "adopt current branch as rolling work" },
     .{ .name = "status", .args = "", .about = "display layers and unstacked commits" },
-    .{ .name = "undo", .args = "", .about = "reverse the last restack or undo" },
+    .{ .name = "undo", .args = "", .about = "reverse the last restack, fix or undo" },
     .{ .name = "log", .args = "", .about = "show edit history and rescue commits" },
     .{ .name = "cut", .args = "<name> [--at <rev>]", .about = "create the next layer" },
+    .{ .name = "fix", .args = "[<cut>] -m <msg>|--amend", .about = "fold staged changes into a cut, replaying descendants" },
     .{ .name = "go", .args = "<cut>", .about = "switch to a cut and edit it with ordinary commits" },
     .{ .name = "restack", .args = "", .about = "replay what sits above a cut you committed on" },
     .{ .name = "continue", .args = "", .about = "resume a restack after a conflict" },

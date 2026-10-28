@@ -10,7 +10,7 @@ Remote publication is outside these flows; `submit` remains unimplemented.
 - Hold `<git-common-dir>/stakrr.lock` for the entire mutation, across all
   worktrees. Release the lock without unlinking its inode. After acquiring it,
   recover any pending ref transaction before inspecting stack or session state.
-- `init`, `cut`, `reset`, `go`, `up`, `down` and `undo` must refuse while
+- `init`, `cut`, `reset`, `go`, `up`, `down`, `fix` and `undo` must refuse while
   `refs/stakrr/edit` exists. Use `continue`, `abort` or `quit` for a pending edit.
 - Base/work branches, layer branches and internal refs must be direct refs.
   Reject symbolic refs even when they resolve to the expected OID or their
@@ -172,6 +172,36 @@ retains intent for recovery under the shared protocol.
 Move HEAD and let checkout update index/files. Change no branch tips or stakrr
 metadata. Unrelated ignored files are allowed.
 
+## fix
+
+`stakrr fix [<cut>] -m <message>|--amend` folds staged changes into a layer.
+
+1. Lock, refuse an active edit, inspect the stack, and require HEAD on work with
+   no Git operation. Require layers and no stale layer. Select the named layer,
+   defaulting to the highest; require it and all higher layers to be free in
+   other worktrees. Then require a staged diff with
+   `git diff --no-relative --cached --quiet`.
+2. Capture the index with `git write-tree`; create a temporary commit with that
+   tree and old work as parent. Merge it into the target layer using
+   `git merge-tree --write-tree --no-messages --merge-base=<old-work> <old-layer> <staged-commit>`.
+   Require Git 2.40 or newer for this option; unsupported Git returns a clear error.
+3. For `-m`, create a new commit on the layer. For `--amend`, replace its tip
+   using the folded tree and original parent; preserve author, committer and
+   message, dropping invalidated signatures.
+4. Replay `old-layer..old-work` oldest first in object storage. For each commit,
+   merge with its old parent as base and the rewritten cursor as ours, then
+   rewrite it with the resulting tree and cursor as parent. Map each crossed
+   layer boundary to its replacement. Refuse any conflict or a final work tree
+   differing from the captured index tree.
+5. Build a completed checkpoint retaining original/replacement boundaries and
+   old work. In one transaction update the target/higher layer branches and
+   records, work, tip guard and operation log; verify the anchor. Compare every
+   changed ref with its observed old OID.
+
+Keep HEAD, the staged tree and working files in place. The staged diff becomes
+empty against new work; unstaged edits remain. Refusal publishes no refs and
+creates no active edit. A completed fix can be undone.
+
 ## restack
 
 `stakrr restack` incorporates an edited layer and replays its descendants.
@@ -304,6 +334,7 @@ layer branches block initialization until removed or deleted by another reset.
 | Flows | Implementation | Regression coverage |
 | --- | --- | --- |
 | Init, inspect, cut, navigation, reset | [stack.zig](../src/stack.zig) | [stack](../tests/stack_test.zig), [cut](../tests/cut_test.zig), [reset](../tests/reset_test.zig) |
+| Fix | [fix.zig](../src/fix.zig) | [fix](../tests/fix_test.zig) |
 | Interrupted ref publication | [ref_transaction.zig](../src/ref_transaction.zig) | [transactions](../tests/transaction_test.zig), [Git](../tests/git_test.zig) |
 | Restack and recovery, undo, log | [edit.zig](../src/edit.zig), [checkpoint codec](../src/edit_session.zig) | [edit](../tests/edit_test.zig), [recovery](../tests/edit_recovery_test.zig), [undo](../tests/undo_test.zig) |
 | Arguments, output and exits | [cli.zig](../src/cli.zig), [main.zig](../src/main.zig) | [CLI](../tests/cli_test.zig) |
