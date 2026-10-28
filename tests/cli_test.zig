@@ -17,10 +17,10 @@ test "cli: bare repositories reject worktree commands without changing refs" {
         &.{ "init", "--base", "main" }, &.{ "cut", "p1" },
         &.{"status"},                   &.{"reset"},
         &.{ "go", "p1" },               &.{"up"},
-        &.{"down"},                     &.{"restack"},
-        &.{"continue"},                 &.{"abort"},
-        &.{"quit"},                     &.{"undo"},
-        &.{"log"},
+        &.{"down"},                     &.{ "fix", "-m", "fix" },
+        &.{"restack"},                  &.{"continue"},
+        &.{"abort"},                    &.{"quit"},
+        &.{"undo"},                     &.{"log"},
     };
     for (commands) |args| {
         const result = try stakrr(&repo, args);

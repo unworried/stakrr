@@ -523,6 +523,12 @@ test "separate Git directories allow own branches and reject forced duplicate ch
         try view.exec(&.{ "config", "core.hooksPath", "/dev/null" });
         try view.exec(&.{ "config", "commit.gpgsign", "false" });
         try fixture.setup(&view);
+        try view.write("model", "fixed\n");
+        try view.exec(&.{ "add", "model" });
+        var fixed = try stakrr.fix.fix(&view.git, .{ .layer = "models", .how = .{ .message = "fix" } });
+        defer fixed.deinit(testing.allocator);
+        try stakrr.edit.undo(&view.git);
+        try view.expectOutput(&.{ "show", "work:model" }, "original");
         try fixture.correctModels(&view);
         try stakrr.edit.run(&view.git, .restack);
         try fixture.valid(&view);
@@ -539,5 +545,232 @@ test "separate Git directories allow own branches and reject forced duplicate ch
         try testing.expectError(error.BranchOccupied, stakrr.edit.run(&view.git, .restack));
         try view.expectOutput(&.{"show-ref"}, before);
         try fixture.noSession(&view);
+    }
+}
+
+test "Git failure after preparation keeps intent for partially published refs" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try fixture.setup(&repo);
+    const old = try repo.git.resolveCommit("refs/heads/stakrr/models");
+    defer testing.allocator.free(old);
+    try repo.write("model", "fixed\n");
+    try repo.exec(&.{ "add", "model" });
+    try cli.installFaultShim(&repo);
+    try repo.env.put("STAKRR_TEST_PARTIAL_LABEL", "stakrr: fix models");
+    try repo.env.put("STAKRR_TEST_PARTIAL_EXIT", "1");
+    try repo.env.put("STAKRR_TEST_PARTIAL_STATUS", "128");
+    const stopped = try cli.run(&repo, &.{ "fix", "models", "-m", "fix" });
+    defer stopped.deinit();
+    try testing.expectEqual(@as(?u8, 1), stopped.code);
+    _ = repo.env.swapRemove("STAKRR_TEST_PARTIAL_LABEL");
+    try testing.expect(try repo.hasRef(intent_ref));
+    const published = try repo.git.resolveCommit("refs/heads/stakrr/models");
+    defer testing.allocator.free(published);
+    try testing.expect(!std.mem.eql(u8, old, published));
+    try repo.expectRef("refs/stakrr/layers/models", old);
+
+    try cli.expectSuccess(&repo, &.{"continue"});
+    try repo.expectNoRef(intent_ref);
+    try repo.expectOutput(&.{ "show", "work:model" }, "fixed");
+    try repo.expectOutput(&.{ "status", "--porcelain" }, "");
+    try fixture.valid(&repo);
+}
+
+test "partial ref recovery refuses unexpected values without changing any refs" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try fixture.setup(&repo);
+    try repo.write("model", "fixed\n");
+    try repo.exec(&.{ "add", "model" });
+    try cli.installFaultShim(&repo);
+    try repo.env.put("STAKRR_TEST_PARTIAL_LABEL", "stakrr: fix models");
+    const stopped = try cli.run(&repo, &.{ "fix", "models", "-m", "fix" });
+    defer stopped.deinit();
+    try testing.expect(stopped.code != 0);
+    _ = repo.env.swapRemove("STAKRR_TEST_PARTIAL_LABEL");
+    try repo.exec(&.{ "update-ref", "refs/heads/work", "main" });
+    const before = try repo.git.output(&.{"show-ref"});
+    defer testing.allocator.free(before);
+
+    const refused = try cli.run(&repo, &.{"undo"});
+    defer refused.deinit();
+    try testing.expectEqual(@as(?u8, 5), refused.code);
+    try repo.expectOutput(&.{"show-ref"}, before);
+    try testing.expect(try repo.hasRef(intent_ref));
+}
+
+test "fix publication completes before undo after a partial transaction" {
+    for ([_][]const u8{ "1", "4", "7" }) |count| {
+        var repo = try Repo.init();
+        defer repo.deinit();
+        try fixture.setup(&repo);
+        const before = try repo.git.listRefs("refs/heads/");
+        defer testing.allocator.free(before.raw);
+        defer testing.allocator.free(before.refs);
+        try repo.write("model", "fixed\n");
+        try repo.exec(&.{ "add", "model" });
+        try cli.installFaultShim(&repo);
+        try repo.env.put("STAKRR_TEST_PARTIAL_LABEL", "stakrr: fix models");
+        try repo.env.put("STAKRR_TEST_PARTIAL_WRITES", count);
+        const stopped = try cli.run(&repo, &.{ "fix", "models", "-m", "fix" });
+        defer stopped.deinit();
+        try testing.expect(stopped.code != 0);
+        _ = repo.env.swapRemove("STAKRR_TEST_PARTIAL_LABEL");
+
+        try cli.expectSuccess(&repo, &.{"undo"});
+        var after = try repo.git.listRefs("refs/heads/");
+        defer after.deinit(testing.allocator);
+        try testing.expectEqualStrings(before.raw, after.raw);
+        try repo.expectNoRef(intent_ref);
+        try fixture.noSession(&repo);
+        try fixture.valid(&repo);
+    }
+}
+
+test "status and log report partial publication without repairing it" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try fixture.setup(&repo);
+    try repo.write("model", "fixed\n");
+    try repo.exec(&.{ "add", "model" });
+    try cli.installFaultShim(&repo);
+    try repo.env.put("STAKRR_TEST_PARTIAL_LABEL", "stakrr: fix models");
+    const stopped = try cli.run(&repo, &.{ "fix", "models", "-m", "fix" });
+    defer stopped.deinit();
+    try testing.expect(stopped.code != 0);
+    _ = repo.env.swapRemove("STAKRR_TEST_PARTIAL_LABEL");
+    const before = try repo.git.output(&.{"show-ref"});
+    defer testing.allocator.free(before);
+    for ([_][]const u8{ "status", "log" }) |command| {
+        const result = try cli.run(&repo, &.{command});
+        defer result.deinit();
+        try testing.expectEqual(@as(?u8, 1), result.code);
+        try testing.expect(std.mem.indexOf(u8, result.stderr, "stakrr continue") != null);
+        try repo.expectOutput(&.{"show-ref"}, before);
+    }
+    try cli.expectSuccess(&repo, &.{"continue"});
+    try repo.expectNoRef(intent_ref);
+    try repo.expectOutput(&.{ "status", "--porcelain" }, "");
+    try fixture.valid(&repo);
+}
+
+test "publication resumes before its first write and after interrupted cleanup" {
+    for ([_][]const u8{ "stakrr: fix models", "stakrr: finish transaction" }) |label| {
+        var repo = try Repo.init();
+        defer repo.deinit();
+        try fixture.setup(&repo);
+        try repo.write("model", "fixed\n");
+        try repo.exec(&.{ "add", "model" });
+        try cli.installFaultShim(&repo);
+        try repo.env.put("STAKRR_TEST_PARTIAL_LABEL", label);
+        try repo.env.put("STAKRR_TEST_PARTIAL_WRITES", "0");
+        const stopped = try cli.run(&repo, &.{ "fix", "models", "-m", "fix" });
+        defer stopped.deinit();
+        try testing.expect(stopped.code != 0);
+        try testing.expect(try repo.hasRef(intent_ref));
+        _ = repo.env.swapRemove("STAKRR_TEST_PARTIAL_LABEL");
+
+        const resumed = try cli.run(&repo, &.{"continue"});
+        defer resumed.deinit();
+        try testing.expectEqual(@as(?u8, 0), resumed.code);
+        try testing.expectEqualStrings("interrupted operation completed\n", resumed.stdout);
+        try repo.expectNoRef(intent_ref);
+        try repo.expectOutput(&.{ "show", "work:model" }, "fixed");
+        try fixture.valid(&repo);
+        try cli.expectSuccess(&repo, &.{"undo"});
+        try repo.expectOutput(&.{ "show", "work:model" }, "original");
+    }
+}
+
+test "recovery preserves Git locks and refuses branches occupied in another worktree" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try fixture.setup(&repo);
+    try repo.write("model", "fixed\n");
+    try repo.exec(&.{ "add", "model" });
+    try cli.installFaultShim(&repo);
+    try repo.env.put("STAKRR_TEST_PARTIAL_LABEL", "stakrr: fix models");
+    const stopped = try cli.run(&repo, &.{ "fix", "models", "-m", "fix" });
+    defer stopped.deinit();
+    try testing.expect(stopped.code != 0);
+    _ = repo.env.swapRemove("STAKRR_TEST_PARTIAL_LABEL");
+    const before = try repo.git.output(&.{"show-ref"});
+    defer testing.allocator.free(before);
+    const other = try fixture.linked(&repo, "occupied", "stakrr/api");
+    defer other.cwd.?.close(testing.io);
+    const occupied = try cli.run(&repo, &.{"continue"});
+    defer occupied.deinit();
+    try testing.expectEqual(@as(?u8, 1), occupied.code);
+    try testing.expect(std.mem.indexOf(u8, occupied.stderr, "another worktree") != null);
+    try repo.expectOutput(&.{"show-ref"}, before);
+    try other.exec(&.{ "switch", "-q", "--detach" });
+
+    const path = try repo.git.path(&.{ "rev-parse", "--git-path", "refs/stakrr/layers/models.lock" });
+    defer testing.allocator.free(path);
+    try repo.write(path, "owned by Git\n");
+    const locked = try cli.run(&repo, &.{"continue"});
+    defer locked.deinit();
+    try testing.expectEqual(@as(?u8, 1), locked.code);
+    try repo.expectOutput(&.{"show-ref"}, before);
+    const bytes = try repo.tmp.dir.readFileAlloc(testing.io, path, testing.allocator, .limited(1024));
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualStrings("owned by Git\n", bytes);
+    try repo.tmp.dir.deleteFile(testing.io, path);
+    try cli.expectSuccess(&repo, &.{"continue"});
+    try repo.expectNoRef(intent_ref);
+    try fixture.valid(&repo);
+}
+
+test "corrupt publication intent is preserved without changing other refs" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try fixture.setup(&repo);
+    const blob = try repo.git.writeBlob("invalid transaction\n");
+    defer testing.allocator.free(blob);
+    try repo.exec(&.{ "update-ref", intent_ref, blob });
+    const before = try repo.git.output(&.{"show-ref"});
+    defer testing.allocator.free(before);
+    for ([_][]const u8{ "continue", "quit", "reset" }) |command| {
+        const result = try cli.run(&repo, &.{command});
+        defer result.deinit();
+        try testing.expectEqual(@as(?u8, 1), result.code);
+        try testing.expect(std.mem.indexOf(u8, result.stderr, "invalid interrupted ref transaction") != null);
+        try repo.expectOutput(&.{"show-ref"}, before);
+    }
+}
+
+test "fix restack and undo work in linked worktrees of bare repositories" {
+    for ([_][]const u8{ "sha1", "sha256" }) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+        testing.allocator.free(try repo.commit("seed"));
+        try repo.exec(&.{ "clone", "--bare", "-q", ".", ".git/bare.git" });
+        const metadata = try repo.tmp.dir.realPathFileAlloc(testing.io, ".git", testing.allocator);
+        defer testing.allocator.free(metadata);
+        const path = try std.fs.path.join(testing.allocator, &.{ metadata, "linked-main" });
+        defer testing.allocator.free(path);
+        try repo.exec(&.{ "-C", ".git/bare.git", "worktree", "add", "-q", path, "main" });
+        const dir = try repo.tmp.dir.openDir(testing.io, path, .{});
+        defer dir.close(testing.io);
+        var view = repo;
+        view.tmp.dir = dir;
+        view.git.cwd = dir;
+        try view.exec(&.{ "config", "user.name", "Stakrr Test" });
+        try view.exec(&.{ "config", "user.email", "test@stakrr.local" });
+        try view.exec(&.{ "config", "core.hooksPath", "/dev/null" });
+        try view.exec(&.{ "config", "commit.gpgsign", "false" });
+        try fixture.setup(&view);
+        try view.write("model", "fixed\n");
+        try view.exec(&.{ "add", "model" });
+        var fixed = try stakrr.fix.fix(&view.git, .{ .how = .{ .message = "fix" } });
+        defer fixed.deinit(testing.allocator);
+        try stakrr.edit.undo(&view.git);
+        try fixture.correctModels(&view);
+        try stakrr.edit.run(&view.git, .restack);
+        try view.expectOutput(&.{ "show", "work:model" }, "corrected");
+        try stakrr.edit.undo(&view.git);
+        try fixture.valid(&view);
+        try view.expectOutput(&.{ "show", "work:model" }, "original");
     }
 }

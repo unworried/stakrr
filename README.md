@@ -174,3 +174,13 @@ match. Sessions belong to their originating worktree.
 Exit codes are 0 success, 1 failure, 2 usage, 3 replay conflict pending,
 4 dirty or ignored work or an active Git operation, and 5 externally changed
 edit or publication state.
+
+## // fixing staged changes
+
+On the rolling work branch, stage a correction and run
+`stakrr fix <cut> -m "correction"`. Omit the cut to target the highest layer,
+or use `--amend` to keep that layer tip's metadata. Fix folds the staged tree
+into the target and replays descendants in object storage before publishing.
+Conflicts refuse publication. HEAD, the index tree and working files stay in
+place, preserving unstaged edits. `stakrr undo` restores the previous refs.
+Explicit-base merges require Git 2.40 or newer.

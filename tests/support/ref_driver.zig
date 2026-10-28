@@ -31,6 +31,15 @@ fn run(git: *const stakrr.git.Git, args: []const []const u8) !void {
         }
         return;
     }
+    if (std.mem.eql(u8, args[0], "reset")) {
+        _ = try stakrr.stack.reset(git, .{ .delete_layers = true });
+        return;
+    }
+    if (std.mem.eql(u8, args[0], "fix")) {
+        var result = try stakrr.fix.fix(git, .{ .layer = "models", .how = .{ .message = "fix" } });
+        defer result.deinit(git.allocator);
+        return;
+    }
     const name = "refs/stakrr/publication-test";
     const old = args[1];
     const new = args[2];

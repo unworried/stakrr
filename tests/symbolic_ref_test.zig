@@ -9,6 +9,7 @@ const subject = "refs/heads/stakrr/models";
 const publication_ref = "refs/stakrr/publication-test";
 const Repo = @import("support/repo.zig").Repo;
 const cli = @import("support/cli.zig");
+const fixture = @import("support/edit_fixture.zig");
 
 const victim = "refs/heads/victim";
 const formats = [_][]const u8{ "sha1", "sha256" };
@@ -756,4 +757,126 @@ test "recovery refuses symbolic substitution after comparing current refs" {
 
 test "recovery cleanup refuses a transaction journal substituted before deletion" {
     try recovery(.update_new, true, "stakrr: finish transaction");
+}
+
+fn fix(repo: *const Repo) !void {
+    var result = try stakrr.fix.fix(&repo.git, .{ .layer = "models", .how = .{ .message = "fix" } });
+    defer result.deinit(testing.allocator);
+}
+
+fn fixRef(name: []const u8) !void {
+    try eachFormat(fixRefCase, .{name});
+}
+
+fn fixRefCase(format: []const u8, name: []const u8) !void {
+    var repo = try Repo.initOptions(.{ .object_format = format });
+    defer repo.deinit();
+    try fixture.setup(&repo);
+    if (std.mem.eql(u8, name, layout.oplog_ref)) {
+        try dirtyFix(&repo);
+        try repo.write("model", "first fix\n");
+        try repo.exec(&.{ "add", "model" });
+        try fix(&repo); // Give the oplog a real completed checkpoint.
+    }
+    try dirtyFix(&repo);
+    try testing.expect(!(try repo.git.check(&.{ "diff", "--cached", "--quiet" }, 1)));
+    const old = (try repo.git.readRef(name)).?;
+    defer testing.allocator.free(old);
+    try alias(&repo, name, old);
+    var before = try Snapshot.capture(&repo);
+    defer before.deinit();
+
+    const result = fix(&repo);
+    try before.expectUnchanged(&repo);
+    try expectSymbolic(&repo, name);
+    try expectDirect(&repo, victim, old);
+    try expectAbsent(&repo, layout.transaction_ref);
+    try expectAbsent(&repo, layout.session_ref);
+    try testing.expectError(error.SymbolicRef, result);
+}
+
+test "fix refuses symbolic layer branches" {
+    try fixRef(subject);
+}
+
+test "fix refuses symbolic layer records" {
+    try fixRef(layout.record_prefix ++ "models");
+}
+
+test "fix refuses a symbolic tip" {
+    try fixRef(layout.tip_ref);
+}
+
+test "fix refuses a symbolic anchor guard" {
+    try fixRef(layout.anchor_ref);
+}
+
+test "fix refuses a symbolic rolling branch" {
+    try fixRef("refs/heads/work");
+}
+
+test "fix refuses a symbolic base branch" {
+    try fixRef("refs/heads/main");
+}
+
+test "fix refuses a symbolic operation log" {
+    try fixRef(layout.oplog_ref);
+}
+
+fn commandRace(is_fix: bool, name: []const u8, label: []const u8) !void {
+    try eachFormat(commandRaceCase, .{ is_fix, name, label });
+}
+
+fn commandRaceCase(format: []const u8, is_fix: bool, name: []const u8, label: []const u8) !void {
+    var repo = try Repo.initOptions(.{ .object_format = format });
+    defer repo.deinit();
+    try fixture.setup(&repo);
+    try dirtyFix(&repo);
+    const old = (try repo.git.readRef(name)).?;
+    defer testing.allocator.free(old);
+    try race(&repo, label, name);
+    // The expected state includes the external writer's substitution.
+    try alias(&repo, name, old);
+    var before = try Snapshot.capture(&repo);
+    defer before.deinit();
+    try restore(&repo, name, old);
+
+    const result = try driver(&repo, &.{if (is_fix) "fix" else "reset"});
+    defer result.deinit();
+    try expectRaceFired(&repo);
+    try before.expectUnchanged(&repo);
+    try expectSymbolic(&repo, name); // Proves the selected race actually ran.
+    try expectDirect(&repo, victim, old);
+    try expectAbsent(&repo, layout.transaction_ref);
+    try expectDriverError(result, error.GitFailed);
+}
+
+test "reset refuses symbolic substitution after discovery before intent creation" {
+    try commandRace(false, subject, "stakrr: prepare transaction");
+}
+
+test "reset refuses symbolic substitution after intent creation before publication" {
+    try commandRace(false, subject, "stakrr: reset");
+}
+
+test "fix refuses symbolic substitution after discovery before intent creation" {
+    try commandRace(true, subject, "stakrr: prepare transaction");
+}
+
+test "fix refuses symbolic substitution after intent creation before publication" {
+    try commandRace(true, subject, "stakrr: fix models");
+}
+
+test "fix refuses a guard becoming symbolic immediately before publication" {
+    try commandRace(true, layout.anchor_ref, "stakrr: fix models");
+}
+
+fn dirtyFix(repo: *const Repo) !void {
+    try repo.write("model", "staged fix\n");
+    try repo.exec(&.{ "add", "model" });
+    try repo.write("tail", "unstaged work\n");
+}
+
+test "reset refuses symbolic layer records including dangling refs" {
+    try resetRef(layout.record_prefix ++ "models");
 }
