@@ -25,3 +25,10 @@ SHA-1 and SHA-256 repositories. Object creation leaves refs, HEAD, the index
 and working files in place; ref publication remains a separate transaction.
 Checkpoint commits preserve parent order, omit duplicate parents and bypass
 hooks and signing.
+
+Merge candidate commits with `merge-tree --write-tree --merge-base=<base>`;
+this explicit-base operation requires Git 2.40 or newer. A merge conflict
+returns no tree. Rewrite commits with the replacement tree and one parent,
+preserving author, committer, message and other metadata while dropping
+invalidated signatures and merge tags. Both operations leave refs, HEAD,
+the index and working files in place.

@@ -618,3 +618,169 @@ test "input transport preserves early Git refusal diagnostics with large input" 
     try testing.expect(diagnostics.stderr().len != 0);
     try repo.expectOutput(&.{ "for-each-ref", "--format=%(refname)" }, "");
 }
+
+fn treeWithFile(repo: *const Repo, data: []const u8) ![]u8 {
+    const blob = try repo.git.writeBlob(data);
+    defer testing.allocator.free(blob);
+    return repo.git.writeTree(&.{.{ .name = "file", .oid = blob }});
+}
+
+test "mergeTree uses the explicit base and preserves refs and dirty work" {
+    for ([_][]const u8{ "sha1", "sha256" }) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+        const base = try repo.commit("base");
+        defer testing.allocator.free(base);
+        const ours_tree = try treeWithFile(&repo, "ours\n");
+        defer testing.allocator.free(ours_tree);
+        const ours = try repo.git.commitTree(ours_tree, &.{base}, "ours");
+        defer testing.allocator.free(ours);
+        const blob = try repo.git.writeBlob("theirs\n");
+        defer testing.allocator.free(blob);
+        const theirs_tree = try repo.git.writeTree(&.{.{ .name = "other", .oid = blob }});
+        defer testing.allocator.free(theirs_tree);
+        // These commits are related, but their actual merge base is `ours`.
+        // The supplied base must still apply both independent changes.
+        const theirs = try repo.git.commitTree(theirs_tree, &.{ours}, "theirs");
+        defer testing.allocator.free(theirs);
+        try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "dirty", .data = "staged\n" });
+        try repo.exec(&.{ "add", "dirty" });
+        try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "dirty", .data = "unstaged\n" });
+        const before_index = try repo.git.output(&.{"write-tree"});
+        defer testing.allocator.free(before_index);
+        const before_status = try repo.git.outputRaw(&.{ "status", "--porcelain=v1", "-z" });
+        defer testing.allocator.free(before_status);
+        const before_refs = try repo.git.output(&.{"show-ref"});
+        defer testing.allocator.free(before_refs);
+
+        const merged = (try repo.git.mergeTree(base, ours, theirs)) orelse return error.TestExpectedTree;
+        defer testing.allocator.free(merged);
+        const contents = try std.fmt.allocPrint(testing.allocator, "{s}:file", .{merged});
+        defer testing.allocator.free(contents);
+        try repo.expectOutput(&.{ "show", contents }, "ours");
+        const other = try std.fmt.allocPrint(testing.allocator, "{s}:other", .{merged});
+        defer testing.allocator.free(other);
+        try repo.expectOutput(&.{ "show", other }, "theirs");
+        try repo.expectOutput(&.{"write-tree"}, before_index);
+        try repo.expectOutput(&.{"show-ref"}, before_refs);
+        const after_status = try repo.git.outputRaw(&.{ "status", "--porcelain=v1", "-z" });
+        defer testing.allocator.free(after_status);
+        try testing.expectEqualStrings(before_status, after_status);
+        try repo.expectRef("HEAD", base);
+    }
+}
+
+test "mergeTree returns null on conflict without publishing refs" {
+    for ([_][]const u8{ "sha1", "sha256" }) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+        var commits: [3][]u8 = undefined;
+        var created: usize = 0;
+        defer for (commits[0..created]) |oid| testing.allocator.free(oid);
+        for ([_][]const u8{ "base\n", "ours\n", "theirs\n" }, 0..) |data, i| {
+            const tree = try treeWithFile(&repo, data);
+            defer testing.allocator.free(tree);
+            commits[i] = try repo.git.commitTree(tree, if (i == 0) &.{} else &.{commits[0]}, data);
+            created += 1;
+        }
+        const merged = try repo.git.mergeTree(commits[0], commits[1], commits[2]);
+        defer if (merged) |tree| testing.allocator.free(tree);
+        try testing.expect(merged == null);
+        try repo.expectOutput(&.{ "for-each-ref", "--format=%(refname)" }, "");
+        try repo.expectOutput(&.{ "status", "--porcelain" }, "");
+    }
+}
+
+test "rewriteCommit replaces links and drops signatures while preserving metadata and message bytes" {
+    for ([_][]const u8{ "sha1", "sha256" }) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+        const first = try repo.commit("first");
+        defer testing.allocator.free(first);
+        const second = try repo.commit("second");
+        defer testing.allocator.free(second);
+        const old_tree = try repo.git.writeTree(&.{});
+        defer testing.allocator.free(old_tree);
+        const new_tree = try treeWithFile(&repo, "replacement\n");
+        defer testing.allocator.free(new_tree);
+        const metadata = "author Original Author <author@example.test> 1234567890 +0130\n" ++
+            "committer Original Committer <committer@example.test> 1234567999 -0200\n" ++
+            "encoding ISO-8859-1\nx-custom retained\n continued header\n";
+        for ([_][]const u8{ "", "subject\n\nbinary \xff body\n\n" }) |message| {
+            const raw = try std.fmt.allocPrint(testing.allocator, "tree {s}\nparent {s}\nparent {s}\n{s}" ++
+                "gpgsig fake signature\n continued signature\n" ++
+                "gpgsig-sha256 another signature\n continued signature\n" ++
+                "mergetag fake tag\n continued tag\n\n{s}", .{ old_tree, first, second, metadata, message });
+            defer testing.allocator.free(raw);
+            const source = try repo.git.inputOutput(&.{ "hash-object", "-w", "-t", "commit", "--stdin" }, raw);
+            defer testing.allocator.free(source);
+            const rewritten = try repo.git.rewriteCommit(source, new_tree, second);
+            defer testing.allocator.free(rewritten);
+            const actual = try repo.git.outputRaw(&.{ "cat-file", "commit", rewritten });
+            defer testing.allocator.free(actual);
+            const expected = try std.fmt.allocPrint(testing.allocator, "tree {s}\nparent {s}\n{s}\n{s}", .{
+                new_tree, second, metadata, message,
+            });
+            defer testing.allocator.free(expected);
+            try testing.expectEqualStrings(expected, actual);
+            const original = try repo.git.outputRaw(&.{ "cat-file", "commit", source });
+            defer testing.allocator.free(original);
+            try testing.expectEqualStrings(raw, original);
+            try repo.expectRef("HEAD", second);
+        }
+    }
+}
+
+test "merge and rewrite reject invalid object IDs before spawning Git" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    // A missing executable proves validation occurs before any Git command.
+    try repo.env.put("PATH", "/nonexistent/stakrr-test-bin");
+    const block = try repo.env.createPosixBlock(testing.allocator, .{});
+    defer block.deinit(testing.allocator);
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = .{ .block = block } });
+    defer threaded.deinit();
+    var git = repo.git;
+    git.io = threaded.io();
+    const valid = &@as([40]u8, @splat('a'));
+    const arguments = [_][3][]const u8{
+        .{ "HEAD", valid, valid }, .{ valid, "--bad", valid }, .{ valid, valid, "bad\nvalue" },
+    };
+    for (arguments) |args| {
+        try testing.expectError(error.InvalidOid, git.mergeTree(args[0], args[1], args[2]));
+        try testing.expectError(error.InvalidOid, git.rewriteCommit(args[0], args[1], args[2]));
+    }
+}
+
+test "mergeTree distinguishes unsupported options from fatal Git errors" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try repo.tmp.dir.createDir(testing.io, "bin", .default_dir);
+    const bin = try repo.tmp.dir.realPathFileAlloc(testing.io, "bin", testing.allocator);
+    defer testing.allocator.free(bin);
+    try repo.env.put("PATH", bin);
+    // Executable lookup uses the I/O instance's environment, not the child's.
+    const block = try repo.env.createPosixBlock(testing.allocator, .{});
+    defer block.deinit(testing.allocator);
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = .{ .block = block } });
+    defer threaded.deinit();
+    var git = repo.git;
+    git.io = threaded.io();
+    var diagnostics: stakrr_git.Diagnostics = .{};
+    git.diagnostics = &diagnostics;
+    const valid = &@as([40]u8, @splat('a'));
+    for ([_]struct { script: []const u8, expected: anyerror }{
+        .{ .script = "#!/bin/sh\nexit 129\n", .expected = error.UnsupportedGitVersion },
+        .{ .script = "#!/bin/sh\necho 'fatal: injected failure' >&2\nexit 128\n", .expected = error.GitFailed },
+        .{ .script = "#!/bin/sh\nkill -TERM $$\n", .expected = error.GitTerminated },
+    }) |case| {
+        try repo.tmp.dir.writeFile(testing.io, .{
+            .sub_path = "bin/git",
+            .data = case.script,
+            .flags = .{ .permissions = .executable_file },
+        });
+        try testing.expectError(case.expected, git.mergeTree(valid, valid, valid));
+        if (case.expected == error.GitFailed)
+            try testing.expectEqualStrings("fatal: injected failure", diagnostics.stderr());
+    }
+}

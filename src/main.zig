@@ -168,6 +168,7 @@ fn userError(err: anyerror) ?[]const u8 {
         error.DetachedHead => "detached HEAD is unsupported",
         error.InvalidGitConfig => "stakrr.state has multiple or empty values (run 'stakrr reset')",
         error.InvalidGitOutput => "unexpected output from git",
+        error.UnsupportedGitVersion => "fix requires Git 2.40 or newer (merge-tree --merge-base)",
         error.StreamTooLong => "git output exceeded the size limit",
         error.FileNotFound => "git executable not found on PATH",
         error.OutOfMemory => "out of memory",
