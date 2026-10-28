@@ -490,6 +490,19 @@ pub const Git = struct {
 
         try self.transact("stakrr: cut", updates[0..count]);
     }
+
+    pub fn switchBranch(self: *const Git, ref_name: []const u8) !void {
+        if (!isSafeBranchRef(ref_name)) return error.InvalidRefName;
+
+        const branch = ref_name["refs/heads/".len..];
+
+        // Reject option-like names and Git's "-" previous-branch shorthand.
+        if (branch[0] == '-') return error.InvalidRefName;
+
+        try self.exec(&.{
+            "switch", "--quiet", "--no-guess", "--", branch,
+        });
+    }
 };
 
 /// internal guard pointing at the highest layer
