@@ -84,7 +84,7 @@ pub const Git = struct {
         return if (self.cwd) |dir| .{ .dir = dir } else .inherit;
     }
 
-    /// `git` followed by `args`; the caller frees the slice, not its items.
+    /// `git` followed by `args`; the caller frees the slice, not its items
     fn argvFor(self: *const Git, args: []const []const u8) ![]const []const u8 {
         const argv = try self.allocator.alloc([]const u8, args.len + 1);
         argv[0] = "git";
@@ -132,19 +132,14 @@ pub const Git = struct {
     }
 
     /// execute a command that must succeed
-    /// returns an owned, newline-trimmed copy of stdout
+    /// returns owned, newline-trimmed stdout
     pub fn output(
         self: *const Git,
         args: []const []const u8,
     ) ![]u8 {
-        const result = try self.run(args);
-        defer self.freeResult(result);
-
-        if ((try exitCode(result)) != 0)
-            return self.fail(result.stderr);
-
-        const trimmed = std.mem.trimEnd(u8, result.stdout, "\r\n");
-        return self.allocator.dupe(u8, trimmed);
+        const bytes = try self.outputRaw(args);
+        errdefer self.allocator.free(bytes);
+        return self.allocator.realloc(bytes, std.mem.trimEnd(u8, bytes, "\r\n").len);
     }
 
     /// Successful stdout, unchanged. The caller owns the returned bytes.
@@ -176,15 +171,20 @@ pub const Git = struct {
         if ((try exitCode(result)) != 0) return self.fail(result.stderr);
     }
 
-    /// Return owned, newline-trimmed stdout on success and null on `absent`;
-    /// any other exit status fails with diagnostics.
+    /// For commands where exit status `absent` is an expected answer rather
+    /// than a failure. Returns owned, newline-trimmed stdout on success and
+    /// null on `absent`; any other status fails with diagnostics.
     pub fn query(self: *const Git, args: []const []const u8, absent: u8) !?[]u8 {
         const result = try self.run(args);
-        defer self.freeResult(result);
+        defer self.allocator.free(result.stderr);
+        errdefer self.allocator.free(result.stdout);
         const code = try exitCode(result);
-        if (code == absent) return null;
+        if (code == absent) {
+            self.allocator.free(result.stdout);
+            return null;
+        }
         if (code != 0) return self.fail(result.stderr);
-        return try self.allocator.dupe(u8, std.mem.trimEnd(u8, result.stdout, "\r\n"));
+        return try self.allocator.realloc(result.stdout, std.mem.trimEnd(u8, result.stdout, "\r\n").len);
     }
 
     /// True on success, false on exit status `no`; any other status fails.
@@ -336,15 +336,17 @@ pub const Git = struct {
         self: *const Git,
         key: []const u8,
     ) !?[]u8 {
-        const value = (try self.query(&.{ "config", "--local", "--get-all", key }, 1)) orelse
+        const value = (try self.query(&.{ "config", "--null", "--local", "--get-all", key }, 1)) orelse
             return null;
         errdefer self.allocator.free(value);
 
-        // stakrr expects exactly one config value
-        if (value.len == 0 or std.mem.indexOfScalar(u8, value, '\n') != null)
+        // Preserve value boundaries: trimming newlines could hide a trailing
+        // empty value or a newline embedded in the persisted state.
+        if (value.len <= 1 or value[value.len - 1] != 0 or
+            std.mem.indexOfAny(u8, value[0 .. value.len - 1], "\x00\r\n") != null)
             return error.InvalidGitConfig;
 
-        return value;
+        return try self.allocator.realloc(value, value.len - 1);
     }
 
     /// remove every value of a local config key; returns false if unset
@@ -436,6 +438,7 @@ pub const Git = struct {
     /// One line of an `update-ref --stdin` transaction.
     pub const RefUpdate = union(enum) {
         verify: ExpectedRef,
+        /// create `name` at `oid`; fails if it already exists
         create: ExpectedRef,
         /// compare-and-swap `name` from `old` to `new`
         update: struct { name: []const u8, new: []const u8, old: []const u8 },
@@ -596,41 +599,6 @@ pub const Git = struct {
         for (oids) |oid| {
             if (!isOid(oid)) return error.InvalidOid;
         }
-    }
-
-    /// atomically create a layer and advance the internal tip guard
-    /// verifies all observed refs and fails if the stack changed meanwhile
-    pub fn createLayerRef(
-        self: *const Git,
-        name: []const u8,
-        oid: []const u8,
-        anchor: ExpectedRef,
-        work: ExpectedRef,
-        previous: ?ExpectedRef,
-    ) !void {
-        var updates: [5]RefUpdate = undefined;
-        var count: usize = 0;
-
-        updates[count] = .{ .verify = anchor };
-        count += 1;
-        updates[count] = .{ .verify = work };
-        count += 1;
-
-        if (previous) |ref| {
-            updates[count] = .{ .verify = ref };
-            count += 1;
-        }
-
-        updates[count] = .{ .create = .{ .name = name, .oid = oid } };
-        count += 1;
-
-        updates[count] = if (previous) |ref|
-            .{ .update = .{ .name = layout.tip_ref, .new = oid, .old = ref.oid } }
-        else
-            .{ .create = .{ .name = layout.tip_ref, .oid = oid } };
-        count += 1;
-
-        try self.transact("stakrr: cut", updates[0..count]);
     }
 
     /// Feed stdin while draining both output pipes. Git supplies object IDs.
@@ -812,19 +780,10 @@ pub const Git = struct {
         if (branch[0] == '-') return error.InvalidRefName;
 
         try self.exec(&.{
-            "switch", "--quiet", "--no-guess", "--", branch,
+            "switch", "--quiet", "--no-guess", "--no-overwrite-ignore", "--", branch,
         });
     }
 };
-
-/// internal guard pointing at the highest layer
-pub const tip_ref = layout.tip_ref;
-
-/// the stack's starting commit; also keeps it reachable for gc
-pub const anchor_ref = layout.anchor_ref;
-
-/// namespace for stakrr-managed layer branches
-pub const layer_prefix = layout.layer_prefix;
 
 const testing = std.testing;
 

@@ -1,8 +1,17 @@
 //! Coordination shared by every stakrr mutation, including linked worktrees.
 const std = @import("std");
 const Git = @import("git.zig").Git;
+const layout = @import("layout.zig");
 
-pub const Error = error{ MutationInProgress, BranchOccupied, LayerCheckedOut, GitOperationInProgress };
+pub const Error = error{
+    MutationInProgress,
+    EditInProgress,
+    BranchOccupied,
+    LayerCheckedOut,
+    DirtyWorkTree,
+    IgnoredFilesPresent,
+    GitOperationInProgress,
+};
 
 pub const Guard = struct {
     file: std.Io.File,
@@ -30,6 +39,29 @@ pub fn lock(git: *const Git) !Guard {
     };
     errdefer guard.close(git.io);
     return .{ .file = guard, .recovered = try git.recoverTransaction() };
+}
+
+/// Lock for a stack mutation, which an active edit session excludes.
+pub fn lockStack(git: *const Git) !Guard {
+    const guard = try lock(git);
+    errdefer guard.close(git.io);
+    if (try git.readRef(layout.session_ref)) |oid| {
+        git.allocator.free(oid);
+        return error.EditInProgress;
+    }
+    return guard;
+}
+
+/// A clean working tree with no Git operation in progress.
+pub fn requireQuiescent(git: *const Git) !void {
+    try requireClean(git);
+    try requireNoGitOperation(git, .{});
+}
+
+pub fn requireClean(git: *const Git) !void {
+    const status = try git.outputRaw(&.{ "status", "--porcelain=v1", "-z", "--untracked-files=all" });
+    defer git.allocator.free(status);
+    if (status.len != 0) return error.DirtyWorkTree;
 }
 
 /// Worktree porcelain -z keeps paths containing spaces/newlines unambiguous.

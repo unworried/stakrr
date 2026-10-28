@@ -107,3 +107,70 @@ Read-only status never repairs publication. It reports a pending transaction
 when any new value remains unpublished, but may inspect a completed transaction
 awaiting intent cleanup. Retry a stack mutation to finish pending publication;
 reset's config removal remains a separate step after ref recovery.
+
+## Recorded layer boundaries
+
+Each layer branch `refs/heads/stakrr/<name>` has a recorded boundary at
+`refs/stakrr/layers/<name>`. Inspection matches branches with records and orders
+recorded boundaries along the linear anchor-to-work chain. A moved branch is
+stale; new cuts refuse stale layers. Existing stacks without records must be
+reset and initialized again. Reset preserves base/work branches and user files.
+
+`stakrr.state` must contain exactly one nonempty local value with distinct
+base/work branches outside the managed layer namespace. Navigation protects
+ignored files with `git switch --no-overwrite-ignore`. Stack mutations refuse
+an active `refs/stakrr/edit` session.
+
+## init
+
+`stakrr init --base <branch>` adopts the current branch as rolling work.
+
+1. Lock and refuse an active edit, existing config, layer branches, records,
+   anchor or tip. Old operation-log history may remain.
+2. Read symbolic HEAD. Require a valid, distinct local base branch and both
+   branch names outside the layer namespace. Resolve both tips, require base
+   ancestry, and reject merges in `base..work`.
+3. Create the anchor at the observed base OID in a ref transaction.
+4. Write `git config --local stakrr.state 'v1 <base-ref> <work-ref>'`.
+   On failure, attempt to delete the just-created anchor with its expected OID.
+   A crash between these separate writes leaves state that `reset` can remove.
+
+Keep HEAD, branches, index and files in place. Dirty work is allowed.
+
+
+## cut
+
+`stakrr cut <name> [--at <rev>]` records the next boundary without rewriting work.
+
+1. Lock and refuse an active edit. Validate the new ref with
+   `git check-ref-format`, inspect the stack, and require HEAD on work.
+   Refuse stale layers and existing names, including parent/child ref collisions.
+2. Resolve `<rev>^{commit}`, defaulting to the observed work tip. Require the
+   target strictly above the highest recorded layer (the anchor for the first
+   cut) and ancestral to work.
+3. In one transaction verify anchor, work tip and the previous layer branch
+   when present; create the new layer branch and its record at the target;
+   create the tip guard for the first cut or update it from the previous
+   boundary to the target.
+
+Keep HEAD, existing branches, index and files in place. Dirty work is allowed.
+A compare-and-swap refusal leaves every ref unchanged. Interrupted publication
+retains intent for recovery under the shared protocol.
+
+
+## reset
+
+`stakrr reset [--delete-layers]` forgets stack metadata, including corrupt state.
+
+1. Lock and refuse an active edit. List layer branches, records, anchor and tip
+   without parsing config or requiring a valid stack.
+2. With `--delete-layers`, refuse a layer checked out in this or another
+   worktree. Otherwise preserve layer branches.
+3. In one transaction delete anchor, tip and all records; delete layer branches
+   only when requested. Use each ref's observed old OID.
+4. Run `git config --local --unset-all stakrr.state`, accepting an absent key.
+   Rerun reset if config removal fails after ref deletion. Report uninitialized
+   only when no config, stack refs or layer branches existed.
+
+Keep HEAD, base/work branches, index, files and operation-log history. Retained
+layer branches block initialization until removed or deleted by another reset.

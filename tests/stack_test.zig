@@ -1,4 +1,5 @@
 const std = @import("std");
+const layout = @import("stakrr").layout;
 const testing = std.testing;
 
 const stack = @import("stakrr").stack;
@@ -39,9 +40,7 @@ fn expectNoState(repo: *const Repo) !void {
     defer if (state) |value| testing.allocator.free(value);
     try testing.expect(state == null);
 
-    const anchor = try repo.git.readRef("refs/stakrr/anchor");
-    defer if (anchor) |oid| testing.allocator.free(oid);
-    try testing.expect(anchor == null);
+    try repo.expectNoRef(layout.anchor_ref);
 }
 
 test "inspect: config rejects missing state" {
@@ -115,6 +114,14 @@ test "inspect: config rejects malformed state" {
             .value = "v1 refs/heads/main refs/heads/main",
             .expected = error.InvalidConfig,
         },
+        .{
+            .value = "v1 refs/heads/main refs/heads/stakrr/work",
+            .expected = error.InvalidConfig,
+        },
+        .{
+            .value = "v1 refs/heads/stakrr/base refs/heads/work",
+            .expected = error.InvalidConfig,
+        },
     };
 
     for (cases) |case| {
@@ -133,7 +140,7 @@ test "inspect: config reports a missing anchor ref as an inconsistent stack" {
     const base = try repo.initStack();
     defer testing.allocator.free(base);
 
-    try repo.exec(&.{ "update-ref", "-d", "refs/stakrr/anchor" });
+    try repo.exec(&.{ "update-ref", "-d", layout.anchor_ref });
 
     try testing.expectError(
         error.InvalidStack,
@@ -148,7 +155,7 @@ test "initStack records the anchor as a ref" {
     const base = try repo.initStack();
     defer testing.allocator.free(base);
 
-    const anchor = (try repo.git.readRef("refs/stakrr/anchor")).?;
+    const anchor = (try repo.git.readRef(layout.anchor_ref)).?;
     defer testing.allocator.free(anchor);
 
     try testing.expectEqualStrings(base, anchor);
@@ -302,48 +309,10 @@ test "inspect reports layers, depths and unstacked commits" {
     defer snapshot.deinit();
 
     try testing.expectEqual(@as(usize, 2), snapshot.layers.len);
-    try testing.expectEqual(@as(usize, 1), snapshot.layers[0].depth);
     try testing.expectEqual(@as(usize, 1), snapshot.layers[0].commits);
-    try testing.expectEqual(@as(usize, 3), snapshot.layers[1].depth);
     try testing.expectEqual(@as(usize, 2), snapshot.layers[1].commits);
     try testing.expectEqual(@as(usize, 1), snapshot.unstacked_commits);
     try testing.expect(!snapshot.base_moved);
-}
-
-test "inspect snapshots own independent storage across stack changes" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-
-    const base = try repo.initStack();
-    defer testing.allocator.free(base);
-    const first = try repo.commit("first");
-    defer testing.allocator.free(first);
-    try stack.cut(&repo.git, "first", null);
-
-    var original = try stack.inspect(&repo.git);
-    defer original.deinit();
-
-    const second = try repo.commit("second");
-    defer testing.allocator.free(second);
-    try stack.cut(&repo.git, "second", null);
-    {
-        var updated = try stack.inspect(&repo.git);
-        defer updated.deinit();
-        try testing.expectEqual(@as(usize, 2), updated.layers.len);
-        try testing.expectEqualStrings(second, updated.work_oid);
-        _ = try stack.reset(&repo.git, true);
-    }
-
-    try testing.expectEqualStrings("refs/heads/main", original.config.base_ref);
-    try testing.expectEqualStrings("refs/heads/work", original.config.work_ref);
-    try testing.expectEqualStrings(base, original.config.anchor_oid);
-    try testing.expectEqualStrings(first, original.work_oid);
-    try testing.expectEqual(@as(usize, 1), original.layers.len);
-    try testing.expectEqualStrings("refs/heads/stakrr/first", original.layers[0].ref_name);
-    try testing.expectEqualStrings(first, original.layers[0].oid);
-    try testing.expectEqual(@as(usize, 1), original.layers[0].depth);
-    try testing.expectEqual(@as(usize, 1), original.layers[0].commits);
-    try testing.expectEqual(@as(usize, 0), original.unstacked_commits);
 }
 
 test "inspect rejects a merge committed after init" {
@@ -368,7 +337,7 @@ test "inspect rejects a tip guard without layers" {
     const base = try repo.initStack();
     defer testing.allocator.free(base);
 
-    try repo.exec(&.{ "update-ref", "refs/stakrr/tip", base });
+    try repo.exec(&.{ "update-ref", layout.tip_ref, base });
 
     try testing.expectError(
         error.InvalidStack,
@@ -429,6 +398,7 @@ test "inspect rejects two layers on the same commit" {
     defer testing.allocator.free(b);
     try stack.cut(&repo.git, "p1", null);
     try repo.exec(&.{ "branch", "stakrr/dup", b });
+    try repo.exec(&.{ "update-ref", layout.record_prefix ++ "dup", b });
 
     try testing.expectError(
         error.InvalidLayerBoundary,
@@ -475,4 +445,142 @@ test "stacks work in SHA-256 repositories" {
 
     try testing.expectEqual(@as(usize, 1), snapshot.layers.len);
     try testing.expectEqualStrings(b, snapshot.layers[0].oid);
+}
+
+test "navigate traverses layers by history and stops at the stack boundaries" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    const base = try repo.initStack();
+    defer testing.allocator.free(base);
+
+    const first = try repo.commit("first");
+    defer testing.allocator.free(first);
+    try stack.cut(&repo.git, "z-first", null);
+    const second = try repo.commit("second");
+    defer testing.allocator.free(second);
+    try stack.cut(&repo.git, "a-second", null);
+
+    try testing.expect(!try stack.navigate(&repo.git, .up));
+    for ([_][]const u8{ "refs/heads/stakrr/a-second", "refs/heads/stakrr/z-first", "refs/heads/main" }) |expected| {
+        try testing.expect(try stack.navigate(&repo.git, .down));
+        const current = try repo.git.currentBranch();
+        defer testing.allocator.free(current);
+        try testing.expectEqualStrings(expected, current);
+    }
+    try testing.expect(!try stack.navigate(&repo.git, .down));
+    for ([_][]const u8{ "refs/heads/stakrr/z-first", "refs/heads/stakrr/a-second", "refs/heads/work" }) |expected| {
+        try testing.expect(try stack.navigate(&repo.git, .up));
+        const current = try repo.git.currentBranch();
+        defer testing.allocator.free(current);
+        try testing.expectEqualStrings(expected, current);
+    }
+}
+
+test "navigate handles an empty stack and rejects branches outside it" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    const base = try repo.initStack();
+    defer testing.allocator.free(base);
+
+    try testing.expect(try stack.navigate(&repo.git, .down));
+    try testing.expect(!try stack.navigate(&repo.git, .down));
+    try testing.expect(try stack.navigate(&repo.git, .up));
+    try repo.exec(&.{ "switch", "-q", "-c", "outside" });
+    try testing.expectError(error.NotOnStackBranch, stack.navigate(&repo.git, .up));
+    try testing.expectError(error.NotOnStackBranch, stack.navigate(&repo.git, .down));
+    try repo.exec(&.{ "switch", "-q", "--detach" });
+    try testing.expectError(error.DetachedHead, stack.navigate(&repo.git, .up));
+}
+
+test "inspect reports a layer committed on past its recorded boundary as stale" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try repo.initStack();
+    defer testing.allocator.free(base);
+    const b = try repo.commit("B");
+    defer testing.allocator.free(b);
+    try stack.cut(&repo.git, "p1", null);
+    const c = try repo.commit("C");
+    defer testing.allocator.free(c);
+
+    try repo.exec(&.{ "switch", "-q", "stakrr/p1" });
+    const extra = try repo.commit("extra");
+    defer testing.allocator.free(extra);
+    try repo.exec(&.{ "switch", "-q", "work" });
+
+    var snapshot = try stack.inspect(&repo.git);
+    defer snapshot.deinit();
+    try testing.expectEqual(@as(usize, 1), snapshot.layers.len);
+    try testing.expect(snapshot.layers[0].stale());
+    try testing.expectEqualStrings(b, snapshot.layers[0].oid);
+    try testing.expectEqualStrings(extra, snapshot.layers[0].branch_oid);
+    try testing.expectEqual(@as(usize, 1), snapshot.unstacked_commits);
+    try testing.expectError(error.StaleLayers, stack.cut(&repo.git, "p2", null));
+}
+
+test "inspect rejects a layer without a recorded boundary" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try repo.initStack();
+    defer testing.allocator.free(base);
+    const b = try repo.commit("B");
+    defer testing.allocator.free(b);
+    try stack.cut(&repo.git, "p1", null);
+    try repo.exec(&.{ "update-ref", "-d", layout.record_prefix ++ "p1" });
+
+    try testing.expectError(error.InvalidStack, stack.inspect(&repo.git));
+}
+
+test "go switches to a layer by its short name" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try repo.initStack();
+    defer testing.allocator.free(base);
+    const b = try repo.commit("B");
+    defer testing.allocator.free(b);
+    try stack.cut(&repo.git, "p1", null);
+    const c = try repo.commit("C");
+    defer testing.allocator.free(c);
+
+    try stack.go(&repo.git, "p1");
+    try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/p1");
+    try testing.expectError(error.UnknownCut, stack.go(&repo.git, "nope"));
+}
+
+test "inspect snapshots own independent storage across stack changes" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try repo.initStack();
+    defer testing.allocator.free(base);
+    const first = try repo.commit("first");
+    defer testing.allocator.free(first);
+    try stack.cut(&repo.git, "first", null);
+
+    var original = try stack.inspect(&repo.git);
+    defer original.deinit();
+
+    const second = try repo.commit("second");
+    defer testing.allocator.free(second);
+    try stack.cut(&repo.git, "second", null);
+    {
+        var updated = try stack.inspect(&repo.git);
+        defer updated.deinit();
+        try testing.expectEqual(@as(usize, 2), updated.layers.len);
+        try testing.expectEqualStrings(second, updated.work_oid);
+        _ = try stack.reset(&repo.git, .{ .delete_layers = true });
+    }
+
+    try testing.expectEqualStrings("refs/heads/main", original.config.base_ref);
+    try testing.expectEqualStrings("refs/heads/work", original.config.work_ref);
+    try testing.expectEqualStrings(base, original.config.anchor_oid);
+    try testing.expectEqualStrings(first, original.work_oid);
+    try testing.expectEqual(@as(usize, 1), original.layers.len);
+    try testing.expectEqualStrings("refs/heads/stakrr/first", original.layers[0].ref_name);
+    try testing.expectEqualStrings(first, original.layers[0].oid);
+    try testing.expectEqual(@as(usize, 1), original.layers[0].commits);
+    try testing.expectEqual(@as(usize, 0), original.unstacked_commits);
 }

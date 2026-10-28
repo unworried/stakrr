@@ -100,6 +100,10 @@ pub fn printStatus(
             layer.commits,
             plural(layer.commits, "commit", "commits"),
         });
+        if (layer.stale()) {
+            try w.writeAll("  ");
+            try term.styled(out, .warn, "stale", .{});
+        }
         try w.writeByte('\n');
     }
 
