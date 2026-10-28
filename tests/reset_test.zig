@@ -126,3 +126,69 @@ test "reset refuses to delete a checked-out layer" {
     );
     try testing.expect(try refExists(&repo, "refs/stakrr/anchor"));
 }
+
+test "reset refuses to delete a layer checked out in another worktree" {
+    for ([_]bool{ false, true }) |detached| {
+        var repo = try Repo.init();
+        defer repo.deinit();
+
+        const base = try initialize(&repo);
+        defer testing.allocator.free(base);
+        const b = try repo.commit("B");
+        defer testing.allocator.free(b);
+        try stack.cut(&repo.git, "p1", null);
+
+        // Newlines in paths must not be confused with porcelain fields.
+        try repo.exec(&.{ "worktree", "add", "-q", "linked\nbranch refs/heads/stakrr/other", "stakrr/p1" });
+        if (detached) try repo.exec(&.{ "switch", "-q", "--detach", "HEAD" });
+
+        try testing.expectError(error.LayerCheckedOut, stack.reset(&repo.git, true));
+
+        // Refusal must leave both the shared state and the linked HEAD intact.
+        var snapshot = try stack.inspect(&repo.git);
+        defer snapshot.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 1), snapshot.layers.len);
+        const linked_head = try repo.git.output(&.{ "-C", "linked\nbranch refs/heads/stakrr/other", "rev-parse", "HEAD" });
+        defer testing.allocator.free(linked_head);
+        try testing.expectEqualStrings(b, linked_head);
+    }
+}
+
+test "reset can keep a layer checked out in another worktree" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+    const b = try repo.commit("B");
+    defer testing.allocator.free(b);
+    try stack.cut(&repo.git, "p1", null);
+    try repo.exec(&.{ "worktree", "add", "-q", "linked", "stakrr/p1" });
+
+    const result = try stack.reset(&repo.git, false);
+    try testing.expectEqual(@as(usize, 1), result.kept_layers);
+    const linked_head = try repo.git.output(&.{ "-C", "linked", "rev-parse", "HEAD" });
+    defer testing.allocator.free(linked_head);
+    try testing.expectEqualStrings(b, linked_head);
+}
+
+test "reset allows another worktree on an unrelated branch" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+    const b = try repo.commit("B");
+    defer testing.allocator.free(b);
+    try stack.cut(&repo.git, "p1", null);
+    // A path can contain text that looks like a branch field in non-NUL output.
+    const path = "linked\nbranch refs/heads/stakrr/fake";
+    try repo.exec(&.{ "worktree", "add", "-q", path, "main" });
+
+    const result = try stack.reset(&repo.git, true);
+    try testing.expectEqual(@as(usize, 1), result.deleted_layers);
+    try testing.expect(!try refExists(&repo, "refs/heads/stakrr/p1"));
+    const linked_head = try repo.git.output(&.{ "-C", path, "rev-parse", "HEAD" });
+    defer testing.allocator.free(linked_head);
+    try testing.expectEqualStrings(base, linked_head);
+}
