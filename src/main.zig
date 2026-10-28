@@ -161,6 +161,7 @@ fn userError(err: anyerror) ?[]const u8 {
         error.InvalidCutBoundary, error.CutOutsideWork => "revision is outside the next unstacked segment",
         error.GitFailed => "git command failed",
         error.GitTerminated => "git was terminated by a signal",
+        error.SymbolicRef => "managed refs must be direct, not symbolic (restore the direct ref before retrying)",
         error.InvalidRefName => "invalid Git branch name",
         error.InvalidOid => "invalid Git object id",
         error.NotGitRepository => "not inside a Git repository",
