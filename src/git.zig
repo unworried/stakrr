@@ -16,6 +16,7 @@ pub const Error = error{
     InvalidGitConfig,
     InvalidGitOutput,
     StreamTooLong,
+    UnsupportedGitVersion,
 };
 
 /// Optional sink for the stderr of the last failed Git command.
@@ -617,6 +618,57 @@ pub const Git = struct {
             try args.appendSlice(self.allocator, &.{ "-p", parent });
         }
         return self.output(args.items);
+    }
+
+    /// Three-way merge of two commits in memory; neither the index nor the
+    /// worktree is touched. Returns the merged tree, or null when the merge
+    /// conflicts. Needs Git 2.40 or newer for the explicit merge base.
+    pub fn mergeTree(self: *const Git, base: []const u8, ours: []const u8, theirs: []const u8) !?[]u8 {
+        if (!isOid(base) or !isOid(ours) or !isOid(theirs)) return error.InvalidOid;
+        const merge_base = try std.fmt.allocPrint(self.allocator, "--merge-base={s}", .{base});
+        defer self.allocator.free(merge_base);
+        const result = try self.run(&.{ "merge-tree", "--write-tree", "--no-messages", merge_base, ours, theirs });
+        defer self.allocator.free(result.stderr);
+        errdefer self.allocator.free(result.stdout);
+        switch (try exitCode(result)) {
+            0 => return try self.allocator.realloc(result.stdout, std.mem.trimEnd(u8, result.stdout, "\r\n").len),
+            1 => {
+                self.allocator.free(result.stdout);
+                return null;
+            },
+            129 => return error.UnsupportedGitVersion,
+            else => return self.fail(result.stderr),
+        }
+    }
+
+    /// A copy of `source` with another tree and a single parent. Author,
+    /// committer and message are kept; signatures are dropped because they
+    /// would no longer verify.
+    pub fn rewriteCommit(self: *const Git, source: []const u8, tree: []const u8, parent: []const u8) ![]u8 {
+        if (!isOid(source) or !isOid(tree) or !isOid(parent)) return error.InvalidOid;
+        const raw = try self.outputRaw(&.{ "cat-file", "commit", source });
+        defer self.allocator.free(raw);
+        const split = std.mem.indexOf(u8, raw, "\n\n") orelse return error.InvalidGitOutput;
+
+        var data: Io.Writer.Allocating = .init(self.allocator);
+        defer data.deinit();
+        try data.writer.print("tree {s}\nparent {s}\n", .{ tree, parent });
+
+        var skipping = false;
+        var lines = std.mem.splitScalar(u8, raw[0..split], '\n');
+        while (lines.next()) |line| {
+            // a header continues on lines that start with a space
+            if (line.len == 0 or line[0] != ' ') {
+                skipping = for ([_][]const u8{ "tree ", "parent ", "gpgsig", "mergetag" }) |name| {
+                    if (std.mem.startsWith(u8, line, name)) break true;
+                } else false;
+            }
+            if (skipping) continue;
+            try data.writer.writeAll(line);
+            try data.writer.writeByte('\n');
+        }
+        try data.writer.writeAll(raw[split + 1 ..]);
+        return self.writeObject("commit", data.written());
     }
 
     pub fn switchBranch(self: *const Git, ref_name: []const u8) !void {
