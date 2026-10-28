@@ -123,7 +123,7 @@ fn fail(
         stderr.print(" unexpected failure ({s})\n", .{@errorName(err)}) catch {};
     }
 
-    if (err == error.GitFailed) {
+    if (err == error.GitFailed or err == error.SymbolicRef) {
         if (diagnostics) |diag| {
             if (diag.len != 0) {
                 term.styled(errout, .dim, "git:", .{}) catch {};
@@ -169,6 +169,7 @@ fn userError(err: anyerror) ?[]const u8 {
         error.DetachedHead => "detached HEAD is unsupported",
         error.InvalidGitConfig => "stakrr.state has multiple or empty values (run 'stakrr reset')",
         error.InvalidGitOutput => "unexpected output from git",
+        error.UnsupportedRefStorage => "stack ref discovery requires Git's files ref storage (loose or packed refs)",
         error.UnsupportedGitVersion => "fix requires Git 2.40 or newer (merge-tree --merge-base)",
         error.StreamTooLong => "git output exceeded the size limit",
         error.FileNotFound => "git executable not found on PATH",
