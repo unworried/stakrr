@@ -22,7 +22,6 @@ pub const Error = git_mod.Error || coordination.Error || error{
     NotOnWorkBranch,
     InvalidLayerName,
     LayerExists,
-    LayerCheckedOut,
     EmptyCut,
     InvalidCutBoundary,
     CutOutsideWork,
@@ -421,16 +420,12 @@ pub fn reset(git: *const Git, delete_layers: bool) !ResetResult {
         try updates.append(allocator, .{ .delete = ref });
     };
 
-    // Shared refs may be checked out in any worktree, including when this
-    // worktree has a detached HEAD. NUL fields keep unusual paths unambiguous.
+    // Deleting a checked-out branch would leave HEAD pointing nowhere.
     if (delete_layers and layer_count != 0) {
-        const worktrees = try git.output(&.{ "worktree", "list", "--porcelain", "-z" });
-        defer allocator.free(worktrees);
-        var fields = std.mem.splitScalar(u8, worktrees, 0);
-        while (fields.next()) |field| {
-            if (std.mem.startsWith(u8, field, "branch " ++ layout.layer_prefix))
-                return error.LayerCheckedOut;
-        }
+        const names = try allocator.alloc([]const u8, layer_count);
+        defer allocator.free(names);
+        for (layers.refs, names) |ref, *name| name.* = ref.name;
+        try coordination.requireDeletable(git, names);
     }
 
     // refs first: if unsetting config fails, reset can simply be re-run

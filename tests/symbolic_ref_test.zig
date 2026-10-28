@@ -503,3 +503,134 @@ test "CLI reports the symbolic ref and target while preserving user work" {
     try before.expectUnchanged(&repo);
     try expectSymbolic(&repo, layout.tip_ref);
 }
+
+test "reset refuses to delete the checked-out layer through branch aliases" {
+    for (formats) |format| {
+        for ([_]bool{ false, true }) |nested| {
+            var repo = try Repo.initOptions(.{ .object_format = format });
+            defer repo.deinit();
+            try setup(&repo);
+            try repo.exec(&.{ "switch", "-q", "stakrr/models" });
+            try repo.exec(&.{ "symbolic-ref", "refs/heads/alias", subject });
+            const head_target = if (nested) "refs/heads/outer-alias" else "refs/heads/alias";
+            if (nested) try repo.exec(&.{ "symbolic-ref", head_target, "refs/heads/alias" });
+            try repo.exec(&.{ "symbolic-ref", "HEAD", head_target });
+
+            // Confirm the fixture has an indirect HEAD and Git considers the
+            // managed layer checked out, rather than merely pointing at its OID.
+            try repo.expectOutput(&.{ "symbolic-ref", "--no-recurse", "HEAD" }, head_target);
+            try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, subject);
+            const worktrees = try repo.git.outputRaw(&.{ "worktree", "list", "--porcelain", "-z" });
+            defer testing.allocator.free(worktrees);
+            try testing.expect(std.mem.indexOf(u8, worktrees, "branch " ++ subject ++ "\x00") != null);
+            var before = try Snapshot.capture(&repo);
+            defer before.deinit();
+
+            try testing.expectError(error.LayerCheckedOut, reset(&repo, true));
+            try before.expectUnchanged(&repo);
+
+            // The aliases themselves must not prevent deletion once the layer
+            // is no longer checked out.
+            try repo.exec(&.{ "switch", "-q", "work" });
+            try reset(&repo, true);
+            try expectAbsent(&repo, subject);
+            try repo.expectOutput(&.{ "symbolic-ref", "--no-recurse", "refs/heads/alias" }, subject);
+        }
+    }
+}
+
+test "reset preserves dirty work when another worktree owns a requested layer" {
+    for (formats) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+        try setup(&repo);
+        const path = "linked space\nbranch refs/heads/stakrr/fake";
+        try repo.exec(&.{ "worktree", "add", "-q", path, "stakrr/models" });
+        try dirty(&repo);
+        var before = try Snapshot.capture(&repo);
+        defer before.deinit();
+        const linked_head = try repo.git.outputRaw(&.{ "-C", path, "rev-parse", "HEAD" });
+        defer testing.allocator.free(linked_head);
+
+        try testing.expectError(error.BranchOccupied, reset(&repo, true));
+        try before.expectUnchanged(&repo);
+        const after_head = try repo.git.outputRaw(&.{ "-C", path, "rev-parse", "HEAD" });
+        defer testing.allocator.free(after_head);
+        try testing.expectEqualStrings(linked_head, after_head);
+        const result = try cli.run(&repo, &.{ "reset", "--delete-layers" });
+        defer result.deinit();
+        try testing.expectEqual(@as(?u8, 1), result.code);
+        try testing.expect(std.mem.indexOf(u8, result.stderr, "checked out in another worktree") != null);
+        try before.expectUnchanged(&repo);
+
+        // Refusal releases the shared lock, allowing retry after detaching.
+        try repo.exec(&.{ "-C", path, "switch", "-q", "--detach" });
+        try reset(&repo, true);
+        try expectAbsent(&repo, subject);
+        const tracked = try repo.tmp.dir.readFileAlloc(testing.io, "tracked", testing.allocator, .limited(1024));
+        defer testing.allocator.free(tracked);
+        try testing.expectEqualStrings("unstaged work\n", tracked);
+        const untracked = try repo.tmp.dir.readFileAlloc(testing.io, "untracked", testing.allocator, .limited(1024));
+        defer testing.allocator.free(untracked);
+        try testing.expectEqualStrings("untracked work\n", untracked);
+    }
+}
+
+test "reset distinguishes own and duplicate layer checkouts with separate Git directories" {
+    for (formats) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+        try repo.exec(&.{ "init", "-q", "--separate-git-dir=.git-data space" });
+        try setup(&repo);
+        try repo.exec(&.{ "switch", "-q", "stakrr/models" });
+        var before = try Snapshot.capture(&repo);
+        defer before.deinit();
+        try testing.expectError(error.LayerCheckedOut, reset(&repo, true));
+        try before.expectUnchanged(&repo);
+        try repo.exec(&.{ "switch", "-q", "work" });
+
+        const path = ".git-data space/duplicate space\n";
+        try repo.exec(&.{ "worktree", "add", "-q", path, "stakrr/models" });
+        try repo.exec(&.{ "worktree", "add", "-q", "--force", ".git-data space/second", "stakrr/models" });
+        try testing.expectError(error.BranchOccupied, reset(&repo, true));
+        try repo.exec(&.{ "-C", path, "switch", "-q", "--detach" });
+        // A second forced checkout must still block after the first detaches.
+        try testing.expectError(error.BranchOccupied, reset(&repo, true));
+        try repo.exec(&.{ "-C", ".git-data space/second", "switch", "-q", "--detach" });
+        try reset(&repo, true);
+        try expectAbsent(&repo, subject);
+    }
+}
+
+test "reset checks layers from a linked worktree of a bare repository" {
+    for (formats) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+        testing.allocator.free(try repo.commit("seed"));
+        try repo.exec(&.{ "clone", "--bare", "-q", ".", ".git/bare.git" });
+        const metadata = try repo.tmp.dir.realPathFileAlloc(testing.io, ".git", testing.allocator);
+        defer testing.allocator.free(metadata);
+        const path = try std.fs.path.join(testing.allocator, &.{ metadata, "linked main\n" });
+        defer testing.allocator.free(path);
+        try repo.exec(&.{ "-C", ".git/bare.git", "worktree", "add", "-q", path, "main" });
+        const dir = try repo.tmp.dir.openDir(testing.io, path, .{});
+        defer dir.close(testing.io);
+        // Borrow fixture ownership and use its existing helpers in this worktree.
+        var view = repo;
+        view.tmp.dir = dir;
+        view.git.cwd = dir;
+        try view.exec(&.{ "config", "user.name", "Stakrr Test" });
+        try view.exec(&.{ "config", "user.email", "test@stakrr.local" });
+        try view.exec(&.{ "config", "core.hooksPath", "/dev/null" });
+        try view.exec(&.{ "config", "commit.gpgsign", "false" });
+        try setup(&view);
+        try view.exec(&.{ "switch", "-q", "stakrr/models" });
+        var before = try Snapshot.capture(&view);
+        defer before.deinit();
+        try testing.expectError(error.LayerCheckedOut, reset(&view, true));
+        try before.expectUnchanged(&view);
+        try view.exec(&.{ "switch", "-q", "work" });
+        try reset(&view, true);
+        try expectAbsent(&view, subject);
+    }
+}

@@ -67,3 +67,20 @@ Drain stdout and stderr while writing the prepared request. Preserve Git
 diagnostics on refusal, and release child processes and pipes on transport
 errors. Individual ref writes are crash-atomic; this protocol alone does not
 recover a transaction interrupted between ref writes.
+
+## Branch availability across worktrees
+
+Use the shared branch guards before rewriting or deleting branches. Parse
+`worktree list --porcelain -z` to preserve paths containing spaces and newlines,
+and compare full branch ref names. Use Git's resolved checked-out branch so
+single and nested branch aliases cannot hide a layer checkout.
+
+A rewrite may include the caller's own branch; deletion must also refuse that
+checkout with `LayerCheckedOut`. Any requested branch checked out in another
+worktree fails with `BranchOccupied`. Check every worktree, including forced
+duplicate checkouts, separate Git directories and linked worktrees of bare
+repositories. Detached and unrelated checkouts do not block the operation.
+
+`reset --delete-layers` runs the deletion guard under the mutation lock before
+publishing refs or removing config. Refusal preserves refs, config, HEAD, the
+index and user work. Keeping layers permits their checkouts in other worktrees.
