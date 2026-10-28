@@ -293,6 +293,7 @@ fn userError(err: anyerror) ?[]const u8 {
         error.StreamTooLong => "git output exceeded the size limit",
         error.FileNotFound => "git executable not found on PATH",
         error.OutOfMemory => "out of memory",
+        error.MutationInProgress => "another stakrr mutation is running",
         error.NotOnStackBranch => "current branch is outside the configured stack",
         else => null,
     };

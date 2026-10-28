@@ -141,6 +141,18 @@ pub const Git = struct {
         return self.allocator.dupe(u8, trimmed);
     }
 
+    /// Git path output is terminated by one newline; path bytes may themselves
+    /// end in newlines, unlike ordinary text output.
+    pub fn path(self: *const Git, args: []const []const u8) ![]u8 {
+        const result = try self.run(args);
+        defer self.allocator.free(result.stderr);
+        errdefer self.allocator.free(result.stdout);
+        if ((try exitCode(result)) != 0) return self.fail(result.stderr);
+        if (result.stdout.len == 0 or result.stdout[result.stdout.len - 1] != '\n')
+            return error.InvalidGitOutput;
+        return self.allocator.realloc(result.stdout, result.stdout.len - 1);
+    }
+
     /// execute a Git command that must succeed without retaining stdout
     pub fn exec(self: *const Git, args: []const []const u8) !void {
         const result = try self.run(args);
