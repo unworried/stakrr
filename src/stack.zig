@@ -1,6 +1,7 @@
 const std = @import("std");
 const git_mod = @import("git.zig");
 const Git = git_mod.Git;
+const layout = @import("layout.zig");
 
 /// Domain errors raised by stack operations. Every member needs a
 /// user-facing message in main.zig; a test there enforces it.
@@ -28,8 +29,8 @@ pub const Error = git_mod.Error || error{
 };
 
 /// git config key holding "<version> <base_ref> <work_ref>"
-pub const state_key = "stakrr.state";
-pub const state_version = "v1";
+pub const state_key = layout.state_key;
+pub const state_version = layout.state_version;
 
 pub const Config = struct {
     base_ref: []const u8,
@@ -89,7 +90,7 @@ pub fn initStack(
     try git.ensureWorkTree();
 
     // 2. refuse existing initialisation
-    if (try git.configGet(state_key)) |existing| {
+    if (try git.configGet(layout.state_key)) |existing| {
         allocator.free(existing);
         return error.AlreadyInitialized;
     }
@@ -98,7 +99,7 @@ pub fn initStack(
     const existing_layers = try git.listStackRefs();
     defer allocator.free(existing_layers);
     if (existing_layers.len != 0) return error.ExistingStackRefs;
-    for ([_][]const u8{ git_mod.tip_ref, git_mod.anchor_ref }) |ref_name| {
+    for ([_][]const u8{ layout.tip_ref, layout.anchor_ref }) |ref_name| {
         const existing = try git.readRef(ref_name);
         defer if (existing) |oid| allocator.free(oid);
         if (existing != null) return error.ExistingStackRefs;
@@ -109,15 +110,15 @@ pub fn initStack(
     defer allocator.free(work_ref);
 
     // accept either a branch name or its full refs/heads/ ref
-    const base_ref = if (std.mem.startsWith(u8, base_name, "refs/heads/"))
+    const base_ref = if (std.mem.startsWith(u8, base_name, layout.branch_prefix))
         try allocator.dupe(u8, base_name)
     else
-        try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{base_name});
+        try std.fmt.allocPrint(allocator, layout.branch_prefix ++ "{s}", .{base_name});
     defer allocator.free(base_ref);
 
     // layer names live exclusively under refs/heads/stakrr/
-    if (std.mem.startsWith(u8, work_ref, git_mod.layer_prefix) or
-        std.mem.startsWith(u8, base_ref, git_mod.layer_prefix))
+    if (std.mem.startsWith(u8, work_ref, layout.layer_prefix) or
+        std.mem.startsWith(u8, base_ref, layout.layer_prefix))
         return error.ReservedBranchNamespace;
 
     try git.checkRefFormat(base_ref);
@@ -142,24 +143,24 @@ pub fn initStack(
         return error.MergeCommitsUnsupported;
 
     // 7. claim the anchor; `create` fails if a concurrent init won the race
-    const anchor: Git.ExpectedRef = .{ .name = git_mod.anchor_ref, .oid = base_oid };
+    const anchor: Git.ExpectedRef = .{ .name = layout.anchor_ref, .oid = base_oid };
     try git.transact("stakrr: init", &.{.{ .create = anchor }});
     errdefer git.transact("stakrr: init rollback", &.{.{ .delete = anchor }}) catch {};
 
     // 8. persist the branch pair
     const state = try std.fmt.allocPrint(
         allocator,
-        state_version ++ " {s} {s}",
+        layout.state_version ++ " {s} {s}",
         .{ base_ref, work_ref },
     );
     defer allocator.free(state);
 
-    try git.exec(&.{ "config", "--local", state_key, state });
+    try git.exec(&.{ "config", "--local", layout.state_key, state });
 }
 
 pub fn loadConfig(git: *const Git) !Config {
     const allocator = git.allocator;
-    const raw = (try git.configGet(state_key)) orelse
+    const raw = (try git.configGet(layout.state_key)) orelse
         return error.NotInitialized;
     errdefer allocator.free(raw);
 
@@ -168,7 +169,7 @@ pub fn loadConfig(git: *const Git) !Config {
     const version = tokens.next() orelse
         return error.InvalidConfig;
 
-    if (!std.mem.eql(u8, version, state_version))
+    if (!std.mem.eql(u8, version, layout.state_version))
         return error.UnsupportedConfigVersion;
 
     const base = tokens.next() orelse
@@ -187,7 +188,7 @@ pub fn loadConfig(git: *const Git) !Config {
     if (std.mem.eql(u8, base, work))
         return error.InvalidConfig;
 
-    const anchor = (try git.readRef(git_mod.anchor_ref)) orelse
+    const anchor = (try git.readRef(layout.anchor_ref)) orelse
         return error.InvalidStack;
     errdefer allocator.free(anchor);
 
@@ -308,7 +309,7 @@ pub fn inspect(git: *const Git) !Snapshot {
     }
 
     // the private tip guard must match the highest committed layer
-    const tip = try git.readRef(git_mod.tip_ref);
+    const tip = try git.readRef(layout.tip_ref);
     defer if (tip) |oid| allocator.free(oid);
     if (layers.items.len == 0) {
         if (tip != null) return error.InvalidStack;
@@ -358,7 +359,7 @@ pub fn cut(
 
     const new_ref = try std.fmt.allocPrint(
         allocator,
-        git_mod.layer_prefix ++ "{s}",
+        layout.layer_prefix ++ "{s}",
         .{name},
     );
     defer allocator.free(new_ref);
@@ -413,7 +414,7 @@ pub fn cut(
         new_ref,
         target,
         .{
-            .name = git_mod.anchor_ref,
+            .name = layout.anchor_ref,
             .oid = snapshot.config.anchor_oid,
         },
         .{
@@ -448,7 +449,7 @@ pub fn reset(git: *const Git, delete_layers: bool) !ResetResult {
     var updates: std.ArrayList(Git.RefUpdate) = .empty;
     defer updates.deinit(allocator);
 
-    const internal = [_][]const u8{ git_mod.tip_ref, git_mod.anchor_ref };
+    const internal = [_][]const u8{ layout.tip_ref, layout.anchor_ref };
     var internal_oids: [internal.len]?[]u8 = @splat(null);
     defer for (internal_oids) |maybe| if (maybe) |oid| allocator.free(oid);
 
@@ -483,7 +484,7 @@ pub fn reset(git: *const Git, delete_layers: bool) !ResetResult {
         defer allocator.free(worktrees);
         var fields = std.mem.splitScalar(u8, worktrees, 0);
         while (fields.next()) |field| {
-            if (std.mem.startsWith(u8, field, "branch " ++ git_mod.layer_prefix))
+            if (std.mem.startsWith(u8, field, "branch " ++ layout.layer_prefix))
                 return error.LayerCheckedOut;
         }
     }
@@ -492,7 +493,7 @@ pub fn reset(git: *const Git, delete_layers: bool) !ResetResult {
     if (updates.items.len != 0)
         try git.transact("stakrr: reset", updates.items);
 
-    const had_state = try git.configUnset(state_key);
+    const had_state = try git.configUnset(layout.state_key);
 
     if (!had_state and updates.items.len == 0 and layer_count == 0)
         return error.NotInitialized;
