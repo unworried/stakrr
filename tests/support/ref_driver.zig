@@ -13,6 +13,24 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn run(git: *const stakrr.git.Git, args: []const []const u8) !void {
+    if (std.mem.eql(u8, args[0], "recover") or std.mem.eql(u8, args[0], "retain")) {
+        // Journal APIs require the common mutation lock, including in a child.
+        const common = try git.path(&.{ "rev-parse", "--path-format=absolute", "--git-common-dir" });
+        const path = try std.fs.path.join(git.allocator, &.{ common, "stakrr.lock" });
+        const guard = try std.Io.Dir.cwd().createFile(git.io, path, .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true });
+        defer guard.close(git.io);
+        if (std.mem.eql(u8, args[0], "recover")) {
+            if (!try git.recoverTransaction()) return error.ExpectedPendingTransaction;
+        } else {
+            try git.transact("test retained objects", &.{
+                .{ .update = .{ .name = "refs/stakrr/commit", .old = args[1], .new = args[2] } },
+                .{ .create = .{ .name = "refs/stakrr/blob", .oid = args[3] } },
+                .{ .create = .{ .name = "refs/stakrr/tree", .oid = args[4] } },
+                .{ .create = .{ .name = "refs/tags/retained", .oid = args[5] } },
+            });
+        }
+        return;
+    }
     const name = "refs/stakrr/publication-test";
     const old = args[1];
     const new = args[2];
@@ -26,7 +44,7 @@ fn run(git: *const stakrr.git.Git, args: []const []const u8) !void {
         .{ .delete = .{ .name = name, .oid = old } }
     else
         return error.InvalidTestOperation;
-    try git.transact("test symbolic publication", &.{
+    try git.transactRaw("test symbolic publication", &.{
         update,
         .{ .create = .{ .name = "refs/stakrr/unrelated", .oid = new } },
     });

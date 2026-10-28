@@ -2,23 +2,34 @@
 const std = @import("std");
 const Git = @import("git.zig").Git;
 
-pub const Error = error{ MutationInProgress, BranchOccupied, LayerCheckedOut };
+pub const Error = error{ MutationInProgress, BranchOccupied, LayerCheckedOut, GitOperationInProgress };
+
+pub const Guard = struct {
+    file: std.Io.File,
+    recovered: bool,
+
+    pub fn close(self: Guard, io: std.Io) void {
+        self.file.close(io);
+    }
+};
 
 /// Keep the inode: unlinking an advisory lock would allow two owners.
-pub fn lock(git: *const Git) !std.Io.File {
+pub fn lock(git: *const Git) !Guard {
     try git.ensureWorkTree();
     const common = try git.path(&.{ "rev-parse", "--path-format=absolute", "--git-common-dir" });
     defer git.allocator.free(common);
     const path = try std.fs.path.join(git.allocator, &.{ common, "stakrr.lock" });
     defer git.allocator.free(path);
-    return std.Io.Dir.cwd().createFile(git.io, path, .{
+    const guard = std.Io.Dir.cwd().createFile(git.io, path, .{
         .truncate = false,
         .lock = .exclusive,
         .lock_nonblocking = true,
     }) catch |err| switch (err) {
-        error.WouldBlock => error.MutationInProgress,
+        error.WouldBlock => return error.MutationInProgress,
         else => return err,
     };
+    errdefer guard.close(git.io);
+    return .{ .file = guard, .recovered = try git.recoverTransaction() };
 }
 
 /// Worktree porcelain -z keeps paths containing spaces/newlines unambiguous.
@@ -71,5 +82,31 @@ fn requireAvailability(git: *const Git, refs: []const []const u8, allow_current:
                     return if (own) error.LayerCheckedOut else error.BranchOccupied;
             }
         }
+    }
+}
+
+pub const cherry_pick_head = "CHERRY_PICK_HEAD";
+
+pub const OperationOptions = struct {
+    /// the caller owns and validates a stopped cherry-pick
+    allow_cherry_pick: bool = false,
+};
+
+pub fn requireNoGitOperation(git: *const Git, options: OperationOptions) !void {
+    if (!options.allow_cherry_pick) {
+        if (try git.readRef(cherry_pick_head)) |oid| {
+            git.allocator.free(oid);
+            return error.GitOperationInProgress;
+        }
+    }
+    for ([_][]const u8{ "MERGE_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "sequencer" }) |name| {
+        const path = try git.path(&.{ "rev-parse", "--git-path", name });
+        defer git.allocator.free(path);
+        const dir = git.cwd orelse std.Io.Dir.cwd();
+        dir.access(git.io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        return error.GitOperationInProgress;
     }
 }

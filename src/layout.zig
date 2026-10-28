@@ -12,6 +12,9 @@ pub const tip_ref = "refs/stakrr/tip";
 /// the stack's starting commit; also keeps it reachable for gc
 pub const anchor_ref = "refs/stakrr/anchor";
 
+/// Write-ahead intent retained until every ref in a transaction is published.
+pub const transaction_ref = "refs/stakrr/transaction";
+
 /// git config key holding "<version> <base_ref> <work_ref>"
 pub const state_key = "stakrr.state";
 pub const state_version = "v1";

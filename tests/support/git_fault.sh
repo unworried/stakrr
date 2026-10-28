@@ -11,8 +11,12 @@ if [ "${1:-}" = symbolic-ref ] && [ -n "${STAKRR_TEST_LOCK_REF:-}" ] &&
     fi
 fi
 update=false
+partial=false
+race=false
 for arg do
     [ "$arg" != update-ref ] || update=true
+    [ "$arg" != "${STAKRR_TEST_PARTIAL_LABEL:-}" ] || partial=true
+    [ "$arg" != "${STAKRR_TEST_RACE_LABEL:-}" ] || race=true
 done
 # Read the full request before injecting a transport failure, so cleanup tests
 # do not depend on a blocked input writer or the scheduling of short pipe writes.
@@ -48,5 +52,48 @@ if [ "$update" = true ] && [ -n "${STAKRR_TEST_SYMREF_LABEL:-}" ]; then
             break
         fi
     done
+fi
+# Advance a ref after stakrr saved its intent, before Git prepares publication.
+if [ "$update" = true ] && [ "$race" = true ]; then
+    "$STAKRR_TEST_GIT" update-ref "$STAKRR_TEST_RACE_REF" "$STAKRR_TEST_RACE_NEW" "$STAKRR_TEST_RACE_OLD" || exit $?
+fi
+# Model a files-backend transaction interrupted between individual ref writes.
+# Applying a prefix makes the crash deterministic; the production transaction
+# still has to preserve enough intent to finish both writes and deletions.
+if [ "$update" = true ] && [ "$partial" = true ]; then
+    # The production client waits for prepare before deciding whether to commit.
+    # Read only that phase; waiting for EOF here would deadlock the handshake.
+    payload=
+    while IFS= read -r line; do
+        payload="${payload}${line}
+"
+        [ "$line" != prepare ] || break
+    done
+    writes=$(printf '%s\n' "$payload" | awk '$1 == "create" || $1 == "update" || $1 == "delete" { n++ } END { print n+0 }')
+    if [ "$writes" -gt 1 ] || [ "${STAKRR_TEST_PARTIAL_WRITES:-}" = 0 ]; then
+        # Real Git acknowledges preparation before writing any refs at commit.
+        printf 'start: ok\nprepare: ok\n'
+        IFS= read -r decision || exit 1
+        if [ "$decision" = abort ]; then
+            printf 'abort: ok\n'
+            exit 0
+        fi
+        [ "$decision" = commit ] || exit 1
+        count=0
+        while IFS= read -r line; do
+            [ "$count" -ne "${STAKRR_TEST_PARTIAL_WRITES:-1}" ] || break
+            case "$line" in
+                create\ *|update\ *|delete\ *)
+                    printf '%s\n' "$line" | "$STAKRR_TEST_GIT" update-ref --no-deref --stdin || exit $?
+                    count=$((count + 1)) ;;
+            esac
+        done <<EOF
+$payload
+EOF
+        [ "${STAKRR_TEST_PARTIAL_EXIT:-}" = 1 ] || kill -KILL "$PPID"
+        exit "${STAKRR_TEST_PARTIAL_STATUS:-137}"
+    fi
+    { printf '%s' "$payload"; cat; } | "$STAKRR_TEST_GIT" "$@"
+    exit $?
 fi
 exec "$STAKRR_TEST_GIT" "$@"

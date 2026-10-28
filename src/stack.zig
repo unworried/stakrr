@@ -191,6 +191,7 @@ fn loadConfig(git: *const Git) !Config {
 
 pub fn inspect(parent_git: *const Git) !Snapshot {
     try parent_git.ensureWorkTree();
+    try parent_git.requireNoPendingTransaction();
 
     // The snapshot owns everything inspection allocates.
     var arena: std.heap.ArenaAllocator = .init(parent_git.allocator);

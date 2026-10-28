@@ -123,7 +123,7 @@ fn fail(
         stderr.print(" unexpected failure ({s})\n", .{@errorName(err)}) catch {};
     }
 
-    if (err == error.GitFailed or err == error.SymbolicRef) {
+    if (err == error.GitFailed or err == error.SymbolicRef or err == error.RefTransactionChanged) {
         if (diagnostics) |diag| {
             if (diag.len != 0) {
                 term.styled(errout, .dim, "git:", .{}) catch {};
@@ -156,6 +156,10 @@ fn userError(err: anyerror) ?[]const u8 {
         error.NotOnWorkBranch => "cut must run on the rolling work branch",
         error.InvalidLayerName => "invalid layer name",
         error.LayerExists => "a layer with that name already exists or conflicts with one",
+        error.GitOperationInProgress => "finish the active Git operation before proceeding",
+        error.InvalidRefTransaction => "invalid interrupted ref transaction; inspect refs/stakrr/transaction before retrying",
+        error.RefTransactionPending => "ref publication is pending (retry a stack mutation to finish it)",
+        error.RefTransactionChanged => "interrupted ref transaction has unexpected refs; inspect refs/stakrr/transaction before retrying",
         error.BranchOccupied => "a required branch is checked out in another worktree",
         error.LayerCheckedOut => "cannot delete layers while a layer branch is checked out",
         error.EmptyCut => "no new commits since previous layer",

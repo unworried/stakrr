@@ -8,6 +8,7 @@ operation finishes. Linked worktrees share this advisory lock. If another
 stakrr mutation holds it, refuse immediately with `another stakrr mutation
 is running` (exit 1), without changing refs, config, HEAD, the index or user
 files. Read-only `status` does not acquire the lock.
+After acquiring it, recover pending ref publication before reading stack state.
 
 Release the lock on success and failure by closing its file. Keep the file
 in place: unlinking it could let two processes lock different inodes. An
@@ -84,3 +85,25 @@ repositories. Detached and unrelated checkouts do not block the operation.
 `reset --delete-layers` runs the deletion guard under the mutation lock before
 publishing refs or removing config. Refusal preserves refs, config, HEAD, the
 index and user work. Keeping layers permits their checkouts in other worktrees.
+
+## Interrupted ref publication
+
+Before a transaction with multiple ref writes, save its expected old and new
+values under `refs/stakrr/transaction`. Retain commits, trees, blobs and annotated
+tag contents so garbage collection cannot discard objects needed for recovery.
+Verify old values and create the intent ref in one compare-and-swap transaction,
+then publish the requested updates. Clear the intent only after verifying all
+new values. Single-ref writes use Git's existing per-ref atomicity.
+
+The next stack mutation recovers under the shared lock. Refs already at the new
+value are verified; refs still at the old value are advanced or deleted. Refuse
+unexpected values, symbolic substitutions, occupied branches, checked-out branch
+deletions and active Git operations. Keep the intent for inspection and retry.
+Never remove Git-owned lock files. A confirmed refusal before preparation cancels
+the intent; uncertain or partial publication retains it unless every old value
+still matches.
+
+Read-only status never repairs publication. It reports a pending transaction
+when any new value remains unpublished, but may inspect a completed transaction
+awaiting intent cleanup. Retry a stack mutation to finish pending publication;
+reset's config removal remains a separate step after ref recovery.

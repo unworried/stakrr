@@ -69,6 +69,7 @@ pub fn build(b: *std.Build) void {
         "tests/reset_test.zig",
         "tests/cli_test.zig",
         "tests/symbolic_ref_test.zig",
+        "tests/transaction_test.zig",
     };
 
     for (integration_tests) |path| {
