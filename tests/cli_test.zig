@@ -1,55 +1,12 @@
 const std = @import("std");
 const testing = std.testing;
-const exe_path = @import("cli_options").exe_path;
 const Repo = @import("support/repo.zig").Repo;
-
-const Run = struct {
-    code: u8,
-    stdout: []u8,
-    stderr: []u8,
-
-    fn deinit(self: Run) void {
-        testing.allocator.free(self.stdout);
-        testing.allocator.free(self.stderr);
-    }
-};
-
-/// run the built stakrr binary inside the test repository
-fn stakrr(repo: *const Repo, args: []const []const u8) !Run {
-    return stakrrAt(repo, args, repo.tmp.dir);
-}
-
-fn stakrrAt(repo: *const Repo, args: []const []const u8, cwd: std.Io.Dir) !Run {
-    // the build passes a path relative to the build root; the child runs
-    // inside the temp repository, so resolve it first
-    const exe = try std.Io.Dir.cwd().realPathFileAlloc(testing.io, exe_path, testing.allocator);
-    defer testing.allocator.free(exe);
-
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(testing.allocator);
-    try argv.append(testing.allocator, exe);
-    try argv.appendSlice(testing.allocator, args);
-
-    const result = try std.process.run(testing.allocator, testing.io, .{
-        .argv = argv.items,
-        .cwd = .{ .dir = cwd },
-        .environ_map = repo.env,
-    });
-
-    return .{
-        .code = switch (result.term) {
-            .exited => |code| code,
-            else => return error.Terminated,
-        },
-        .stdout = result.stdout,
-        .stderr = result.stderr,
-    };
-}
+const cli = @import("support/cli.zig");
+const stakrr = cli.run;
+const stakrrAt = cli.runAt;
 
 fn setup(repo: *const Repo) !void {
-    const base = try repo.commit("base");
-    testing.allocator.free(base);
-    try repo.exec(&.{ "switch", "-q", "-c", "work" });
+    testing.allocator.free(try repo.initWork());
 }
 
 test "cli: full init, cut, status, reset flow" {
@@ -59,7 +16,7 @@ test "cli: full init, cut, status, reset flow" {
 
     const init = try stakrr(&repo, &.{ "init", "--base", "main" });
     defer init.deinit();
-    try testing.expectEqual(@as(u8, 0), init.code);
+    try testing.expectEqual(@as(?u8, 0), init.code);
     try testing.expectEqualStrings("", init.stderr);
 
     const b = try repo.commit("B");
@@ -67,12 +24,12 @@ test "cli: full init, cut, status, reset flow" {
 
     const cut = try stakrr(&repo, &.{ "cut", "p1" });
     defer cut.deinit();
-    try testing.expectEqual(@as(u8, 0), cut.code);
+    try testing.expectEqual(@as(?u8, 0), cut.code);
     try testing.expectEqualStrings("created layer: stakrr/p1\n", cut.stdout);
 
     const status = try stakrr(&repo, &.{"status"});
     defer status.deinit();
-    try testing.expectEqual(@as(u8, 0), status.code);
+    try testing.expectEqual(@as(?u8, 0), status.code);
     try testing.expectEqualStrings(
         \\stack  main → work
         \\
@@ -86,12 +43,12 @@ test "cli: full init, cut, status, reset flow" {
 
     const reset = try stakrr(&repo, &.{ "reset", "--delete-layers" });
     defer reset.deinit();
-    try testing.expectEqual(@as(u8, 0), reset.code);
+    try testing.expectEqual(@as(?u8, 0), reset.code);
     try testing.expectEqualStrings("stack reset\ndeleted 1 layer branch\n", reset.stdout);
 
     const again = try stakrr(&repo, &.{ "init", "--base=main" });
     defer again.deinit();
-    try testing.expectEqual(@as(u8, 0), again.code);
+    try testing.expectEqual(@as(?u8, 0), again.code);
 }
 
 test "cli: navigate between work, layers and base without moving their refs" {
@@ -101,12 +58,12 @@ test "cli: navigate between work, layers and base without moving their refs" {
 
     const init = try stakrr(&repo, &.{ "init", "--base", "main" });
     defer init.deinit();
-    try testing.expectEqual(@as(u8, 0), init.code);
+    try testing.expectEqual(@as(?u8, 0), init.code);
     const b = try repo.commit("B");
     defer testing.allocator.free(b);
     const cut = try stakrr(&repo, &.{ "cut", "p1" });
     defer cut.deinit();
-    try testing.expectEqual(@as(u8, 0), cut.code);
+    try testing.expectEqual(@as(?u8, 0), cut.code);
     const before = try repo.git.output(&.{"show-ref"});
     defer testing.allocator.free(before);
 
@@ -121,7 +78,7 @@ test "cli: navigate between work, layers and base without moving their refs" {
     for (steps) |step| {
         const result = try stakrr(&repo, &.{step.command});
         defer result.deinit();
-        try testing.expectEqual(@as(u8, 0), result.code);
+        try testing.expectEqual(@as(?u8, 0), result.code);
         try testing.expectEqualStrings(step.stdout, result.stdout);
         try testing.expectEqualStrings("", result.stderr);
         const branch = try repo.git.output(&.{ "branch", "--show-current" });
@@ -140,12 +97,12 @@ test "cli: status renders a detached HEAD without selecting a branch" {
 
     const init = try stakrr(&repo, &.{ "init", "--base", "main" });
     defer init.deinit();
-    try testing.expectEqual(@as(u8, 0), init.code);
+    try testing.expectEqual(@as(?u8, 0), init.code);
     try repo.exec(&.{ "switch", "--detach", "-q", "HEAD" });
 
     const status = try stakrr(&repo, &.{"status"});
     defer status.deinit();
-    try testing.expectEqual(@as(u8, 0), status.code);
+    try testing.expectEqual(@as(?u8, 0), status.code);
     try testing.expectEqualStrings("", status.stderr);
     try testing.expect(std.mem.indexOf(u8, status.stdout, "stack  main → work") != null);
     try testing.expect(std.mem.indexOf(u8, status.stdout, "▸") == null);
@@ -158,7 +115,7 @@ test "cli: failures print one clean message and exit non-zero" {
 
     const status = try stakrr(&repo, &.{"status"});
     defer status.deinit();
-    try testing.expectEqual(@as(u8, 1), status.code);
+    try testing.expectEqual(@as(?u8, 1), status.code);
     try testing.expectEqualStrings(
         "error: stack not initialized (run 'stakrr init --base <branch>')\n",
         status.stderr,
@@ -166,7 +123,7 @@ test "cli: failures print one clean message and exit non-zero" {
 
     const usage = try stakrr(&repo, &.{ "cut", "a", "b" });
     defer usage.deinit();
-    try testing.expectEqual(@as(u8, 2), usage.code);
+    try testing.expectEqual(@as(?u8, 2), usage.code);
     try testing.expect(std.mem.startsWith(u8, usage.stderr, "error: invalid arguments"));
 }
 
@@ -183,7 +140,7 @@ test "cli: git failures include git's stderr" {
 
     const cut = try stakrr(&repo, &.{ "cut", "p1", "--at", "does-not-exist" });
     defer cut.deinit();
-    try testing.expectEqual(@as(u8, 1), cut.code);
+    try testing.expectEqual(@as(?u8, 1), cut.code);
     try testing.expect(std.mem.startsWith(u8, cut.stderr, "error: git command failed\ngit: "));
 }
 
@@ -209,7 +166,7 @@ test "cli: help aligns the command list" {
 
     const help = try stakrr(&repo, &.{"help"});
     defer help.deinit();
-    try testing.expectEqual(@as(u8, 0), help.code);
+    try testing.expectEqual(@as(?u8, 0), help.code);
     try testing.expect(std.mem.startsWith(u8, help.stdout, "stakrr "));
     try testing.expect(std.mem.indexOf(
         u8,
@@ -229,7 +186,7 @@ test "cli: version" {
 
     const version = try stakrr(&repo, &.{"--version"});
     defer version.deinit();
-    try testing.expectEqual(@as(u8, 0), version.code);
+    try testing.expectEqual(@as(?u8, 0), version.code);
     try testing.expect(std.mem.startsWith(u8, version.stdout, "stakrr "));
 }
 
@@ -244,12 +201,12 @@ test "cli: mutation lock is shared across worktrees and leaves user state unchan
 
         const init = try stakrr(&repo, &.{ "init", "--base", "main" });
         defer init.deinit();
-        try testing.expectEqual(@as(u8, 0), init.code);
+        try testing.expectEqual(@as(?u8, 0), init.code);
         const commit = try repo.commit("layer");
         defer testing.allocator.free(commit);
         const cut = try stakrr(&repo, &.{ "cut", "p1" });
         defer cut.deinit();
-        try testing.expectEqual(@as(u8, 0), cut.code);
+        try testing.expectEqual(@as(?u8, 0), cut.code);
         try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "user-file", .data = "staged work\n" });
         try repo.exec(&.{ "add", "user-file" });
         try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "user-file", .data = "unstaged work\n" });
@@ -282,13 +239,13 @@ test "cli: mutation lock is shared across worktrees and leaves user state unchan
                 for (commands) |args| {
                     const result = try stakrrAt(&repo, args, cwd);
                     defer result.deinit();
-                    try testing.expectEqual(@as(u8, 1), result.code);
+                    try testing.expectEqual(@as(?u8, 1), result.code);
                     try testing.expectEqualStrings("", result.stdout);
                     try testing.expectEqualStrings("error: another stakrr mutation is running\n", result.stderr);
                 }
                 const status = try stakrrAt(&repo, &.{"status"}, cwd);
                 defer status.deinit();
-                try testing.expectEqual(@as(u8, 0), status.code);
+                try testing.expectEqual(@as(?u8, 0), status.code);
             }
         }
 
@@ -323,14 +280,14 @@ test "cli: mutation lock is shared across worktrees and leaves user state unchan
         // must not prevent a later successful mutation.
         const failed_locked = try stakrr(&repo, &.{ "cut", "p1" });
         defer failed_locked.deinit();
-        try testing.expectEqual(@as(u8, 1), failed_locked.code);
+        try testing.expectEqual(@as(?u8, 1), failed_locked.code);
         try testing.expect(std.mem.indexOf(u8, failed_locked.stderr, "already exists") != null);
         const reset = try stakrr(&repo, &.{ "reset", "--delete-layers" });
         defer reset.deinit();
-        try testing.expectEqual(@as(u8, 0), reset.code);
+        try testing.expectEqual(@as(?u8, 0), reset.code);
         const again = try stakrr(&repo, &.{ "init", "--base", "main" });
         defer again.deinit();
-        try testing.expectEqual(@as(u8, 0), again.code);
+        try testing.expectEqual(@as(?u8, 0), again.code);
         try repo.tmp.dir.access(testing.io, ".git/stakrr.lock", .{});
     }
 }
@@ -354,10 +311,10 @@ test "cli: mutation lock preserves a separate Git directory path ending in a new
         defer guard.close(testing.io);
         const blocked = try stakrr(&repo, &.{ "init", "--base", "main" });
         defer blocked.deinit();
-        try testing.expectEqual(@as(u8, 1), blocked.code);
+        try testing.expectEqual(@as(?u8, 1), blocked.code);
         try testing.expectEqualStrings("error: another stakrr mutation is running\n", blocked.stderr);
     }
     const result = try stakrr(&repo, &.{ "init", "--base", "main" });
     defer result.deinit();
-    try testing.expectEqual(@as(u8, 0), result.code);
+    try testing.expectEqual(@as(?u8, 0), result.code);
 }
