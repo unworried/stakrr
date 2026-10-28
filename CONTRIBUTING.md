@@ -11,20 +11,32 @@ zig build test
 zig build test -Doptimize=ReleaseSafe
 ```
 
-`./mktemprepo.sh` drops you into a throwaway repo with a fresh build on `PATH`
+`scripts/mktemprepo.sh` drops you into a throwaway repo with a fresh build on `PATH`
 for poking at the cli by hand.
 
-`main.zig` dispatches commands and maps errors to messages. `cli.zig` parses
-arguments without running Git or writing output; `render.zig` draws help and
-stack status from supplied values, and `term.zig` provides terminal styling.
+The source layout stays flat: `layout.zig` names every ref and config key
+stakrr persists; `git.zig` runs Git, parses its output and applies generic ref
+transactions; `ref_transaction.zig` retains publication intent for recovery;
+`coordination.zig` owns locks and worktree guards; `stack.zig`
+owns stack policy and snapshots; `edit.zig` advances the edit workflow;
+`edit_session.zig` holds its private model and checkpoint codec. On the CLI
+side, `cli.zig` parses arguments, `render.zig` draws output, `term.zig` styles
+it, and `main.zig` dispatches commands and maps errors to messages.
 
-Stack inspection returns an owned `Snapshot`. Its config, layers and object IDs
-remain valid until `snapshot.deinit()`, which releases all snapshot storage.
-Read configuration through `snapshot.config`; config and layer slices borrow
-from the snapshot and need no separate cleanup.
+Public snapshots and edit status views own their storage and need `deinit`.
+Edit internals use a command arena, with a separate scratch arena for each
+checkpoint. Keep history inspection batched and publish refs with the journal
+in one compare-and-swap transaction. Recovery tests kill the process around
+checkpoints and simulate partial ref publication; preserve their coverage when
+changing edit phases or transaction recovery.
 
-Mutation commands share the lock described in [Git command flows](docs/git-flow.md).
-Keep its scope around the full operation, including validation and publication.
+## // command behavior
+
+[Git command flows](docs/git-flow.md) is the implementation contract for every
+shipped command. Follow its check order, allowed Git mutations, transaction
+boundaries and recovery rules. When changing behavior, update the matching flow
+and regression coverage in the same change. Keep the README focused on usage;
+keep the exact command flow in that one reference.
 
 ## // commits
 
@@ -47,6 +59,10 @@ commit messages become the release notes through [`cliff.toml`](cliff.toml),
 so write the summary for someone reading a changelog.
 
 ## // releasing
+
+Bring the release branch up to date with `main` before preparing the changelog,
+so its history includes the latest release tag. Regenerate the changelog if the
+release contents change before tagging.
 
 1. bump `.version` in `build.zig.zon`
 2. regenerate the changelog with [git-cliff](https://git-cliff.org)
