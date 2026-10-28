@@ -16,17 +16,6 @@ fn setState(repo: *const Repo, state: []const u8) !void {
     });
 }
 
-/// returns the owned base oid. caller must free it
-fn initialize(repo: *const Repo) ![]u8 {
-    const base = try repo.commit("base");
-    errdefer testing.allocator.free(base);
-
-    try repo.exec(&.{ "switch", "-q", "-c", "work" });
-    try stack.initStack(&repo.git, "main");
-
-    return base;
-}
-
 fn addMerge(repo: *const Repo) !void {
     try repo.exec(&.{ "switch", "-q", "-c", "side", "main" });
 
@@ -69,7 +58,7 @@ test "inspect: config parses initialized state" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     var snapshot = try stack.inspect(&repo.git);
@@ -94,7 +83,7 @@ test "inspect: config rejects malformed state" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const cases = [_]struct {
@@ -141,7 +130,7 @@ test "inspect: config reports a missing anchor ref as an inconsistent stack" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     try repo.exec(&.{ "update-ref", "-d", "refs/stakrr/anchor" });
@@ -156,7 +145,7 @@ test "initStack records the anchor as a ref" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const anchor = (try repo.git.readRef("refs/stakrr/anchor")).?;
@@ -202,7 +191,7 @@ test "initStack refuses repeated initialization" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     try testing.expectError(
@@ -225,7 +214,7 @@ test "initStack refuses a leftover anchor ref" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     try repo.exec(&.{ "config", "--local", "--unset-all", "stakrr.state" });
@@ -298,7 +287,7 @@ test "inspect reports layers, depths and unstacked commits" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     for ([_][]const u8{ "B", "C", "D", "E" }) |message| {
@@ -325,7 +314,7 @@ test "inspect snapshots own independent storage across stack changes" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
     const first = try repo.commit("first");
     defer testing.allocator.free(first);
@@ -361,7 +350,7 @@ test "inspect rejects a merge committed after init" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     try addMerge(&repo);
@@ -376,7 +365,7 @@ test "inspect rejects a tip guard without layers" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     try repo.exec(&.{ "update-ref", "refs/stakrr/tip", base });
@@ -391,7 +380,7 @@ test "inspect rejects a deleted layer (tip mismatch)" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const b = try repo.commit("B");
@@ -414,7 +403,7 @@ test "inspect rejects a foreign stakrr branch outside the rolling history" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     try repo.exec(&.{ "switch", "-q", "-c", "side", "main" });
@@ -433,7 +422,7 @@ test "inspect rejects two layers on the same commit" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const b = try repo.commit("B");
@@ -451,7 +440,7 @@ test "inspect rejects work rebased past the anchor" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const b = try repo.commit("B");
@@ -472,7 +461,7 @@ test "stacks work in SHA-256 repositories" {
     var repo = try Repo.initOptions(.{ .object_format = "sha256" });
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
     try testing.expectEqual(@as(usize, 64), base.len);
 
