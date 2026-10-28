@@ -19,6 +19,9 @@ remain valid until `snapshot.deinit()`, which releases all snapshot storage.
 Read configuration through `snapshot.config`; config and layer slices borrow
 from the snapshot and need no separate cleanup.
 
+Mutation commands share the lock described in [Git command flows](docs/git-flow.md).
+Keep its scope around the full operation, including validation and publication.
+
 ## // commits
 
 [conventional commits](https://www.conventionalcommits.org), lowercase,

@@ -2,10 +2,11 @@ const std = @import("std");
 const git_mod = @import("git.zig");
 const Git = git_mod.Git;
 const layout = @import("layout.zig");
+const coordination = @import("coordination.zig");
 
 /// Domain errors raised by stack operations. Every member needs a
 /// user-facing message in main.zig; a test there enforces it.
-pub const Error = git_mod.Error || error{
+pub const Error = git_mod.Error || coordination.Error || error{
     AlreadyInitialized,
     NotInitialized,
     ExistingStackRefs,
@@ -72,8 +73,9 @@ pub fn initStack(
     base_name: []const u8,
 ) !void {
     const allocator = git.allocator;
-    // 1. require standard working tree
-    try git.ensureWorkTree();
+    const guard = try coordination.lock(git);
+    defer guard.close(git.io);
+    // lock() also validates the working tree.
 
     // 2. refuse existing initialisation
     if (try git.configGet(layout.state_key)) |existing| {
@@ -300,6 +302,8 @@ pub fn cut(
     name: []const u8,
     revision: ?[]const u8,
 ) !void {
+    const guard = try coordination.lock(git);
+    defer guard.close(git.io);
     const allocator = git.allocator;
 
     // validate the name before inspecting the stack
@@ -389,8 +393,9 @@ pub const ResetResult = struct {
 /// re-initialised. Layer branches are kept unless `delete_layers` is set.
 /// Works on corrupt or outdated state, so it never parses the config.
 pub fn reset(git: *const Git, delete_layers: bool) !ResetResult {
+    const guard = try coordination.lock(git);
+    defer guard.close(git.io);
     const allocator = git.allocator;
-    try git.ensureWorkTree();
 
     var layers = try git.listRefs(layout.layer_prefix);
     defer layers.deinit(allocator);
@@ -455,6 +460,8 @@ fn navigationRef(snapshot: *const Snapshot, index: usize) []const u8 {
 
 /// Returns false when already at the requested end of the stack.
 pub fn navigate(git: *const Git, direction: Direction) !bool {
+    const guard = try coordination.lock(git);
+    defer guard.close(git.io);
     var snapshot = try inspect(git);
     defer snapshot.deinit();
 
