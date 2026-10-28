@@ -141,6 +141,16 @@ pub const Git = struct {
         return self.allocator.dupe(u8, trimmed);
     }
 
+    /// Successful stdout, unchanged. The caller owns the returned bytes.
+    /// Use for blobs and NUL-delimited records, which are not text lines.
+    pub fn outputRaw(self: *const Git, args: []const []const u8) ![]u8 {
+        const result = try self.run(args);
+        defer self.allocator.free(result.stderr);
+        errdefer self.allocator.free(result.stdout);
+        if ((try exitCode(result)) != 0) return self.fail(result.stderr);
+        return result.stdout;
+    }
+
     /// Git path output is terminated by one newline; path bytes may themselves
     /// end in newlines, unlike ordinary text output.
     pub fn path(self: *const Git, args: []const []const u8) ![]u8 {
@@ -488,6 +498,125 @@ pub const Git = struct {
         count += 1;
 
         try self.transact("stakrr: cut", updates[0..count]);
+    }
+
+    /// Feed stdin while draining both output pipes. Git supplies object IDs.
+    pub fn inputOutput(self: *const Git, args: []const []const u8, data: []const u8) ![]u8 {
+        const result = try self.inputResult(args, data);
+        defer self.allocator.free(result.stderr);
+        errdefer self.allocator.free(result.stdout);
+        if (!result.term.success()) return self.fail(result.stderr);
+        return self.allocator.realloc(result.stdout, std.mem.trimEnd(u8, result.stdout, "\r\n").len);
+    }
+
+    fn inputResult(self: *const Git, args: []const []const u8, data: []const u8) !std.process.RunResult {
+        const argv = try self.argvFor(args);
+        defer self.allocator.free(argv);
+        var child = try std.process.spawn(self.io, .{
+            .argv = argv,
+            .cwd = self.childCwd(),
+            .environ_map = self.environ_map,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+        });
+        defer child.kill(self.io);
+
+        var input_task = try self.io.concurrent(writeInput, .{ self.io, child.stdin.?, data });
+        child.stdin = null; // the task owns and closes this pipe
+        defer input_task.cancel(self.io) catch {};
+
+        var buffer: Io.File.MultiReader.Buffer(2) = undefined;
+        var reader: Io.File.MultiReader = undefined;
+        reader.init(self.allocator, self.io, buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+        defer reader.deinit();
+        while (reader.fill(64, .none)) |_| {
+            if (reader.reader(0).buffered().len > stdout_limit or
+                reader.reader(1).buffered().len > stderr_limit)
+                return error.StreamTooLong;
+        } else |err| switch (err) {
+            error.EndOfStream => {},
+            else => return err,
+        }
+        try reader.checkAnyError();
+        const term = try child.wait(self.io);
+        // Prefer Git's refusal diagnostics over a writer's broken pipe.
+        if (term.success()) try input_task.await(self.io);
+        const stdout = try reader.toOwnedSlice(0);
+        errdefer self.allocator.free(stdout);
+        return .{ .term = term, .stdout = stdout, .stderr = try reader.toOwnedSlice(1) };
+    }
+
+    fn writeInput(io: Io, pipe: Io.File, data: []const u8) !void {
+        defer pipe.close(io);
+        try pipe.writeStreamingAll(io, data);
+    }
+
+    pub fn input(self: *const Git, args: []const []const u8, data: []const u8) !void {
+        const stdout = try self.inputOutput(args, data);
+        self.allocator.free(stdout);
+    }
+
+    pub const ObjectFormat = enum { sha1, sha256 };
+
+    pub fn objectFormat(self: *const Git) !ObjectFormat {
+        const format = try self.output(&.{ "rev-parse", "--show-object-format" });
+        defer self.allocator.free(format);
+        return std.meta.stringToEnum(ObjectFormat, format) orelse
+            error.InvalidGitOutput;
+    }
+
+    /// Store bytes unchanged and use Git's authoritative object ID.
+    pub fn writeBlob(self: *const Git, data: []const u8) ![]u8 {
+        return self.writeObject("blob", data);
+    }
+
+    fn writeObject(self: *const Git, kind: []const u8, data: []const u8) ![]u8 {
+        const oid = try self.inputOutput(&.{ "hash-object", "-w", "-t", kind, "--stdin" }, data);
+        errdefer self.allocator.free(oid);
+        if (!isOid(oid)) return error.InvalidGitOutput;
+        return oid;
+    }
+
+    pub const TreeEntry = struct { name: []const u8, oid: []const u8, tree: bool = false };
+
+    /// Write a tree of blobs/subtrees without touching the worktree's index.
+    pub fn writeTree(self: *const Git, entries: []const TreeEntry) ![]u8 {
+        var data: Io.Writer.Allocating = .init(self.allocator);
+        defer data.deinit();
+        const format = try self.objectFormat();
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        defer names.deinit(self.allocator);
+        for (entries) |entry| {
+            if (entry.name.len == 0 or std.mem.indexOfAny(u8, entry.name, "/\x00\n") != null)
+                return error.InvalidRefName;
+            if ((try names.getOrPut(self.allocator, entry.name)).found_existing) return error.InvalidRefName;
+            if (!isOid(entry.oid) or entry.oid.len != (if (format == .sha1) @as(usize, 40) else 64))
+                return error.InvalidOid;
+            try data.writer.print("{s} {s} {s}\t{s}\x00", .{
+                if (entry.tree) "040000" else "100644",
+                if (entry.tree) "tree" else "blob",
+                entry.oid,
+                entry.name,
+            });
+        }
+        return self.inputOutput(&.{ "mktree", "-z" }, data.written());
+    }
+
+    /// Create a checkpoint commit, preserving parent order and bypassing hooks/signing.
+    pub fn commitTree(self: *const Git, tree: []const u8, parents: []const []const u8, label: []const u8) ![]u8 {
+        if (!isOid(tree)) return error.InvalidOid;
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(self.allocator);
+        try args.appendSlice(self.allocator, &.{ "-c", "commit.gpgsign=false", "commit-tree", tree, "-m", label });
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(self.allocator);
+        for (parents) |parent| {
+            if (!isOid(parent)) return error.InvalidOid;
+            if ((try seen.getOrPut(self.allocator, parent)).found_existing) continue;
+            try args.appendSlice(self.allocator, &.{ "-p", parent });
+        }
+        return self.output(args.items);
     }
 
     pub fn switchBranch(self: *const Git, ref_name: []const u8) !void {

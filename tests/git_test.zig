@@ -463,3 +463,158 @@ test "typed queries support packed refs and sha256 history" {
     try testing.expectEqual(@as(usize, 1), history.commits.len);
     try testing.expectEqualStrings(tip, history.commits[0]);
 }
+
+test "blob storage computes Git object IDs for both formats and arbitrary bytes" {
+    inline for (.{ "sha1", "sha256" }) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+
+        for ([_][]const u8{ "", "metadata\x00with binary bytes\xff\n\n" }) |data| {
+            const oid = try repo.git.writeBlob(data);
+            defer testing.allocator.free(oid);
+            try testing.expectEqual(@as(usize, if (std.mem.eql(u8, format, "sha1")) 40 else 64), oid.len);
+            const bytes = try repo.git.outputRaw(&.{ "cat-file", "blob", oid });
+            defer testing.allocator.free(bytes);
+            try testing.expectEqualStrings(data, bytes);
+        }
+    }
+}
+
+test "writeTree and commitTree preserve object format parent order and the index" {
+    for ([_][]const u8{ "sha1", "sha256" }) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+        const first = try repo.commit("first");
+        defer testing.allocator.free(first);
+        const second = try repo.commit("second");
+        defer testing.allocator.free(second);
+        const blob = try repo.git.writeBlob("journal\n");
+        defer testing.allocator.free(blob);
+        try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "dirty", .data = "staged\n" });
+        try repo.exec(&.{ "add", "dirty" });
+        try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "dirty", .data = "unstaged\n" });
+        try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "untracked", .data = "keep me\n" });
+        const before_index = try repo.git.output(&.{ "ls-files", "--stage" });
+        defer testing.allocator.free(before_index);
+        const before_status = try repo.git.outputRaw(&.{ "status", "--porcelain=v1", "-z" });
+        defer testing.allocator.free(before_status);
+        const before_refs = try repo.git.output(&.{"show-ref"});
+        defer testing.allocator.free(before_refs);
+        const tree = try repo.git.writeTree(&.{ .{ .name = "session.json", .oid = blob }, .{ .name = "plan", .oid = blob } });
+        defer testing.allocator.free(tree);
+        const checkpoint = try repo.git.commitTree(tree, &.{ first, second, first }, "readable checkpoint label");
+        defer testing.allocator.free(checkpoint);
+        const parents = try std.fmt.allocPrint(testing.allocator, "{s} {s}", .{ first, second });
+        defer testing.allocator.free(parents);
+        try repo.expectOutput(&.{ "show", "--no-patch", "--format=%P", checkpoint }, parents);
+        try repo.expectOutput(&.{ "show", "--no-patch", "--format=%s", checkpoint }, "readable checkpoint label");
+        const path = try std.fmt.allocPrint(testing.allocator, "{s}:session.json", .{checkpoint});
+        defer testing.allocator.free(path);
+        try repo.expectOutput(&.{ "show", path }, "journal");
+        try repo.expectOutput(&.{ "ls-files", "--stage" }, before_index);
+        const after_status = try repo.git.outputRaw(&.{ "status", "--porcelain=v1", "-z" });
+        defer testing.allocator.free(after_status);
+        try testing.expectEqualStrings(before_status, after_status);
+        try repo.expectOutput(&.{"show-ref"}, before_refs);
+        try repo.expectRef("HEAD", second);
+    }
+}
+
+test "object plumbing works in bare repositories in both object formats" {
+    for ([_][]const u8{ "sha1", "sha256" }) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+        try repo.exec(&.{ "init", "--bare", "-q", "--object-format", format, "bare.git" });
+        const dir = try repo.tmp.dir.openDir(testing.io, "bare.git", .{});
+        defer dir.close(testing.io);
+        var git = repo.git;
+        git.cwd = dir;
+        try git.exec(&.{ "config", "user.name", "Stakrr Test" });
+        try git.exec(&.{ "config", "user.email", "test@stakrr.local" });
+
+        const blob = try git.writeBlob("bare\x00bytes\xff\n");
+        defer testing.allocator.free(blob);
+        const tree = try git.writeTree(&.{.{ .name = "file\twith spaces", .oid = blob }});
+        defer testing.allocator.free(tree);
+        const commit = try git.commitTree(tree, &.{}, "bare checkpoint");
+        defer testing.allocator.free(commit);
+        try git.transact("bare refs", &.{
+            .{ .create = .{ .name = "refs/heads/main", .oid = commit } },
+            .{ .create = .{ .name = "refs/stakrr/test", .oid = commit } },
+        });
+        const bytes = try git.outputRaw(&.{ "cat-file", "blob", blob });
+        defer testing.allocator.free(bytes);
+        try testing.expectEqualStrings("bare\x00bytes\xff\n", bytes);
+        try testing.expectError(error.NotWorkingTree, git.ensureWorkTree());
+        try git.exec(&.{ "fsck", "--no-reflogs" });
+    }
+}
+
+test "tree plumbing uses Git ordering and rejects duplicate or invalid entries" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    const blob = try repo.git.writeBlob("tree contents");
+    defer testing.allocator.free(blob);
+    const subtree = try repo.git.writeTree(&.{.{ .name = "child", .oid = blob }});
+    defer testing.allocator.free(subtree);
+    const entries = [_]Git.TreeEntry{
+        .{ .name = "foo", .oid = subtree, .tree = true },
+        .{ .name = "foo.bar", .oid = blob },
+        .{ .name = "a\t b", .oid = blob },
+    };
+    const tree = try repo.git.writeTree(&entries);
+    defer testing.allocator.free(tree);
+    const names = try repo.git.outputRaw(&.{ "ls-tree", "--name-only", "-z", tree });
+    defer testing.allocator.free(names);
+    try testing.expectEqualStrings("a\t b\x00foo.bar\x00foo\x00", names);
+    try testing.expectError(error.InvalidRefName, repo.git.writeTree(&.{ entries[1], entries[1] }));
+    try testing.expectError(error.InvalidRefName, repo.git.writeTree(&.{.{ .name = "../file", .oid = blob }}));
+    try testing.expectError(error.InvalidOid, repo.git.writeTree(&.{.{ .name = "bad", .oid = "HEAD" }}));
+}
+
+test "blob input larger than a pipe buffer preserves all bytes" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    const data = try testing.allocator.alloc(u8, 256 * 1024);
+    defer testing.allocator.free(data);
+    for (data, 0..) |*byte, i| byte.* = @truncate(i);
+    const oid = try repo.git.writeBlob(data);
+    defer testing.allocator.free(oid);
+    const actual = try repo.git.outputRaw(&.{ "cat-file", "blob", oid });
+    defer testing.allocator.free(actual);
+    try testing.expectEqualSlices(u8, data, actual);
+}
+
+test "input transport drains output while feeding data larger than pipe buffers" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    const oid = try repo.git.writeBlob("batch object");
+    defer testing.allocator.free(oid);
+    const line_len = oid.len + 1;
+    const requests = try testing.allocator.alloc(u8, line_len * 8192);
+    defer testing.allocator.free(requests);
+    var offset: usize = 0;
+    while (offset < requests.len) : (offset += line_len) {
+        @memcpy(requests[offset..][0..oid.len], oid);
+        requests[offset + oid.len] = '\n';
+    }
+    const actual = try repo.git.inputOutput(&.{ "cat-file", "--batch-check=%(objectname)" }, requests);
+    defer testing.allocator.free(actual);
+    try testing.expectEqualStrings(requests[0 .. requests.len - 1], actual);
+}
+
+test "input transport preserves early Git refusal diagnostics with large input" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    var diagnostics: stakrr_git.Diagnostics = .{};
+    repo.git.diagnostics = &diagnostics;
+    const data = try testing.allocator.alloc(u8, 256 * 1024);
+    defer testing.allocator.free(data);
+    @memset(data, 'x');
+    try testing.expectError(error.GitFailed, repo.git.inputOutput(
+        &.{ "hash-object", "--invalid-stakrr-option", "--stdin" },
+        data,
+    ));
+    try testing.expect(diagnostics.stderr().len != 0);
+    try repo.expectOutput(&.{ "for-each-ref", "--format=%(refname)" }, "");
+}
