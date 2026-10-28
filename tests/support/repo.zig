@@ -81,6 +81,17 @@ pub const Repo = struct {
         return self.git.resolveCommit("HEAD");
     }
 
+    pub fn write(self: *const Repo, path: []const u8, data: []const u8) !void {
+        try self.tmp.dir.writeFile(testing.io, .{ .sub_path = path, .data = data });
+    }
+
+    /// stage every change and commit it
+    pub fn commitAll(self: *const Repo, message: []const u8) !void {
+        try self.exec(&.{ "add", "-A" });
+        const oid = try self.commit(message);
+        testing.allocator.free(oid);
+    }
+
     /// commit a base on main and switch to a new `work` branch;
     /// returns the owned base oid
     pub fn initWork(self: *const Repo) ![]u8 {

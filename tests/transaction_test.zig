@@ -3,6 +3,7 @@ const testing = std.testing;
 const stakrr = @import("stakrr");
 const Repo = @import("support/repo.zig").Repo;
 const cli = @import("support/cli.zig");
+const fixture = @import("support/edit_fixture.zig");
 const intent_ref = stakrr.layout.transaction_ref;
 
 fn setup(repo: *const Repo) !void {
@@ -211,7 +212,7 @@ test "recovery refuses unexpected values without changing refs and succeeds afte
     defer testing.allocator.free(refs);
     const refused = try cli.run(&repo, &.{"up"});
     defer refused.deinit();
-    try testing.expectEqual(@as(?u8, 1), refused.code);
+    try testing.expectEqual(@as(?u8, 5), refused.code);
     try testing.expect(std.mem.indexOf(u8, refused.stderr, "unexpected refs") != null);
     try repo.expectOutput(&.{"show-ref"}, refs);
     try repo.exec(&.{ "update-ref", "refs/heads/work", head });
@@ -287,7 +288,7 @@ test "recovery refuses active Git operations before changing branches" {
         defer testing.allocator.free(refs);
         const refused = try cli.run(&repo, &.{"up"});
         defer refused.deinit();
-        try testing.expectEqual(@as(?u8, 1), refused.code);
+        try testing.expectEqual(@as(?u8, 4), refused.code);
         try testing.expect(std.mem.indexOf(u8, refused.stderr, "finish the active Git operation") != null);
         try repo.expectOutput(&.{"show-ref"}, refs);
         if (directory)
@@ -420,4 +421,123 @@ test "journal rejects duplicate ref names and its reserved namespace without pub
     try repo.expectNoRef("refs/stakrr/same");
     try repo.expectNoRef("refs/stakrr/other");
     try repo.expectRef("HEAD", head);
+}
+
+test "reset recovery refuses to delete the caller's checked-out layer" {
+    for ([_][]const u8{ "sha1", "sha256" }) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+        try fixture.setup(&repo);
+        try cli.installFaultShim(&repo);
+        try repo.env.put("STAKRR_TEST_PARTIAL_LABEL", "stakrr: reset");
+        try repo.env.put("STAKRR_TEST_PARTIAL_WRITES", "1");
+        const stopped = try cli.run(&repo, &.{ "reset", "--delete-layers" });
+        defer stopped.deinit();
+        try testing.expect(stopped.code != 0);
+        _ = repo.env.swapRemove("STAKRR_TEST_PARTIAL_LABEL");
+        try testing.expect(try repo.hasRef(intent_ref));
+
+        try repo.exec(&.{ "switch", "-q", "stakrr/models" });
+        const refs = try repo.git.output(&.{"show-ref"});
+        defer testing.allocator.free(refs);
+        const head = try repo.git.resolveCommit("HEAD");
+        defer testing.allocator.free(head);
+        const index = try repo.git.output(&.{"write-tree"});
+        defer testing.allocator.free(index);
+        const refused = try cli.run(&repo, &.{"continue"});
+        defer refused.deinit();
+        try testing.expectEqual(@as(?u8, 1), refused.code);
+        try testing.expect(std.mem.indexOf(u8, refused.stderr, "checked out") != null);
+        try repo.expectOutput(&.{"show-ref"}, refs);
+        try repo.expectRef("HEAD", head);
+        try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
+        try repo.expectOutput(&.{"write-tree"}, index);
+        try repo.expectOutput(&.{ "status", "--porcelain" }, "");
+
+        try repo.exec(&.{ "switch", "-q", "work" });
+        try cli.expectSuccess(&repo, &.{"continue"});
+        try repo.expectNoRef(intent_ref);
+        try repo.expectNoRef("refs/heads/stakrr/models");
+        try repo.expectNoRef("refs/heads/stakrr/api");
+        try repo.expectOutput(&.{ "status", "--porcelain" }, "");
+        // Ref recovery and config removal are separate steps of reset.
+        try cli.expectSuccess(&repo, &.{"reset"});
+    }
+}
+
+test "restack and archival recover after partial publication" {
+    for ([_][]const u8{ "stakrr: edit checkpoint", "stakrr: restack" }) |label| {
+        var repo = try Repo.init();
+        defer repo.deinit();
+        try fixture.setup(&repo);
+        try fixture.correctModels(&repo);
+        try cli.installFaultShim(&repo);
+        try repo.env.put("STAKRR_TEST_PARTIAL_LABEL", label);
+        try repo.env.put("STAKRR_TEST_PARTIAL_WRITES", if (std.mem.eql(u8, label, "stakrr: restack")) "1" else "2");
+        const stopped = try cli.run(&repo, &.{"restack"});
+        defer stopped.deinit();
+        try testing.expect(stopped.code != 0);
+        _ = repo.env.swapRemove("STAKRR_TEST_PARTIAL_LABEL");
+
+        if (try repo.hasRef(stakrr.layout.session_ref)) {
+            try cli.expectSuccess(&repo, &.{"continue"});
+        } else {
+            // The session deletion was published before the oplog update.
+            try cli.expectSuccess(&repo, &.{"undo"});
+            try cli.expectSuccess(&repo, &.{"undo"});
+        }
+        try repo.expectOutput(&.{ "show", "work:model" }, "corrected");
+        try fixture.valid(&repo);
+        try fixture.noSession(&repo);
+        try repo.expectNoRef(intent_ref);
+    }
+}
+
+test "cut publication does not require a configured author identity" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try fixture.setup(&repo);
+    try repo.exec(&.{ "config", "--unset", "user.name" });
+    try repo.exec(&.{ "config", "--unset", "user.email" });
+    try repo.exec(&.{ "config", "user.useConfigOnly", "true" });
+    try cli.expectSuccess(&repo, &.{ "cut", "rolling" });
+    try repo.expectNoRef(intent_ref);
+    var snapshot = try stakrr.stack.inspect(&repo.git);
+    defer snapshot.deinit();
+    try testing.expectEqual(@as(usize, 3), snapshot.layers.len);
+}
+
+test "separate Git directories allow own branches and reject forced duplicate checkouts" {
+    for ([_][]const u8{ "sha1", "sha256" }) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+        try repo.exec(&.{ "init", "-q", "-b", "main", "--object-format", format, "--separate-git-dir=.git/separate storage", "worktree" });
+        const dir = try repo.tmp.dir.openDir(testing.io, "worktree", .{});
+        defer dir.close(testing.io);
+        // Borrow the fixture's ownership, changing only its working directory.
+        var view = repo;
+        view.tmp.dir = dir;
+        view.git.cwd = dir;
+        try view.exec(&.{ "config", "user.name", "Stakrr Test" });
+        try view.exec(&.{ "config", "user.email", "test@stakrr.local" });
+        try view.exec(&.{ "config", "core.hooksPath", "/dev/null" });
+        try view.exec(&.{ "config", "commit.gpgsign", "false" });
+        try fixture.setup(&view);
+        try fixture.correctModels(&view);
+        try stakrr.edit.run(&view.git, .restack);
+        try fixture.valid(&view);
+        try stakrr.edit.undo(&view.git);
+
+        const metadata = try repo.tmp.dir.realPathFileAlloc(testing.io, ".git", testing.allocator);
+        defer testing.allocator.free(metadata);
+        const path = try std.fs.path.join(testing.allocator, &.{ metadata, "duplicate" });
+        defer testing.allocator.free(path);
+        try fixture.correctModels(&view);
+        try view.exec(&.{ "worktree", "add", "-q", "--force", path, "work" });
+        const before = try view.git.output(&.{"show-ref"});
+        defer testing.allocator.free(before);
+        try testing.expectError(error.BranchOccupied, stakrr.edit.run(&view.git, .restack));
+        try view.expectOutput(&.{"show-ref"}, before);
+        try fixture.noSession(&view);
+    }
 }

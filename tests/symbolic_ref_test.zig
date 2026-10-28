@@ -497,7 +497,7 @@ test "CLI reports the symbolic ref and target while preserving user work" {
     const result = try cli.run(&repo, &.{"status"});
     defer result.deinit();
     try testing.expectEqual(@as(?u8, 1), result.code);
-    try testing.expect(std.mem.indexOf(u8, result.stderr, "managed refs must be direct") != null);
+    try testing.expect(std.mem.indexOf(u8, result.stderr, "managed branches and internal refs must be direct refs") != null);
     try testing.expect(std.mem.indexOf(u8, result.stderr, layout.tip_ref) != null);
     try testing.expect(std.mem.indexOf(u8, result.stderr, victim) != null);
     try before.expectUnchanged(&repo);
