@@ -186,35 +186,43 @@ pub const Git = struct {
         }, 1);
     }
 
-    /// true if the range contains a merge commit (linear stacks only)
-    pub fn hasMergeCommits(
-        self: *const Git,
-        older: []const u8,
-        newer: []const u8,
-    ) !bool {
-        const range = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}..{s}",
-            .{ older, newer },
-        );
-        defer self.allocator.free(range);
-        const merges = try self.output(&.{
-            "rev-list",
-            "--min-parents=2",
-            "--max-count=1",
-            "--end-of-options",
-            range,
-        });
-        defer self.allocator.free(merges);
-        return merges.len != 0;
-    }
+    /// Commits in `older..newer`, oldest first. Oids borrow from `raw`.
+    pub const History = struct {
+        raw: []u8,
+        commits: []const []const u8,
+        /// every commit has exactly one parent (no merges or roots)
+        linear: bool,
 
-    /// Commits in `older..newer`, oldest first, one "<oid> <parents...>"
-    /// line per commit. The caller owns the returned buffer.
-    pub fn revListParents(self: *const Git, older: []const u8, newer: []const u8) ![]u8 {
+        pub fn deinit(self: *History, allocator: Allocator) void {
+            allocator.free(self.commits);
+            allocator.free(self.raw);
+            self.* = undefined;
+        }
+    };
+
+    pub fn history(self: *const Git, older: []const u8, newer: []const u8) !History {
         const range = try std.fmt.allocPrint(self.allocator, "{s}..{s}", .{ older, newer });
         defer self.allocator.free(range);
-        return self.output(&.{ "rev-list", "--parents", "--reverse", "--end-of-options", range });
+        const raw = try self.output(&.{ "rev-list", "--parents", "--reverse", "--end-of-options", range });
+        errdefer self.allocator.free(raw);
+
+        var commits: std.ArrayList([]const u8) = .empty;
+        errdefer commits.deinit(self.allocator);
+        var linear = true;
+        var lines = std.mem.tokenizeScalar(u8, raw, '\n');
+        while (lines.next()) |line| {
+            var fields = std.mem.tokenizeScalar(u8, line, ' ');
+            const oid = fields.next() orelse return error.InvalidGitOutput;
+            var parents: usize = 0;
+            while (fields.next()) |_| parents += 1;
+            if (parents != 1) linear = false;
+            try commits.append(self.allocator, oid);
+        }
+        return .{
+            .raw = raw,
+            .commits = try commits.toOwnedSlice(self.allocator),
+            .linear = linear,
+        };
     }
 
     /// require an ordinary git working tree
@@ -290,36 +298,38 @@ pub const Git = struct {
         return self.check(&.{ "config", "--local", "--unset-all", key }, 5);
     }
 
-    pub fn listStackRefs(self: *const Git) ![]u8 {
-        return self.output(&.{
+    /// Refs under a prefix, in refname order. Names and oids borrow from
+    /// `raw`, which is kept for callers comparing whole listings.
+    pub const RefList = struct {
+        raw: []u8,
+        refs: []ExpectedRef,
+
+        pub fn deinit(self: *RefList, allocator: Allocator) void {
+            allocator.free(self.refs);
+            allocator.free(self.raw);
+            self.* = undefined;
+        }
+    };
+
+    pub fn listRefs(self: *const Git, prefix: []const u8) !RefList {
+        const raw = try self.output(&.{
             "for-each-ref",
             "--format=%(refname)%09%(objectname)",
-            layout.layer_prefix,
+            prefix,
         });
-    }
+        errdefer self.allocator.free(raw);
 
-    pub fn countCommits(
-        self: *const Git,
-        older: []const u8,
-        newer: []const u8,
-    ) !usize {
-        const range = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}..{s}",
-            .{ older, newer },
-        );
-        defer self.allocator.free(range);
-
-        const text = try self.output(&.{
-            "rev-list",
-            "--count",
-            "--end-of-options",
-            range,
-        });
-        defer self.allocator.free(text);
-
-        return std.fmt.parseInt(usize, text, 10) catch
-            error.InvalidGitOutput;
+        var refs: std.ArrayList(ExpectedRef) = .empty;
+        errdefer refs.deinit(self.allocator);
+        var lines = std.mem.tokenizeScalar(u8, raw, '\n');
+        while (lines.next()) |line| {
+            const tab = std.mem.indexOfScalar(u8, line, '\t') orelse
+                return error.InvalidGitOutput;
+            const oid = line[tab + 1 ..];
+            if (!isOid(oid)) return error.InvalidGitOutput;
+            try refs.append(self.allocator, .{ .name = line[0..tab], .oid = oid });
+        }
+        return .{ .raw = raw, .refs = try refs.toOwnedSlice(self.allocator) };
     }
 
     pub const ExpectedRef = struct {

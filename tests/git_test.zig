@@ -321,17 +321,17 @@ test "configGet rejects empty values" {
     );
 }
 
-test "listStackRefs returns empty when no layers exist" {
+test "listRefs returns empty when the prefix has no refs" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const refs = try repo.git.listStackRefs();
-    defer testing.allocator.free(refs);
+    var refs = try repo.git.listRefs("refs/heads/stakrr/");
+    defer refs.deinit(testing.allocator);
 
-    try testing.expectEqualStrings("", refs);
+    try testing.expectEqual(@as(usize, 0), refs.refs.len);
 }
 
-test "listStackRefs finds only owned stack branches" {
+test "listRefs finds only branches under the requested prefix" {
     var repo = try Repo.init();
     defer repo.deinit();
 
@@ -342,28 +342,17 @@ test "listStackRefs finds only owned stack branches" {
     try repo.exec(&.{ "branch", "stakrr/second" });
     try repo.exec(&.{ "branch", "stakrr-other" });
 
-    const refs = try repo.git.listStackRefs();
-    defer testing.allocator.free(refs);
+    var refs = try repo.git.listRefs("refs/heads/stakrr/");
+    defer refs.deinit(testing.allocator);
 
-    const first = try std.fmt.allocPrint(
-        testing.allocator,
-        "refs/heads/stakrr/first\t{s}",
-        .{oid},
-    );
-    defer testing.allocator.free(first);
-
-    try testing.expect(std.mem.indexOf(u8, refs, first) != null);
-
-    try testing.expect(
-        std.mem.indexOf(u8, refs, "refs/heads/stakrr/second\t") != null,
-    );
-
-    try testing.expect(
-        std.mem.indexOf(u8, refs, "stakrr-other") == null,
-    );
+    try testing.expectEqual(@as(usize, 2), refs.refs.len);
+    try testing.expectEqualStrings("refs/heads/stakrr/first", refs.refs[0].name);
+    try testing.expectEqualStrings(oid, refs.refs[0].oid);
+    try testing.expectEqualStrings("refs/heads/stakrr/second", refs.refs[1].name);
+    try testing.expectEqualStrings(oid, refs.refs[1].oid);
 }
 
-test "countCommits counts a linear range" {
+test "history lists a range oldest first" {
     var repo = try Repo.init();
     defer repo.deinit();
 
@@ -376,23 +365,101 @@ test "countCommits counts a linear range" {
     const c = try repo.commit("C");
     defer testing.allocator.free(c);
 
-    try testing.expectEqual(
-        @as(usize, 0),
-        try repo.git.countCommits(a, a),
-    );
+    var empty = try repo.git.history(a, a);
+    defer empty.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), empty.commits.len);
 
-    try testing.expectEqual(
-        @as(usize, 1),
-        try repo.git.countCommits(a, b),
-    );
+    var range = try repo.git.history(a, c);
+    defer range.deinit(testing.allocator);
+    try testing.expect(range.linear);
+    try testing.expectEqual(@as(usize, 2), range.commits.len);
+    try testing.expectEqualStrings(b, range.commits[0]);
+    try testing.expectEqualStrings(c, range.commits[1]);
 
-    try testing.expectEqual(
-        @as(usize, 2),
-        try repo.git.countCommits(a, c),
-    );
+    var backwards = try repo.git.history(c, a);
+    defer backwards.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), backwards.commits.len);
+}
 
-    try testing.expectEqual(
-        @as(usize, 0),
-        try repo.git.countCommits(c, a),
-    );
+test "history reports merges as non-linear" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try repo.commit("base");
+    defer testing.allocator.free(base);
+    try repo.exec(&.{ "switch", "-q", "-c", "side" });
+    const side = try repo.commit("side");
+    defer testing.allocator.free(side);
+    try repo.exec(&.{ "switch", "-q", "main" });
+    const main = try repo.commit("main");
+    defer testing.allocator.free(main);
+    try repo.exec(&.{ "merge", "-q", "--no-edit", "side" });
+    const merge = try repo.git.resolveCommit("HEAD");
+    defer testing.allocator.free(merge);
+
+    var linear = try repo.git.history(base, main);
+    defer linear.deinit(testing.allocator);
+    try testing.expect(linear.linear);
+
+    var merged = try repo.git.history(base, merge);
+    defer merged.deinit(testing.allocator);
+    try testing.expect(!merged.linear);
+}
+
+test "history reports an unrelated root as non-linear" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try repo.commit("base");
+    defer testing.allocator.free(base);
+    try repo.exec(&.{ "switch", "--orphan", "unrelated" });
+    const root = try repo.commit("root");
+    defer testing.allocator.free(root);
+
+    var history = try repo.git.history(base, root);
+    defer history.deinit(testing.allocator);
+    try testing.expect(!history.linear);
+    try testing.expectEqual(@as(usize, 1), history.commits.len);
+    try testing.expectEqualStrings(root, history.commits[0]);
+}
+
+test "history propagates invalid revisions with diagnostics" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try repo.commit("base");
+    defer testing.allocator.free(base);
+    var diagnostics: stakrr_git.Diagnostics = .{};
+    repo.git.diagnostics = &diagnostics;
+
+    try testing.expectError(error.GitFailed, repo.git.history(base, "missing-revision"));
+    try testing.expect(diagnostics.stderr().len > 0);
+}
+
+test "typed queries support packed refs and sha256 history" {
+    var repo = try Repo.initOptions(.{ .object_format = "sha256" });
+    defer repo.deinit();
+
+    const base = try repo.commit("base");
+    defer testing.allocator.free(base);
+    const tip = try repo.commit("tip");
+    defer testing.allocator.free(tip);
+    try repo.exec(&.{ "update-ref", "refs/stakrr/test/z", base });
+    try repo.exec(&.{ "update-ref", "refs/stakrr/test/a", tip });
+    try repo.exec(&.{ "update-ref", "refs/stakrr/test-other", tip });
+    try repo.exec(&.{ "pack-refs", "--all", "--prune" });
+
+    var refs = try repo.git.listRefs("refs/stakrr/test/");
+    defer refs.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), refs.refs.len);
+    try testing.expectEqualStrings("refs/stakrr/test/a", refs.refs[0].name);
+    try testing.expectEqualStrings(tip, refs.refs[0].oid);
+    try testing.expectEqualStrings("refs/stakrr/test/z", refs.refs[1].name);
+    try testing.expectEqualStrings(base, refs.refs[1].oid);
+
+    var history = try repo.git.history(base, tip);
+    defer history.deinit(testing.allocator);
+    try testing.expect(history.linear);
+    try testing.expectEqual(@as(usize, 1), history.commits.len);
+    try testing.expectEqualStrings(tip, history.commits[0]);
 }

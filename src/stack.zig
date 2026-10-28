@@ -96,9 +96,9 @@ pub fn initStack(
     }
 
     // reserve stakrr's branch namespace and internal refs for managed layers
-    const existing_layers = try git.listStackRefs();
-    defer allocator.free(existing_layers);
-    if (existing_layers.len != 0) return error.ExistingStackRefs;
+    var existing_layers = try git.listRefs(layout.layer_prefix);
+    defer existing_layers.deinit(allocator);
+    if (existing_layers.refs.len != 0) return error.ExistingStackRefs;
     for ([_][]const u8{ layout.tip_ref, layout.anchor_ref }) |ref_name| {
         const existing = try git.readRef(ref_name);
         defer if (existing) |oid| allocator.free(oid);
@@ -139,8 +139,9 @@ pub fn initStack(
 
     // 6. reject merge commits
     // FIXME: m2
-    if (try git.hasMergeCommits(base_oid, work_oid))
-        return error.MergeCommitsUnsupported;
+    var history = try git.history(base_oid, work_oid);
+    defer history.deinit(allocator);
+    if (!history.linear) return error.MergeCommitsUnsupported;
 
     // 7. claim the anchor; `create` fails if a concurrent init won the race
     const anchor: Git.ExpectedRef = .{ .name = layout.anchor_ref, .oid = base_oid };
@@ -222,62 +223,31 @@ pub fn inspect(git: *const Git) !Snapshot {
 
     // With no merges, anchor..work is a single chain. Index it once so
     // every layer resolves to a depth without spawning more git processes.
-    const history = try git.revListParents(config.anchor_oid, work_oid);
-    defer allocator.free(history);
+    var history = try git.history(config.anchor_oid, work_oid);
+    defer history.deinit(allocator);
+    if (!history.linear) return error.MergeCommitsUnsupported;
 
     var depths: std.StringHashMapUnmanaged(usize) = .empty;
     defer depths.deinit(allocator);
-
-    var chain_len: usize = 0;
-    var commits = std.mem.splitScalar(u8, history, '\n');
-    while (commits.next()) |line| {
-        if (line.len == 0) continue;
-
-        var fields = std.mem.tokenizeScalar(u8, line, ' ');
-        const oid = fields.next() orelse return error.InvalidGitOutput;
-
-        var parents: usize = 0;
-        while (fields.next()) |_| parents += 1;
-
-        // only supports linear history
-        // FIXME: m2
-        if (parents > 1) return error.MergeCommitsUnsupported;
-        if (parents == 0) return error.InvalidStack;
-
-        chain_len += 1;
-        try depths.put(allocator, oid, chain_len);
-    }
+    for (history.commits, 1..) |oid, depth| try depths.put(allocator, oid, depth);
+    const chain_len = history.commits.len;
 
     // discover branches owned by stakrr
-    const raw_refs = try git.listStackRefs();
-    errdefer allocator.free(raw_refs);
+    const listed = try git.listRefs(layout.layer_prefix);
+    defer allocator.free(listed.refs);
+    errdefer allocator.free(listed.raw);
 
     var layers: std.ArrayList(Layer) = .empty;
     errdefer layers.deinit(allocator);
-    var lines = std.mem.splitScalar(u8, raw_refs, '\n');
 
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-
-        const separator = std.mem.indexOfScalar(
-            u8,
-            line,
-            '\t',
-        ) orelse return error.InvalidGitOutput;
-
-        const ref_name = line[0..separator];
-        const oid = line[separator + 1 ..];
-
-        if (oid.len == 0)
-            return error.InvalidGitOutput;
-
+    for (listed.refs) |ref| {
         // every layer must sit on the chain between the anchor and work
-        const depth = depths.get(oid) orelse
+        const depth = depths.get(ref.oid) orelse
             return error.InvalidStack;
 
         try layers.append(allocator, .{
-            .ref_name = ref_name,
-            .oid = oid,
+            .ref_name = ref.name,
+            .oid = ref.oid,
             .depth = depth,
         });
     }
@@ -328,7 +298,7 @@ pub fn inspect(git: *const Git) !Snapshot {
             base_oid,
             config.anchor_oid,
         ),
-        ._refs_storage = raw_refs,
+        ._refs_storage = listed.raw,
     };
 }
 
@@ -443,8 +413,8 @@ pub fn reset(git: *const Git, delete_layers: bool) !ResetResult {
     const allocator = git.allocator;
     try git.ensureWorkTree();
 
-    const raw_refs = try git.listStackRefs();
-    defer allocator.free(raw_refs);
+    var layers = try git.listRefs(layout.layer_prefix);
+    defer layers.deinit(allocator);
 
     var updates: std.ArrayList(Git.RefUpdate) = .empty;
     defer updates.deinit(allocator);
@@ -462,20 +432,10 @@ pub fn reset(git: *const Git, delete_layers: bool) !ResetResult {
             );
     }
 
-    var layer_count: usize = 0;
-    var lines = std.mem.splitScalar(u8, raw_refs, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        layer_count += 1;
-        if (!delete_layers) continue;
-
-        const separator = std.mem.indexOfScalar(u8, line, '\t') orelse
-            return error.InvalidGitOutput;
-        try updates.append(allocator, .{ .delete = .{
-            .name = line[0..separator],
-            .oid = line[separator + 1 ..],
-        } });
-    }
+    const layer_count = layers.refs.len;
+    if (delete_layers) for (layers.refs) |ref| {
+        try updates.append(allocator, .{ .delete = ref });
+    };
 
     // Shared refs may be checked out in any worktree, including when this
     // worktree has a detached HEAD. NUL fields keep unusual paths unambiguous.
