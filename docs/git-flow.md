@@ -16,3 +16,12 @@ unlocked file is harmless and must not prevent the next mutation.
 The lock coordinates stakrr commands; other Git processes do not honor it.
 Continue publishing refs with compare-and-swap transactions and preserving
 user files and uncommitted work.
+
+## Object creation
+
+Create blobs, trees and checkpoint commits through Git's `hash-object`,
+`mktree` and `commit-tree` plumbing. Use Git's returned object IDs for both
+SHA-1 and SHA-256 repositories. Object creation leaves refs, HEAD, the index
+and working files in place; ref publication remains a separate transaction.
+Checkpoint commits preserve parent order, omit duplicate parents and bypass
+hooks and signing.

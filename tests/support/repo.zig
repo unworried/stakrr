@@ -113,6 +113,13 @@ pub const Repo = struct {
     pub fn expectNoRef(self: *const Repo, ref_name: []const u8) !void {
         try testing.expect(!try self.hasRef(ref_name));
     }
+
+    /// git's trimmed stdout for `args` must equal `expected`
+    pub fn expectOutput(self: *const Repo, args: []const []const u8, expected: []const u8) !void {
+        const actual = try self.git.output(args);
+        defer testing.allocator.free(actual);
+        try testing.expectEqualStrings(expected, actual);
+    }
 };
 
 /// the test process environment, isolated from global and system git
