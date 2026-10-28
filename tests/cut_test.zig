@@ -4,39 +4,11 @@ const stack = @import("stakrr").stack;
 const Git = @import("stakrr").git.Git;
 const Repo = @import("support/repo.zig").Repo;
 
-fn initialize(repo: *const Repo) ![]u8 {
-    const base = try repo.commit("base");
-    errdefer testing.allocator.free(base);
-
-    try repo.exec(&.{ "switch", "-q", "-c", "work" });
-    try stack.initStack(&repo.git, "main");
-    return base;
-}
-
-fn expectRef(
-    repo: *const Repo,
-    ref_name: []const u8,
-    expected: []const u8,
-) !void {
-    const actual = try repo.git.resolveCommit(ref_name);
-    defer testing.allocator.free(actual);
-
-    try testing.expectEqualStrings(expected, actual);
-}
-
-fn expectNoRef(repo: *const Repo, ref_name: []const u8) !void {
-    const result = try repo.git.run(&.{
-        "show-ref", "--verify", "--quiet", ref_name,
-    });
-    defer repo.git.freeResult(result);
-    try testing.expect(!result.term.success());
-}
-
 test "cut at HEAD creates the first layer without moving work" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const b = try repo.commit("B");
@@ -44,10 +16,10 @@ test "cut at HEAD creates the first layer without moving work" {
 
     try stack.cut(&repo.git, "p1", null);
 
-    try expectRef(&repo, "refs/heads/main", base);
-    try expectRef(&repo, "refs/heads/work", b);
-    try expectRef(&repo, "refs/heads/stakrr/p1", b);
-    try expectRef(&repo, "refs/stakrr/tip", b);
+    try repo.expectRef("refs/heads/main", base);
+    try repo.expectRef("refs/heads/work", b);
+    try repo.expectRef("refs/heads/stakrr/p1", b);
+    try repo.expectRef("refs/stakrr/tip", b);
 
     const head = try repo.git.currentBranch();
     defer testing.allocator.free(head);
@@ -66,7 +38,7 @@ test "cut at an earlier commit leaves rolling work untouched" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const b = try repo.commit("B");
@@ -77,8 +49,8 @@ test "cut at an earlier commit leaves rolling work untouched" {
 
     try stack.cut(&repo.git, "p1", "HEAD~1");
 
-    try expectRef(&repo, "refs/heads/stakrr/p1", b);
-    try expectRef(&repo, "refs/heads/work", c);
+    try repo.expectRef("refs/heads/stakrr/p1", b);
+    try repo.expectRef("refs/heads/work", c);
 
     var snapshot = try stack.inspect(&repo.git);
     defer snapshot.deinit();
@@ -90,7 +62,7 @@ test "two sequential cuts create ordered boundaries" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const b = try repo.commit("B");
@@ -105,11 +77,11 @@ test "two sequential cuts create ordered boundaries" {
     try stack.cut(&repo.git, "p1", "HEAD~1");
     try stack.cut(&repo.git, "p2", null);
 
-    try expectRef(&repo, "refs/heads/stakrr/p1", c);
-    try expectRef(&repo, "refs/heads/stakrr/p2", d);
-    try expectRef(&repo, "refs/stakrr/tip", d);
-    try expectRef(&repo, "refs/heads/main", base);
-    try expectRef(&repo, "refs/heads/work", d);
+    try repo.expectRef("refs/heads/stakrr/p1", c);
+    try repo.expectRef("refs/heads/stakrr/p2", d);
+    try repo.expectRef("refs/stakrr/tip", d);
+    try repo.expectRef("refs/heads/main", base);
+    try repo.expectRef("refs/heads/work", d);
 
     var snapshot = try stack.inspect(&repo.git);
     defer snapshot.deinit();
@@ -135,7 +107,7 @@ test "cut rejects empty boundaries" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     try testing.expectError(
@@ -153,14 +125,14 @@ test "cut rejects empty boundaries" {
         stack.cut(&repo.git, "p2", null),
     );
 
-    try expectNoRef(&repo, "refs/heads/stakrr/p2");
+    try repo.expectNoRef("refs/heads/stakrr/p2");
 }
 
 test "cut rejects older and unrelated boundaries" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const b = try repo.commit("B");
@@ -176,7 +148,7 @@ test "cut rejects older and unrelated boundaries" {
         stack.cut(&repo.git, "p2", b),
     );
 
-    try expectNoRef(&repo, "refs/heads/stakrr/p2");
+    try repo.expectNoRef("refs/heads/stakrr/p2");
 
     try repo.exec(&.{ "branch", "unrelated", "main" });
     try repo.exec(&.{ "switch", "-q", "unrelated" });
@@ -196,7 +168,7 @@ test "cut rejects duplicate or invalid layer names" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const b = try repo.commit("B");
@@ -218,8 +190,8 @@ test "cut rejects duplicate or invalid layer names" {
         stack.cut(&repo.git, "p1/sub", null),
     );
 
-    try expectRef(&repo, "refs/heads/stakrr/p1", b);
-    try expectRef(&repo, "refs/stakrr/tip", b);
+    try repo.expectRef("refs/heads/stakrr/p1", b);
+    try repo.expectRef("refs/stakrr/tip", b);
 
     try testing.expectError(
         error.InvalidLayerName,
@@ -241,7 +213,7 @@ test "cut rejects a non-work branch" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const b = try repo.commit("B");
@@ -254,14 +226,14 @@ test "cut rejects a non-work branch" {
         stack.cut(&repo.git, "p1", null),
     );
 
-    try expectNoRef(&repo, "refs/heads/stakrr/p1");
+    try repo.expectNoRef("refs/heads/stakrr/p1");
 }
 
 test "cut still works after the base moves" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const b = try repo.commit("B");
@@ -273,7 +245,7 @@ test "cut still works after the base moves" {
     try repo.exec(&.{ "switch", "-q", "work" });
 
     try stack.cut(&repo.git, "p1", null);
-    try expectRef(&repo, "refs/heads/stakrr/p1", b);
+    try repo.expectRef("refs/heads/stakrr/p1", b);
 
     var snapshot = try stack.inspect(&repo.git);
     defer snapshot.deinit();
@@ -286,7 +258,7 @@ test "cut allows staged changes without changing the index" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const b = try repo.commit("B");
@@ -318,7 +290,7 @@ test "ref transaction aborts if work changes after inspection" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const b = try repo.commit("B");
@@ -338,15 +310,15 @@ test "ref transaction aborts if work changes after inspection" {
         ),
     );
 
-    try expectNoRef(&repo, "refs/heads/stakrr/race");
-    try expectNoRef(&repo, "refs/stakrr/tip");
+    try repo.expectNoRef("refs/heads/stakrr/race");
+    try repo.expectNoRef("refs/stakrr/tip");
 }
 
 test "ref transaction aborts if the stack is reset after inspection" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const b = try repo.commit("B");
@@ -365,14 +337,14 @@ test "ref transaction aborts if the stack is reset after inspection" {
         ),
     );
 
-    try expectNoRef(&repo, "refs/heads/stakrr/race");
+    try repo.expectNoRef("refs/heads/stakrr/race");
 }
 
 test "ref transaction rejects two cuts from the same old tip" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const b = try repo.commit("B");
@@ -410,16 +382,16 @@ test "ref transaction rejects two cuts from the same old tip" {
         ),
     );
 
-    try expectNoRef(&repo, "refs/heads/stakrr/second");
-    try expectRef(&repo, "refs/heads/stakrr/first", b);
-    try expectRef(&repo, "refs/stakrr/tip", b);
+    try repo.expectNoRef("refs/heads/stakrr/second");
+    try repo.expectRef("refs/heads/stakrr/first", b);
+    try repo.expectRef("refs/stakrr/tip", b);
 }
 
 test "cut rejects a side branch outside the rolling history" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const b = try repo.commit("B");
@@ -437,6 +409,6 @@ test "cut rejects a side branch outside the rolling history" {
         stack.cut(&repo.git, "outside", side),
     );
 
-    try expectNoRef(&repo, "refs/heads/stakrr/outside");
-    try expectNoRef(&repo, "refs/stakrr/tip");
+    try repo.expectNoRef("refs/heads/stakrr/outside");
+    try repo.expectNoRef("refs/stakrr/tip");
 }

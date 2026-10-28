@@ -1,5 +1,6 @@
 const std = @import("std");
-const Git = @import("stakrr").git.Git;
+const stakrr = @import("stakrr");
+const Git = stakrr.git.Git;
 
 const testing = std.testing;
 
@@ -78,6 +79,39 @@ pub const Repo = struct {
             "commit", "-q", "--allow-empty", "-m", message,
         });
         return self.git.resolveCommit("HEAD");
+    }
+
+    /// commit a base on main and switch to a new `work` branch;
+    /// returns the owned base oid
+    pub fn initWork(self: *const Repo) ![]u8 {
+        const base = try self.commit("base");
+        errdefer testing.allocator.free(base);
+        try self.exec(&.{ "switch", "-q", "-c", "work" });
+        return base;
+    }
+
+    /// `initWork`, then initialize a stack on main
+    pub fn initStack(self: *const Repo) ![]u8 {
+        const base = try self.initWork();
+        errdefer testing.allocator.free(base);
+        try stakrr.stack.initStack(&self.git, "main");
+        return base;
+    }
+
+    pub fn hasRef(self: *const Repo, ref_name: []const u8) !bool {
+        const oid = try self.git.readRef(ref_name);
+        defer if (oid) |value| testing.allocator.free(value);
+        return oid != null;
+    }
+
+    pub fn expectRef(self: *const Repo, ref_name: []const u8, expected: []const u8) !void {
+        const actual = (try self.git.readRef(ref_name)) orelse return error.TestExpectedRef;
+        defer testing.allocator.free(actual);
+        try testing.expectEqualStrings(expected, actual);
+    }
+
+    pub fn expectNoRef(self: *const Repo, ref_name: []const u8) !void {
+        try testing.expect(!try self.hasRef(ref_name));
     }
 };
 

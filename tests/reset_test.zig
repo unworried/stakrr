@@ -3,27 +3,12 @@ const testing = std.testing;
 const stack = @import("stakrr").stack;
 const Repo = @import("support/repo.zig").Repo;
 
-fn initialize(repo: *const Repo) ![]u8 {
-    const base = try repo.commit("base");
-    errdefer testing.allocator.free(base);
-
-    try repo.exec(&.{ "switch", "-q", "-c", "work" });
-    try stack.initStack(&repo.git, "main");
-    return base;
-}
-
-fn refExists(repo: *const Repo, ref_name: []const u8) !bool {
-    const oid = try repo.git.readRef(ref_name);
-    defer if (oid) |value| testing.allocator.free(value);
-    return oid != null;
-}
-
 test "reset deletes symbolic stakrr refs without deleting their targets" {
     for ([_][]const u8{ "refs/stakrr/anchor", "refs/stakrr/tip", "refs/heads/stakrr/p1" }) |ref_name| {
         var repo = try Repo.init();
         defer repo.deinit();
 
-        const base = try initialize(&repo);
+        const base = try repo.initStack();
         defer testing.allocator.free(base);
         const b = try repo.commit("B");
         defer testing.allocator.free(b);
@@ -42,7 +27,7 @@ test "reset deletes symbolic stakrr refs without deleting their targets" {
         defer if (main) |value| testing.allocator.free(value);
         try testing.expect(main != null);
         try testing.expectEqualStrings(base, main.?);
-        try testing.expect(!try refExists(&repo, ref_name));
+        try repo.expectNoRef(ref_name);
         const state = try repo.git.configGet(stack.state_key);
         defer if (state) |value| testing.allocator.free(value);
         try testing.expect(state == null);
@@ -66,7 +51,7 @@ test "reset keeps layers by default and blocks re-init until they go" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const b = try repo.commit("B");
@@ -77,9 +62,9 @@ test "reset keeps layers by default and blocks re-init until they go" {
     try testing.expectEqual(@as(usize, 1), result.kept_layers);
     try testing.expectEqual(@as(usize, 0), result.deleted_layers);
 
-    try testing.expect(try refExists(&repo, "refs/heads/stakrr/p1"));
-    try testing.expect(!try refExists(&repo, "refs/stakrr/tip"));
-    try testing.expect(!try refExists(&repo, "refs/stakrr/anchor"));
+    try testing.expect(try repo.hasRef("refs/heads/stakrr/p1"));
+    try repo.expectNoRef("refs/stakrr/tip");
+    try repo.expectNoRef("refs/stakrr/anchor");
 
     try testing.expectError(
         error.NotInitialized,
@@ -95,7 +80,7 @@ test "reset --delete-layers allows a clean re-init" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const b = try repo.commit("B");
@@ -108,8 +93,8 @@ test "reset --delete-layers allows a clean re-init" {
 
     const result = try stack.reset(&repo.git, true);
     try testing.expectEqual(@as(usize, 2), result.deleted_layers);
-    try testing.expect(!try refExists(&repo, "refs/heads/stakrr/p1"));
-    try testing.expect(!try refExists(&repo, "refs/heads/stakrr/p2"));
+    try repo.expectNoRef("refs/heads/stakrr/p1");
+    try repo.expectNoRef("refs/heads/stakrr/p2");
 
     // the rolling branch is untouched
     const work = (try repo.git.readRef("refs/heads/work")).?;
@@ -123,7 +108,7 @@ test "reset recovers from corrupt and outdated state" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     // duplicate values make configGet fail; reset must not depend on it
@@ -142,7 +127,7 @@ test "reset refuses to delete a checked-out layer" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
 
     const b = try repo.commit("B");
@@ -155,7 +140,7 @@ test "reset refuses to delete a checked-out layer" {
         error.LayerCheckedOut,
         stack.reset(&repo.git, true),
     );
-    try testing.expect(try refExists(&repo, "refs/stakrr/anchor"));
+    try testing.expect(try repo.hasRef("refs/stakrr/anchor"));
 }
 
 test "reset refuses to delete a layer checked out in another worktree" {
@@ -163,7 +148,7 @@ test "reset refuses to delete a layer checked out in another worktree" {
         var repo = try Repo.init();
         defer repo.deinit();
 
-        const base = try initialize(&repo);
+        const base = try repo.initStack();
         defer testing.allocator.free(base);
         const b = try repo.commit("B");
         defer testing.allocator.free(b);
@@ -189,7 +174,7 @@ test "reset can keep a layer checked out in another worktree" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
     const b = try repo.commit("B");
     defer testing.allocator.free(b);
@@ -207,7 +192,7 @@ test "reset allows another worktree on an unrelated branch" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const base = try initialize(&repo);
+    const base = try repo.initStack();
     defer testing.allocator.free(base);
     const b = try repo.commit("B");
     defer testing.allocator.free(b);
@@ -218,7 +203,7 @@ test "reset allows another worktree on an unrelated branch" {
 
     const result = try stack.reset(&repo.git, true);
     try testing.expectEqual(@as(usize, 1), result.deleted_layers);
-    try testing.expect(!try refExists(&repo, "refs/heads/stakrr/p1"));
+    try repo.expectNoRef("refs/heads/stakrr/p1");
     const linked_head = try repo.git.output(&.{ "-C", path, "rev-parse", "HEAD" });
     defer testing.allocator.free(linked_head);
     try testing.expectEqualStrings(base, linked_head);
