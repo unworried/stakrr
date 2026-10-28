@@ -90,6 +90,45 @@ test "cli: full init, cut, status, reset flow" {
     try testing.expectEqual(@as(u8, 0), again.code);
 }
 
+test "cli: navigate between work, layers and base without moving their refs" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try setup(&repo);
+
+    const init = try stakrr(&repo, &.{ "init", "--base", "main" });
+    defer init.deinit();
+    try testing.expectEqual(@as(u8, 0), init.code);
+    const b = try repo.commit("B");
+    defer testing.allocator.free(b);
+    const cut = try stakrr(&repo, &.{ "cut", "p1" });
+    defer cut.deinit();
+    try testing.expectEqual(@as(u8, 0), cut.code);
+    const before = try repo.git.output(&.{"show-ref"});
+    defer testing.allocator.free(before);
+
+    const steps = [_]struct { command: []const u8, branch: []const u8, stdout: []const u8 = "" }{
+        .{ .command = "up", .branch = "work", .stdout = "already at top\n" },
+        .{ .command = "down", .branch = "stakrr/p1" },
+        .{ .command = "down", .branch = "main" },
+        .{ .command = "down", .branch = "main", .stdout = "already at base\n" },
+        .{ .command = "up", .branch = "stakrr/p1" },
+        .{ .command = "up", .branch = "work" },
+    };
+    for (steps) |step| {
+        const result = try stakrr(&repo, &.{step.command});
+        defer result.deinit();
+        try testing.expectEqual(@as(u8, 0), result.code);
+        try testing.expectEqualStrings(step.stdout, result.stdout);
+        try testing.expectEqualStrings("", result.stderr);
+        const branch = try repo.git.output(&.{ "branch", "--show-current" });
+        defer testing.allocator.free(branch);
+        try testing.expectEqualStrings(step.branch, branch);
+        const after = try repo.git.output(&.{"show-ref"});
+        defer testing.allocator.free(after);
+        try testing.expectEqualStrings(before, after);
+    }
+}
+
 test "cli: failures print one clean message and exit non-zero" {
     var repo = try Repo.init();
     defer repo.deinit();
