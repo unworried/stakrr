@@ -152,10 +152,7 @@ fn runCommand(
             var snapshot = try stack.inspect(git);
             defer snapshot.deinit(git.allocator);
 
-            const current: ?[]u8 = git.currentBranch() catch |err| switch (err) {
-                error.DetachedHead => null,
-                else => return err,
-            };
+            const current = try git.head();
             defer if (current) |ref| git.allocator.free(ref);
 
             try printStatus(out, snapshot, current);
