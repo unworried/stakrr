@@ -363,6 +363,7 @@ pub const Git = struct {
     /// Atomically apply `updates` in one ref transaction; either every
     /// update lands or none do. Names must be Git-valid refs and every oid
     /// a full object id, since both are written into the stdin protocol.
+    /// Updates affect the named refs themselves, never symbolic-ref targets.
     pub fn transact(
         self: *const Git,
         message: []const u8,
@@ -411,6 +412,7 @@ pub const Git = struct {
             .argv = &.{
                 "git",
                 "update-ref",
+                "--no-deref",
                 "--create-reflog",
                 "-m",
                 message,
