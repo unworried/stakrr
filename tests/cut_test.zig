@@ -2,7 +2,6 @@ const std = @import("std");
 const layout = @import("stakrr").layout;
 const testing = std.testing;
 const stack = @import("stakrr").stack;
-const Git = @import("stakrr").git.Git;
 const Repo = @import("support/repo.zig").Repo;
 
 test "cut at HEAD creates the first layer without moving work" {
@@ -22,7 +21,7 @@ test "cut at HEAD creates the first layer without moving work" {
     try repo.expectRef("refs/heads/stakrr/p1", b);
     try repo.expectRef(layout.tip_ref, b);
 
-    const head = try repo.git.currentBranch();
+    const head = try repo.git.currentBranchAlloc();
     defer testing.allocator.free(head);
 
     try testing.expectEqualStrings("refs/heads/work", head);
@@ -300,12 +299,14 @@ test "ref transaction aborts if work changes after inspection" {
     const c = try repo.commit("C");
     defer testing.allocator.free(c);
 
+    var mutation = try repo.git.beginStackMutation();
+    defer mutation.deinit();
     try testing.expectError(
         error.GitFailed,
-        stack.createLayerRef(&repo.git, .{
-            .layer = .{ .name = "refs/heads/stakrr/race", .oid = b },
-            .anchor = .{ .name = layout.anchor_ref, .oid = base },
-            .work = .{ .name = "refs/heads/work", .oid = b },
+        stack.createLayerRef(&mutation, .{
+            .layer = try repo.git.expectedRef("refs/heads/stakrr/race", b),
+            .anchor = try repo.git.expectedRef(layout.anchor_ref, base),
+            .work = try repo.git.expectedRef("refs/heads/work", b),
         }),
     );
 
@@ -325,12 +326,14 @@ test "ref transaction aborts if the stack is reset after inspection" {
 
     _ = try stack.reset(&repo.git, .{});
 
+    var mutation = try repo.git.beginStackMutation();
+    defer mutation.deinit();
     try testing.expectError(
         error.GitFailed,
-        stack.createLayerRef(&repo.git, .{
-            .layer = .{ .name = "refs/heads/stakrr/race", .oid = b },
-            .anchor = .{ .name = layout.anchor_ref, .oid = base },
-            .work = .{ .name = "refs/heads/work", .oid = b },
+        stack.createLayerRef(&mutation, .{
+            .layer = try repo.git.expectedRef("refs/heads/stakrr/race", b),
+            .anchor = try repo.git.expectedRef(layout.anchor_ref, base),
+            .work = try repo.git.expectedRef("refs/heads/work", b),
         }),
     );
 
@@ -350,26 +353,22 @@ test "ref transaction rejects two cuts from the same old tip" {
     const c = try repo.commit("C");
     defer testing.allocator.free(c);
 
-    const expected_base = Git.ExpectedRef{
-        .name = layout.anchor_ref,
-        .oid = base,
-    };
+    var mutation = try repo.git.beginStackMutation();
+    defer mutation.deinit();
+    const expected_base = try repo.git.expectedRef(layout.anchor_ref, base);
 
-    const expected_work = Git.ExpectedRef{
-        .name = "refs/heads/work",
-        .oid = c,
-    };
+    const expected_work = try repo.git.expectedRef("refs/heads/work", c);
 
-    try stack.createLayerRef(&repo.git, .{
-        .layer = .{ .name = "refs/heads/stakrr/first", .oid = b },
+    try stack.createLayerRef(&mutation, .{
+        .layer = try repo.git.expectedRef("refs/heads/stakrr/first", b),
         .anchor = expected_base,
         .work = expected_work,
     });
 
     try testing.expectError(
         error.GitFailed,
-        stack.createLayerRef(&repo.git, .{
-            .layer = .{ .name = "refs/heads/stakrr/second", .oid = c },
+        stack.createLayerRef(&mutation, .{
+            .layer = try repo.git.expectedRef("refs/heads/stakrr/second", c),
             .anchor = expected_base,
             .work = expected_work,
         }),

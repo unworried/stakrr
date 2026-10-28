@@ -6,6 +6,7 @@ const stack = @import("stakrr").stack;
 
 const support = @import("support/repo.zig");
 const Repo = support.Repo;
+const Snapshot = @import("support/snapshot.zig").Snapshot;
 
 fn setState(repo: *const Repo, state: []const u8) !void {
     try repo.exec(&.{
@@ -66,11 +67,11 @@ test "inspect: config parses initialized state" {
 
     try testing.expectEqualStrings(
         "refs/heads/main",
-        config.base_ref,
+        config.base_ref.name.bytes,
     );
     try testing.expectEqualStrings(
         "refs/heads/work",
-        config.work_ref,
+        config.work_ref.name.bytes,
     );
     try testing.expectEqualStrings(
         base,
@@ -155,7 +156,7 @@ test "initStack records the anchor as a ref" {
     const base = try repo.initStack();
     defer testing.allocator.free(base);
 
-    const anchor = (try repo.git.readRef(layout.anchor_ref)).?;
+    const anchor = (try repo.readRef(layout.anchor_ref)).?;
     defer testing.allocator.free(anchor);
 
     try testing.expectEqualStrings(base, anchor);
@@ -175,7 +176,31 @@ test "initStack accepts a full base ref" {
     defer snapshot.deinit();
     const config = snapshot.config;
 
-    try testing.expectEqualStrings("refs/heads/main", config.base_ref);
+    try testing.expectEqualStrings("refs/heads/main", config.base_ref.name.bytes);
+}
+
+test "initStack refuses a base name rejected by config without changing repository state" {
+    for ([_][]const u8{ "sha1", "sha256" }) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+        const base = try repo.initWork();
+        defer testing.allocator.free(base);
+        // Git permits this full ref, but it cannot be used as a stack branch.
+        try repo.exec(&.{ "update-ref", "refs/heads/-base", base });
+        try repo.write("user-file", "staged\n");
+        try repo.exec(&.{ "add", "user-file" });
+        try repo.write("user-file", "unstaged\n");
+
+        var before = try Snapshot.capture(&repo);
+        defer before.deinit();
+        for ([_][]const u8{ "-base", "refs/heads/-base" }) |name| {
+            try testing.expectError(error.InvalidRefName, stack.initStack(&repo.git, name));
+            try before.expectUnchanged(&repo);
+            try expectNoState(&repo);
+            try repo.expectNoRef(layout.transaction_ref);
+            try repo.expectFile("user-file", "unstaged\n");
+        }
+    }
 }
 
 test "initStack rejects a missing base" {
@@ -463,14 +488,14 @@ test "navigate traverses layers by history and stops at the stack boundaries" {
     try testing.expect(!try stack.navigate(&repo.git, .up));
     for ([_][]const u8{ "refs/heads/stakrr/a-second", "refs/heads/stakrr/z-first", "refs/heads/main" }) |expected| {
         try testing.expect(try stack.navigate(&repo.git, .down));
-        const current = try repo.git.currentBranch();
+        const current = try repo.git.currentBranchAlloc();
         defer testing.allocator.free(current);
         try testing.expectEqualStrings(expected, current);
     }
     try testing.expect(!try stack.navigate(&repo.git, .down));
     for ([_][]const u8{ "refs/heads/stakrr/z-first", "refs/heads/stakrr/a-second", "refs/heads/work" }) |expected| {
         try testing.expect(try stack.navigate(&repo.git, .up));
-        const current = try repo.git.currentBranch();
+        const current = try repo.git.currentBranchAlloc();
         defer testing.allocator.free(current);
         try testing.expectEqualStrings(expected, current);
     }
@@ -574,8 +599,8 @@ test "inspect snapshots own independent storage across stack changes" {
         _ = try stack.reset(&repo.git, .{ .delete_layers = true });
     }
 
-    try testing.expectEqualStrings("refs/heads/main", original.config.base_ref);
-    try testing.expectEqualStrings("refs/heads/work", original.config.work_ref);
+    try testing.expectEqualStrings("refs/heads/main", original.config.base_ref.name.bytes);
+    try testing.expectEqualStrings("refs/heads/work", original.config.work_ref.name.bytes);
     try testing.expectEqualStrings(base, original.config.anchor_oid);
     try testing.expectEqualStrings(first, original.work_oid);
     try testing.expectEqual(@as(usize, 1), original.layers.len);

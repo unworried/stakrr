@@ -18,9 +18,9 @@ test "cut CAS refusal after intent creation does not leave recovery pending" {
         var repo = try Repo.initOptions(.{ .object_format = format });
         defer repo.deinit();
         try setup(&repo);
-        var before = try repo.git.listRefs("refs/");
+        var before = try repo.git.listDirectRefs("refs/");
         defer before.deinit(testing.allocator);
-        const old = try repo.git.resolveCommit("work");
+        const old = try repo.git.resolveCommitAlloc("work");
         defer testing.allocator.free(old);
         const tree = try repo.git.output(&.{ "rev-parse", "work^{tree}" });
         defer testing.allocator.free(tree);
@@ -38,7 +38,7 @@ test "cut CAS refusal after intent creation does not leave recovery pending" {
         try testing.expect(std.mem.indexOf(u8, refused.stderr, "refs/heads/work") != null);
         _ = repo.env.swapRemove("STAKRR_TEST_RACE_LABEL");
         for (before.refs) |ref| {
-            try repo.expectRef(ref.name, if (std.mem.eql(u8, ref.name, "refs/heads/work")) raced else ref.oid);
+            try repo.expectRef(ref.name.bytes, if (std.mem.eql(u8, ref.name.bytes, "refs/heads/work")) raced else ref.oid.hex());
         }
         try repo.expectNoRef("refs/heads/stakrr/rolling");
         try repo.expectNoRef(stakrr.layout.record_prefix ++ "rolling");
@@ -111,7 +111,9 @@ test "partial ref transactions recover in normal bare separate and linked reposi
             try testing.expect(try repo.hasRef(intent_ref));
             try repo.exec(&.{ "reflog", "expire", "--expire=now", "--all" });
             try repo.exec(&.{ "gc", "--prune=now" });
-            try repo.git.transact("resume", &.{});
+            var mutation = try repo.git.beginRefMutation();
+            defer mutation.deinit();
+            try testing.expect(mutation.recovered);
             try repo.expectRef("refs/heads/a", new);
             try repo.expectRef("refs/stakrr/blob", blob);
             try repo.expectNoRef("refs/stakrr/remove");
@@ -121,12 +123,7 @@ test "partial ref transactions recover in normal bare separate and linked reposi
     }
 }
 
-fn expectSuccess(repo: *const Repo, args: []const []const u8) !void {
-    const result = try cli.run(repo, args);
-    defer result.deinit();
-    if (result.code != 0) std.debug.print("stakrr stderr: {s}\n", .{result.stderr});
-    try testing.expectEqual(@as(?u8, 0), result.code);
-}
+const expectSuccess = cli.expectSuccess;
 
 fn interrupt(repo: *Repo, args: []const []const u8, label: []const u8, count: []const u8) !void {
     try cli.installFaultShim(repo);
@@ -134,7 +131,10 @@ fn interrupt(repo: *Repo, args: []const []const u8, label: []const u8, count: []
     try repo.env.put("STAKRR_TEST_PARTIAL_WRITES", count);
     const stopped = try cli.run(repo, args);
     defer stopped.deinit();
-    try testing.expect(stopped.code != 0);
+    if (repo.env.get("STAKRR_TEST_PARTIAL_EXIT") != null)
+        try testing.expectEqual(@as(?u8, 1), stopped.code)
+    else
+        try stopped.expectKilled();
     _ = repo.env.swapRemove("STAKRR_TEST_PARTIAL_LABEL");
     try testing.expect(try repo.hasRef(intent_ref));
 }
@@ -145,7 +145,7 @@ test "cut resumes before its first write after partial publication and after int
             var repo = try Repo.initOptions(.{ .object_format = format });
             defer repo.deinit();
             try setup(&repo);
-            const head = try repo.git.resolveCommit("HEAD");
+            const head = try repo.git.resolveCommitAlloc("HEAD");
             defer testing.allocator.free(head);
             try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "dirty", .data = "staged\n" });
             try repo.exec(&.{ "add", "dirty" });
@@ -167,18 +167,14 @@ test "cut resumes before its first write after partial publication and after int
             try repo.expectRef("refs/heads/stakrr/rolling", head);
             try repo.expectRef("refs/stakrr/layers/rolling", head);
             try repo.expectRef("refs/stakrr/tip", head);
-            try repo.expectRef("HEAD", head);
+            try repo.expectOutput(&.{ "rev-parse", "--verify", "HEAD" }, head);
             try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/work");
             try repo.expectOutput(&.{"write-tree"}, index);
             var snapshot = try stakrr.stack.inspect(&repo.git);
             defer snapshot.deinit();
             try testing.expectEqual(@as(usize, 2), snapshot.layers.len);
-            const dirty = try repo.tmp.dir.readFileAlloc(testing.io, "dirty", testing.allocator, .limited(1024));
-            defer testing.allocator.free(dirty);
-            try testing.expectEqualStrings("unstaged\n", dirty);
-            const untracked = try repo.tmp.dir.readFileAlloc(testing.io, "untracked", testing.allocator, .limited(1024));
-            defer testing.allocator.free(untracked);
-            try testing.expectEqualStrings("keep\n", untracked);
+            try repo.expectFile("dirty", "unstaged\n");
+            try repo.expectFile("untracked", "keep\n");
         }
     }
 }
@@ -190,10 +186,10 @@ test "failure after preparation retains intent for partially published refs" {
     try repo.env.put("STAKRR_TEST_PARTIAL_EXIT", "1");
     try repo.env.put("STAKRR_TEST_PARTIAL_STATUS", "128");
     try interrupt(&repo, &.{ "cut", "rolling" }, "stakrr: cut", "1");
-    const head = try repo.git.resolveCommit("HEAD");
+    const head = try repo.git.resolveCommitAlloc("HEAD");
     defer testing.allocator.free(head);
     try repo.expectRef("refs/heads/stakrr/rolling", head);
-    const tip = (try repo.git.readRef("refs/stakrr/tip")).?;
+    const tip = (try repo.readRef("refs/stakrr/tip")).?;
     defer testing.allocator.free(tip);
     try testing.expect(!std.mem.eql(u8, head, tip));
     try expectSuccess(&repo, &.{"up"});
@@ -205,7 +201,7 @@ test "recovery refuses unexpected values without changing refs and succeeds afte
     var repo = try Repo.init();
     defer repo.deinit();
     try setup(&repo);
-    const head = try repo.git.resolveCommit("HEAD");
+    const head = try repo.git.resolveCommitAlloc("HEAD");
     defer testing.allocator.free(head);
     try interrupt(&repo, &.{ "cut", "rolling" }, "stakrr: cut", "1");
     try repo.exec(&.{ "update-ref", "refs/heads/work", "main" });
@@ -262,9 +258,7 @@ test "recovery preserves Git owned lock files and retries after their removal" {
     defer refused.deinit();
     try testing.expectEqual(@as(?u8, 1), refused.code);
     try repo.expectOutput(&.{"show-ref"}, refs);
-    const bytes = try repo.tmp.dir.readFileAlloc(testing.io, ".git/refs/stakrr/tip.lock", testing.allocator, .limited(1024));
-    defer testing.allocator.free(bytes);
-    try testing.expectEqualStrings("owned by Git\n", bytes);
+    try repo.expectFile(".git/refs/stakrr/tip.lock", "owned by Git\n");
     try repo.tmp.dir.deleteFile(testing.io, ".git/refs/stakrr/tip.lock");
     try expectSuccess(&repo, &.{"up"});
     try repo.expectNoRef(intent_ref);
@@ -275,7 +269,7 @@ test "recovery refuses active Git operations before changing branches" {
         var repo = try Repo.init();
         defer repo.deinit();
         try setup(&repo);
-        const head = try repo.git.resolveCommit("HEAD");
+        const head = try repo.git.resolveCommitAlloc("HEAD");
         defer testing.allocator.free(head);
         try interrupt(&repo, &.{ "cut", "rolling" }, "stakrr: cut", "0");
         const path = try repo.git.path(&.{ "rev-parse", "--git-path", name });
@@ -319,41 +313,7 @@ test "corrupt intent is preserved by status and mutations" {
     }
 }
 
-test "journal publication does not require a configured author identity" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-    try setup(&repo);
-    try repo.exec(&.{ "config", "--unset", "user.name" });
-    try repo.exec(&.{ "config", "--unset", "user.email" });
-    try repo.exec(&.{ "config", "user.useConfigOnly", "true" });
-    try expectSuccess(&repo, &.{ "cut", "rolling" });
-    try repo.expectNoRef(intent_ref);
-    var snapshot = try stakrr.stack.inspect(&repo.git);
-    defer snapshot.deinit();
-    try testing.expectEqual(@as(usize, 2), snapshot.layers.len);
-}
-
-fn driver(repo: *const Repo, args: []const []const u8) !cli.Run {
-    const exe = try std.Io.Dir.cwd().realPathFileAlloc(testing.io, @import("cli_options").ref_driver_path, testing.allocator);
-    defer testing.allocator.free(exe);
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(testing.allocator);
-    try argv.append(testing.allocator, exe);
-    try argv.appendSlice(testing.allocator, args);
-    const result = try std.process.run(testing.allocator, testing.io, .{
-        .argv = argv.items,
-        .cwd = .{ .dir = repo.tmp.dir },
-        .environ_map = repo.env,
-    });
-    return .{
-        .code = switch (result.term) {
-            .exited => |code| code,
-            else => null,
-        },
-        .stdout = result.stdout,
-        .stderr = result.stderr,
-    };
-}
+const driver = cli.runRefDriver;
 
 test "production intent retains commits trees blobs and exact annotated tag bytes through pruning" {
     for ([_][]const u8{ "sha1", "sha256" }) |format| {
@@ -378,7 +338,7 @@ test "production intent retains commits trees blobs and exact annotated tag byte
         try repo.env.put("STAKRR_TEST_PARTIAL_WRITES", "0");
         const stopped = try driver(&repo, &.{ "retain", old, new, blob, tree, tag });
         defer stopped.deinit();
-        try testing.expect(stopped.code != 0);
+        try stopped.expectKilled();
         try testing.expect(try repo.hasRef(intent_ref));
         _ = repo.env.swapRemove("STAKRR_TEST_PARTIAL_LABEL");
         try repo.exec(&.{ "reflog", "expire", "--expire=now", "--all" });
@@ -408,20 +368,22 @@ test "journal rejects duplicate ref names and its reserved namespace without pub
     defer repo.deinit();
     const head = try repo.commit("seed");
     defer testing.allocator.free(head);
-    try testing.expectError(error.InvalidRefName, repo.git.transact("duplicate", &.{
-        .{ .create = .{ .name = "refs/stakrr/same", .oid = head } },
-        .{ .create = .{ .name = "refs/stakrr/same", .oid = head } },
-    }));
+    var mutation = try repo.git.beginRefMutation();
+    defer mutation.deinit();
+    try testing.expectError(error.InvalidRefName, mutation.publish(.{ .message = "duplicate", .updates = &.{
+        try repo.git.createRef("refs/stakrr/same", head),
+        try repo.git.createRef("refs/stakrr/same", head),
+    } }));
     for ([_][]const u8{ intent_ref, intent_ref ++ "/nested" }) |name| {
-        try testing.expectError(error.InvalidRefName, repo.git.transact("reserved", &.{
-            .{ .create = .{ .name = name, .oid = head } },
-            .{ .create = .{ .name = "refs/stakrr/other", .oid = head } },
-        }));
+        try testing.expectError(error.InvalidRefName, mutation.publish(.{ .message = "reserved", .updates = &.{
+            try repo.git.createRef(name, head),
+            try repo.git.createRef("refs/stakrr/other", head),
+        } }));
     }
     try repo.expectNoRef(intent_ref);
     try repo.expectNoRef("refs/stakrr/same");
     try repo.expectNoRef("refs/stakrr/other");
-    try repo.expectRef("HEAD", head);
+    try repo.expectOutput(&.{ "rev-parse", "--verify", "HEAD" }, head);
 }
 
 test "reset recovery refuses to delete the caller's checked-out layer" {
@@ -434,14 +396,14 @@ test "reset recovery refuses to delete the caller's checked-out layer" {
         try repo.env.put("STAKRR_TEST_PARTIAL_WRITES", "1");
         const stopped = try cli.run(&repo, &.{ "reset", "--delete-layers" });
         defer stopped.deinit();
-        try testing.expect(stopped.code != 0);
+        try stopped.expectKilled();
         _ = repo.env.swapRemove("STAKRR_TEST_PARTIAL_LABEL");
         try testing.expect(try repo.hasRef(intent_ref));
 
         try repo.exec(&.{ "switch", "-q", "stakrr/models" });
         const refs = try repo.git.output(&.{"show-ref"});
         defer testing.allocator.free(refs);
-        const head = try repo.git.resolveCommit("HEAD");
+        const head = try repo.git.resolveCommitAlloc("HEAD");
         defer testing.allocator.free(head);
         const index = try repo.git.output(&.{"write-tree"});
         defer testing.allocator.free(index);
@@ -450,7 +412,7 @@ test "reset recovery refuses to delete the caller's checked-out layer" {
         try testing.expectEqual(@as(?u8, 1), refused.code);
         try testing.expect(std.mem.indexOf(u8, refused.stderr, "checked out") != null);
         try repo.expectOutput(&.{"show-ref"}, refs);
-        try repo.expectRef("HEAD", head);
+        try repo.expectOutput(&.{ "rev-parse", "--verify", "HEAD" }, head);
         try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
         try repo.expectOutput(&.{"write-tree"}, index);
         try repo.expectOutput(&.{ "status", "--porcelain" }, "");
@@ -477,7 +439,7 @@ test "restack and archival recover after partial publication" {
         try repo.env.put("STAKRR_TEST_PARTIAL_WRITES", if (std.mem.eql(u8, label, "stakrr: restack")) "1" else "2");
         const stopped = try cli.run(&repo, &.{"restack"});
         defer stopped.deinit();
-        try testing.expect(stopped.code != 0);
+        try stopped.expectKilled();
         _ = repo.env.swapRemove("STAKRR_TEST_PARTIAL_LABEL");
 
         if (try repo.hasRef(stakrr.layout.session_ref)) {
@@ -495,17 +457,21 @@ test "restack and archival recover after partial publication" {
 }
 
 test "cut publication does not require a configured author identity" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-    try fixture.setup(&repo);
-    try repo.exec(&.{ "config", "--unset", "user.name" });
-    try repo.exec(&.{ "config", "--unset", "user.email" });
-    try repo.exec(&.{ "config", "user.useConfigOnly", "true" });
-    try cli.expectSuccess(&repo, &.{ "cut", "rolling" });
-    try repo.expectNoRef(intent_ref);
-    var snapshot = try stakrr.stack.inspect(&repo.git);
-    defer snapshot.deinit();
-    try testing.expectEqual(@as(usize, 3), snapshot.layers.len);
+    for ([_][]const u8{ "sha1", "sha256" }) |format| {
+        for ([_]bool{ false, true }) |with_files| {
+            var repo = try Repo.initOptions(.{ .object_format = format });
+            defer repo.deinit();
+            if (with_files) try fixture.setup(&repo) else try setup(&repo);
+            try repo.exec(&.{ "config", "--unset", "user.name" });
+            try repo.exec(&.{ "config", "--unset", "user.email" });
+            try repo.exec(&.{ "config", "user.useConfigOnly", "true" });
+            try cli.expectSuccess(&repo, &.{ "cut", "rolling" });
+            try repo.expectNoRef(intent_ref);
+            var snapshot = try stakrr.stack.inspect(&repo.git);
+            defer snapshot.deinit();
+            try testing.expectEqual(@as(usize, if (with_files) 3 else 2), snapshot.layers.len);
+        }
+    }
 }
 
 test "separate Git directories allow own branches and reject forced duplicate checkouts" {
@@ -553,7 +519,7 @@ test "Git failure after preparation keeps intent for partially published refs" {
     var repo = try Repo.init();
     defer repo.deinit();
     try fixture.setup(&repo);
-    const old = try repo.git.resolveCommit("refs/heads/stakrr/models");
+    const old = try repo.git.resolveCommitAlloc("refs/heads/stakrr/models");
     defer testing.allocator.free(old);
     try repo.write("model", "fixed\n");
     try repo.exec(&.{ "add", "model" });
@@ -566,7 +532,7 @@ test "Git failure after preparation keeps intent for partially published refs" {
     try testing.expectEqual(@as(?u8, 1), stopped.code);
     _ = repo.env.swapRemove("STAKRR_TEST_PARTIAL_LABEL");
     try testing.expect(try repo.hasRef(intent_ref));
-    const published = try repo.git.resolveCommit("refs/heads/stakrr/models");
+    const published = try repo.git.resolveCommitAlloc("refs/heads/stakrr/models");
     defer testing.allocator.free(published);
     try testing.expect(!std.mem.eql(u8, old, published));
     try repo.expectRef("refs/stakrr/layers/models", old);
@@ -588,7 +554,7 @@ test "partial ref recovery refuses unexpected values without changing any refs" 
     try repo.env.put("STAKRR_TEST_PARTIAL_LABEL", "stakrr: fix models");
     const stopped = try cli.run(&repo, &.{ "fix", "models", "-m", "fix" });
     defer stopped.deinit();
-    try testing.expect(stopped.code != 0);
+    try stopped.expectKilled();
     _ = repo.env.swapRemove("STAKRR_TEST_PARTIAL_LABEL");
     try repo.exec(&.{ "update-ref", "refs/heads/work", "main" });
     const before = try repo.git.output(&.{"show-ref"});
@@ -606,9 +572,8 @@ test "fix publication completes before undo after a partial transaction" {
         var repo = try Repo.init();
         defer repo.deinit();
         try fixture.setup(&repo);
-        const before = try repo.git.listRefs("refs/heads/");
-        defer testing.allocator.free(before.raw);
-        defer testing.allocator.free(before.refs);
+        var before = try repo.git.listDirectRefs("refs/heads/");
+        defer before.deinit(testing.allocator);
         try repo.write("model", "fixed\n");
         try repo.exec(&.{ "add", "model" });
         try cli.installFaultShim(&repo);
@@ -616,11 +581,11 @@ test "fix publication completes before undo after a partial transaction" {
         try repo.env.put("STAKRR_TEST_PARTIAL_WRITES", count);
         const stopped = try cli.run(&repo, &.{ "fix", "models", "-m", "fix" });
         defer stopped.deinit();
-        try testing.expect(stopped.code != 0);
+        try stopped.expectKilled();
         _ = repo.env.swapRemove("STAKRR_TEST_PARTIAL_LABEL");
 
         try cli.expectSuccess(&repo, &.{"undo"});
-        var after = try repo.git.listRefs("refs/heads/");
+        var after = try repo.git.listDirectRefs("refs/heads/");
         defer after.deinit(testing.allocator);
         try testing.expectEqualStrings(before.raw, after.raw);
         try repo.expectNoRef(intent_ref);
@@ -639,7 +604,7 @@ test "status and log report partial publication without repairing it" {
     try repo.env.put("STAKRR_TEST_PARTIAL_LABEL", "stakrr: fix models");
     const stopped = try cli.run(&repo, &.{ "fix", "models", "-m", "fix" });
     defer stopped.deinit();
-    try testing.expect(stopped.code != 0);
+    try stopped.expectKilled();
     _ = repo.env.swapRemove("STAKRR_TEST_PARTIAL_LABEL");
     const before = try repo.git.output(&.{"show-ref"});
     defer testing.allocator.free(before);
@@ -668,7 +633,7 @@ test "publication resumes before its first write and after interrupted cleanup" 
         try repo.env.put("STAKRR_TEST_PARTIAL_WRITES", "0");
         const stopped = try cli.run(&repo, &.{ "fix", "models", "-m", "fix" });
         defer stopped.deinit();
-        try testing.expect(stopped.code != 0);
+        try stopped.expectKilled();
         try testing.expect(try repo.hasRef(intent_ref));
         _ = repo.env.swapRemove("STAKRR_TEST_PARTIAL_LABEL");
 
@@ -694,7 +659,7 @@ test "recovery preserves Git locks and refuses branches occupied in another work
     try repo.env.put("STAKRR_TEST_PARTIAL_LABEL", "stakrr: fix models");
     const stopped = try cli.run(&repo, &.{ "fix", "models", "-m", "fix" });
     defer stopped.deinit();
-    try testing.expect(stopped.code != 0);
+    try stopped.expectKilled();
     _ = repo.env.swapRemove("STAKRR_TEST_PARTIAL_LABEL");
     const before = try repo.git.output(&.{"show-ref"});
     defer testing.allocator.free(before);

@@ -29,11 +29,11 @@ test "reset refuses symbolic stakrr refs without changing refs or config" {
         try testing.expectEqualStrings(refs, refs_after);
         try testing.expectEqualStrings(config, config_after);
 
-        const work = try repo.git.readRef("refs/heads/work");
+        const work = try repo.readRef("refs/heads/work");
         defer if (work) |value| testing.allocator.free(value);
         try testing.expect(work != null);
         try testing.expectEqualStrings(b, work.?);
-        const main = try repo.git.readRef("refs/heads/main");
+        const main = try repo.readRef("refs/heads/main");
         defer if (main) |value| testing.allocator.free(value);
         try testing.expect(main != null);
         try testing.expectEqualStrings(base, main.?);
@@ -107,7 +107,7 @@ test "reset --delete-layers allows a clean re-init" {
     try repo.expectNoRef("refs/heads/stakrr/p2");
 
     // the rolling branch is untouched
-    const work = (try repo.git.readRef("refs/heads/work")).?;
+    const work = (try repo.readRef("refs/heads/work")).?;
     defer testing.allocator.free(work);
     try testing.expectEqualStrings(c, work);
 

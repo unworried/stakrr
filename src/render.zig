@@ -65,10 +65,10 @@ pub fn printStatus(
     const w = out.writer;
     const config = snapshot.config;
 
-    var width = columnWidth(config.base_ref, config.work_ref);
-    for (snapshot.layers) |layer| width = @max(width, columnWidth(config.base_ref, layer.ref_name));
+    var width = columnWidth(config.base_ref.name.bytes, config.work_ref.name.bytes);
+    for (snapshot.layers) |layer| width = @max(width, columnWidth(config.base_ref.name.bytes, layer.ref_name));
 
-    try printStackHeader(out, config.base_ref, config.work_ref);
+    try printStackHeader(out, config.base_ref.name.bytes, config.work_ref.name.bytes);
     try w.writeByte('\n');
 
     if (snapshot.base_moved) {
@@ -82,7 +82,7 @@ pub fn printStatus(
         try w.writeAll("\n\n");
     }
 
-    try printStackRow(out, config.work_ref, isCurrent(current, config.work_ref), false, width);
+    try printStackRow(out, config.work_ref.name.bytes, isCurrent(current, config.work_ref.name.bytes), false, width);
     try term.styled(out, .dim, "{d} unstacked", .{snapshot.unstacked_commits});
     try w.writeByte('\n');
 
@@ -102,7 +102,7 @@ pub fn printStatus(
         try w.writeByte('\n');
     }
 
-    try printFooter(out, config.base_ref, current, width, snapshot.layers.len);
+    try printFooter(out, config.base_ref.name.bytes, current, width, snapshot.layers.len);
     for (snapshot.layers) |layer| {
         if (!layer.stale()) continue;
         try w.writeAll("\n  stale layers have commits above their recorded boundary;\n" ++

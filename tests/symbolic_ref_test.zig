@@ -14,43 +14,7 @@ const fixture = @import("support/edit_fixture.zig");
 const victim = "refs/heads/victim";
 const formats = [_][]const u8{ "sha1", "sha256" };
 
-// Include ref types, config, HEAD, the index and working files when checking
-// refusal. Resolved OIDs alone would hide a symbolic substitution.
-const Snapshot = struct {
-    const commands = [_][]const []const u8{
-        &.{ "for-each-ref", "--format=%(refname)%09%(objectname)%09%(symref)" },
-        &.{ "config", "--local", "--null", "--list" },
-        &.{ "symbolic-ref", "--no-recurse", "HEAD" },
-        &.{ "rev-parse", "--verify", "HEAD" },
-        &.{ "ls-files", "--stage", "-z" },
-        &.{ "diff", "--no-relative", "--no-ext-diff", "--binary", "HEAD" },
-        &.{ "status", "--porcelain=v1", "-z" },
-    };
-    values: [commands.len][]u8,
-
-    fn capture(repo: *const Repo) !Snapshot {
-        var result: Snapshot = undefined;
-        var initialized: usize = 0;
-        errdefer for (result.values[0..initialized]) |value| testing.allocator.free(value);
-        for (commands, &result.values) |command, *value| {
-            value.* = try repo.git.outputRaw(command);
-            initialized += 1;
-        }
-        return result;
-    }
-
-    fn deinit(self: *Snapshot) void {
-        for (self.values) |value| testing.allocator.free(value);
-    }
-
-    fn expectUnchanged(self: *const Snapshot, repo: *const Repo) !void {
-        for (commands, self.values) |command, expected| {
-            const actual = try repo.git.outputRaw(command);
-            defer testing.allocator.free(actual);
-            try testing.expectEqualStrings(expected, actual);
-        }
-    }
-};
+const Snapshot = @import("support/snapshot.zig").Snapshot;
 
 fn expectSymbolic(repo: *const Repo, name: []const u8) !void {
     // for-each-ref omits dangling symbolic refs, so assert their identity too.
@@ -62,27 +26,7 @@ fn expectAbsent(repo: *const Repo, name: []const u8) !void {
     try testing.expect(!(try repo.git.check(&.{ "symbolic-ref", "--quiet", "--no-recurse", name }, 1)));
 }
 
-fn driver(repo: *const Repo, args: []const []const u8) !cli.Run {
-    const exe = try std.Io.Dir.cwd().realPathFileAlloc(testing.io, @import("cli_options").ref_driver_path, testing.allocator);
-    defer testing.allocator.free(exe);
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(testing.allocator);
-    try argv.append(testing.allocator, exe);
-    try argv.appendSlice(testing.allocator, args);
-    const result = try std.process.run(testing.allocator, testing.io, .{
-        .argv = argv.items,
-        .cwd = .{ .dir = repo.tmp.dir },
-        .environ_map = repo.env,
-    });
-    return .{
-        .code = switch (result.term) {
-            .exited => |code| code,
-            else => null,
-        },
-        .stdout = result.stdout,
-        .stderr = result.stderr,
-    };
-}
+const driver = cli.runRefDriver;
 
 fn expectDriverError(result: cli.Run, expected: anyerror) !void {
     try testing.expectEqual(@as(?u8, 1), result.code);
@@ -206,9 +150,6 @@ fn publicationCase(format: []const u8, kind: PublicationCase, inject: bool, lock
     defer testing.allocator.free(old);
     const new = try repo.commit("new");
     defer testing.allocator.free(new);
-    const zero = try testing.allocator.alloc(u8, old.len);
-    defer testing.allocator.free(zero);
-    @memset(zero, '0');
     const absent = kind == .create or kind == .verify_absent;
     const initial: ?[]const u8 = if (absent) null else old;
     try restore(&repo, publication_ref, initial);
@@ -227,7 +168,7 @@ fn publicationCase(format: []const u8, kind: PublicationCase, inject: bool, lock
         var before = try Snapshot.capture(&repo);
         defer before.deinit();
         try restore(&repo, publication_ref, initial);
-        const result = try driver(&repo, &.{ @tagName(kind), if (absent) zero else old, new });
+        const result = try driver(&repo, &.{ @tagName(kind), if (absent) "" else old, new });
         defer result.deinit();
         try expectRaceFired(&repo);
         try before.expectUnchanged(&repo);
@@ -236,7 +177,7 @@ fn publicationCase(format: []const u8, kind: PublicationCase, inject: bool, lock
         try expectAbsent(&repo, "refs/stakrr/unrelated");
         try expectDriverError(result, error.GitFailed);
     } else {
-        const result = try driver(&repo, &.{ @tagName(kind), if (absent) zero else old, new });
+        const result = try driver(&repo, &.{ @tagName(kind), if (absent) "" else old, new });
         defer result.deinit();
         try testing.expectEqual(@as(?u8, 0), result.code);
         switch (kind) {
@@ -311,7 +252,7 @@ fn resetRefCase(format: []const u8, name: []const u8, delete_layers: bool, dangl
     defer repo.deinit();
     try setup(&repo);
     try dirty(&repo);
-    const old = (try repo.git.readRef(name)).?;
+    const old = (try repo.readRef(name)).?;
     defer testing.allocator.free(old);
     try alias(&repo, name, if (dangling) null else old);
     var before = try Snapshot.capture(&repo);
@@ -396,13 +337,15 @@ test "reftable prefix discovery refuses safely while explicit ref transactions r
         return error.GitFailed;
     }
     try repo.exec(&.{ "symbolic-ref", "refs/heads/stakrr/orphan", "refs/heads/missing" });
-    try testing.expectError(error.UnsupportedRefStorage, repo.git.listRefs(layout.layer_prefix));
-    try repo.git.transact("reftable direct publication", &.{.{ .create = .{ .name = "refs/stakrr/direct", .oid = old } }});
+    try testing.expectError(error.UnsupportedRefStorage, repo.git.listDirectRefs(layout.layer_prefix));
+    var mutation = try repo.git.beginRefMutation();
+    defer mutation.deinit();
+    try mutation.publish(.{ .message = "reftable direct publication", .updates = &.{try repo.git.createRef("refs/stakrr/direct", old)} });
     try expectDirect(&repo, "refs/stakrr/direct", old);
     try repo.expectOutput(&.{ "symbolic-ref", "refs/heads/stakrr/orphan" }, "refs/heads/missing");
 }
 
-test "full ref reads and commit resolution reject direct and dangling symbolic aliases" {
+test "direct ref reads and branch commit queries reject direct and dangling symbolic aliases" {
     for (formats) |format| {
         for ([_]bool{ false, true }) |dangling| {
             var repo = try Repo.initOptions(.{ .object_format = format });
@@ -415,14 +358,14 @@ test "full ref reads and commit resolution reject direct and dangling symbolic a
             var before = try Snapshot.capture(&repo);
             defer before.deinit();
 
-            try testing.expectError(error.SymbolicRef, repo.git.readRef(subject));
-            try testing.expectError(error.SymbolicRef, repo.git.resolveCommit(subject));
-            try testing.expectError(error.SymbolicRef, repo.git.listRefs(layout.layer_prefix));
+            try testing.expectError(error.SymbolicRef, repo.git.readDirectRef(try stakrr.git.RefName.init(subject)));
+            try testing.expectError(error.SymbolicRef, repo.git.branchCommit(try stakrr.git.BranchRef.init(subject)));
+            try testing.expectError(error.SymbolicRef, repo.git.listDirectRefs(layout.layer_prefix));
             try testing.expect(std.mem.indexOf(u8, diagnostics.stderr(), subject) != null);
             try testing.expect(std.mem.indexOf(u8, diagnostics.stderr(), victim) != null);
             try before.expectUnchanged(&repo);
             try expectSymbolic(&repo, subject);
-            try repo.expectRef("HEAD", old);
+            try repo.expectOutput(&.{ "rev-parse", "--verify", "HEAD" }, old);
         }
     }
 }
@@ -439,8 +382,8 @@ test "head preserves its immediate target while currentBranch refuses nested ali
         const head = (try repo.git.head()).?;
         defer testing.allocator.free(head);
         try testing.expectEqualStrings("refs/heads/outer", head);
-        try testing.expectError(error.SymbolicRef, repo.git.currentBranch());
-        try repo.expectRef("HEAD", old);
+        try testing.expectError(error.SymbolicRef, repo.git.currentBranchAlloc());
+        try repo.expectOutput(&.{ "rev-parse", "--verify", "HEAD" }, old);
         try repo.expectOutput(&.{ "symbolic-ref", "--no-recurse", "HEAD" }, "refs/heads/outer");
     }
 }
@@ -479,13 +422,13 @@ test "linked worktree discovery checks shared loose refs and ignores lock files"
             .sub_path = ".git/refs/heads/stakrr/probe.lock",
             .data = "ref: refs/heads/missing\n",
         });
-        var refs = try git.listRefs(layout.layer_prefix);
+        var refs = try git.listDirectRefs(layout.layer_prefix);
         defer refs.deinit(testing.allocator);
         try testing.expectEqual(@as(usize, 1), refs.refs.len);
-        try testing.expectEqualStrings(subject, refs.refs[0].name);
-        try testing.expectEqualStrings(old, refs.refs[0].oid);
+        try testing.expectEqualStrings(subject, refs.refs[0].name.bytes);
+        try testing.expectEqualStrings(old, refs.refs[0].oid.hex());
         try alias(&repo, "refs/heads/stakrr/nested/orphan", null);
-        try testing.expectError(error.SymbolicRef, git.listRefs(layout.layer_prefix));
+        try testing.expectError(error.SymbolicRef, git.listDirectRefs(layout.layer_prefix));
         try expectSymbolic(&repo, "refs/heads/stakrr/nested/orphan");
     }
 }
@@ -572,12 +515,8 @@ test "reset preserves dirty work when another worktree owns a requested layer" {
         try repo.exec(&.{ "-C", path, "switch", "-q", "--detach" });
         try reset(&repo, true);
         try expectAbsent(&repo, subject);
-        const tracked = try repo.tmp.dir.readFileAlloc(testing.io, "tracked", testing.allocator, .limited(1024));
-        defer testing.allocator.free(tracked);
-        try testing.expectEqualStrings("unstaged work\n", tracked);
-        const untracked = try repo.tmp.dir.readFileAlloc(testing.io, "untracked", testing.allocator, .limited(1024));
-        defer testing.allocator.free(untracked);
-        try testing.expectEqualStrings("untracked work\n", untracked);
+        try repo.expectFile("tracked", "unstaged work\n");
+        try repo.expectFile("untracked", "untracked work\n");
     }
 }
 
@@ -784,7 +723,7 @@ fn fixRefCase(format: []const u8, name: []const u8) !void {
     }
     try dirtyFix(&repo);
     try testing.expect(!(try repo.git.check(&.{ "diff", "--cached", "--quiet" }, 1)));
-    const old = (try repo.git.readRef(name)).?;
+    const old = (try repo.readRef(name)).?;
     defer testing.allocator.free(old);
     try alias(&repo, name, old);
     var before = try Snapshot.capture(&repo);
@@ -836,7 +775,7 @@ fn commandRaceCase(format: []const u8, is_fix: bool, name: []const u8, label: []
     defer repo.deinit();
     try fixture.setup(&repo);
     try dirtyFix(&repo);
-    const old = (try repo.git.readRef(name)).?;
+    const old = (try repo.readRef(name)).?;
     defer testing.allocator.free(old);
     try race(&repo, label, name);
     // The expected state includes the external writer's substitution.

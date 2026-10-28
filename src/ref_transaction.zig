@@ -2,130 +2,139 @@
 const std = @import("std");
 const git_mod = @import("git.zig");
 const Git = git_mod.Git;
+const types = @import("git_types.zig");
+const Oid = types.Oid;
+const RefUpdate = types.RefUpdate;
+const mutation_mod = @import("mutation.zig");
+const Mutation = mutation_mod.Mutation;
+const backend = @import("ref_backend.zig");
 const layout = @import("layout.zig");
 const coordination = @import("coordination.zig");
+const intent_name = types.RefName.init(layout.transaction_ref) catch unreachable;
 
+// Wire fields stay hexadecimal strings; live publication uses validated values.
 const Change = struct { name: []const u8, old: ?[]const u8, new: ?[]const u8 };
 const Tag = struct { oid: []const u8, blob: []const u8 };
 const Intent = struct {
-    version: u8 = 1,
+    version: u8 = layout.transaction_version,
     label: []const u8,
     changes: []const Change,
     tags: []const Tag = &.{},
+    current_branch: ?[]const u8 = null,
+    owner: ?[]const u8 = null,
 };
-const Loaded = struct { oid: []const u8, intent: Intent };
+const Loaded = struct { oid: Oid, intent: Intent, updates: []const RefUpdate };
 
-pub fn transact(original: *const Git, label: []const u8, updates: []const Git.RefUpdate) !void {
-    var arena = std.heap.ArenaAllocator.init(original.allocator);
+pub fn transact(mutation: *const Mutation, options: types.PublishOptions) !void {
+    var arena = std.heap.ArenaAllocator.init(mutation.repo().allocator);
     defer arena.deinit();
-    const scoped = original.withAllocator(arena.allocator());
+    const scoped = mutation.repo().withAllocator(arena.allocator());
     const git = &scoped;
-    _ = try recover(git);
-    const changes = try git.allocator.alloc(Change, updates.len);
+    // Recovery belongs to acquisition, before the workflow observes its state.
+    if (try readExpectedRef(git, intent_name) != null) return error.RefTransactionPending;
+    try mutation_mod.validatePublication(git, options.updates, options.current_branch);
+    try validateNames(git, options.updates);
+    const changes = try git.allocator.alloc(Change, options.updates.len);
     var writes: usize = 0;
-    for (updates, changes) |update, *change| {
-        change.* = switch (update) {
-            .verify => |ref| .{ .name = ref.name, .old = ref.oid, .new = ref.oid },
-            .create => |ref| .{ .name = ref.name, .old = null, .new = ref.oid },
-            .update => |ref| .{ .name = ref.name, .old = ref.old, .new = ref.new },
-            .delete => |ref| .{ .name = ref.name, .old = ref.oid, .new = null },
+    for (options.updates, changes) |update, *change| {
+        change.* = .{
+            .name = update.name().bytes,
+            .old = if (update.oldOid()) |oid| try oid.dupeHex(git.allocator) else null,
+            .new = if (update.newOid()) |oid| try oid.dupeHex(git.allocator) else null,
         };
-        if (!equal(change.old, change.new)) writes += 1;
+        if (update.writes()) writes += 1;
     }
-    try validate(git, changes, null);
     // A single ref write already has Git's per-ref atomicity.
-    if (writes <= 1) return git.transactRaw(label, updates);
+    if (writes <= 1) return backend.publish(git, options.message, options.updates);
 
-    const saved = try save(git, label, changes);
-    const zero = try git.allocator.alloc(u8, saved.len);
-    @memset(zero, '0');
-    var checks = try expected(git, changes, zero, .old);
-    try checks.append(git.allocator, .{ .create = .{ .name = layout.transaction_ref, .oid = saved } });
-    try git.transactRaw("stakrr: prepare transaction", checks.items);
+    const saved = try git.parseOid(try save(git, options.message, changes, options.current_branch));
+    var checks = try expected(git, options.updates, .old);
+    try checks.append(git.allocator, .{ .create = .{ .name = intent_name, .new = saved } });
+    try backend.publish(git, "stakrr: prepare transaction", checks.items);
     var refused = false;
-    git.transactRawWithRefusal(label, updates, &refused) catch |err| {
-        // A confirmed prepare refusal cannot have published any refs, even
-        // when a competing writer changed an expected value. Otherwise only
-        // cancel if every old value still matches; keep partial publication.
-        var cancel = if (refused) std.ArrayList(Git.RefUpdate).empty else try expected(git, changes, zero, .old);
-        try cancel.append(git.allocator, .{ .delete = .{ .name = layout.transaction_ref, .oid = saved } });
-        git.transactRaw("stakrr: cancel transaction", cancel.items) catch {};
+    publishUpdates(git, options, &refused) catch |err| {
+        // A confirmed refusal cannot have published any refs. Otherwise cancel
+        // only when every old value still matches, preserving partial writes.
+        var cancel = if (refused) std.ArrayList(RefUpdate).empty else try expected(git, options.updates, .old);
+        try cancel.append(git.allocator, .{ .delete = .{ .name = intent_name, .old = saved } });
+        backend.publish(git, "stakrr: cancel transaction", cancel.items) catch {};
         return err;
     };
-    try finish(git, saved, changes, zero);
+    try finish(git, saved, options.updates);
 }
 
-/// Call under the common mutation lock, before reading stack/session state.
-pub fn recover(original: *const Git) !bool {
-    var arena = std.heap.ArenaAllocator.init(original.allocator);
+fn publishUpdates(git: *const Git, options: types.PublishOptions, refused: *bool) !void {
+    refused.* = true; // a failed preflight has not sent a commit
+    try mutation_mod.validatePublication(git, options.updates, options.current_branch);
+    try backend.publishWithRefusal(git, options.message, options.updates, refused);
+}
+
+/// Only acquisition calls recovery, while already holding the common lock.
+pub fn recover(mutation: *const Mutation) !bool {
+    var arena = std.heap.ArenaAllocator.init(mutation.repo().allocator);
     defer arena.deinit();
-    const scoped = original.withAllocator(arena.allocator());
+    const scoped = mutation.repo().withAllocator(arena.allocator());
     const git = &scoped;
     const loaded = (try load(git)) orelse return false;
-    const saved = loaded.oid;
-    const intent = loaded.intent;
-    const zero = try git.allocator.alloc(u8, saved.len);
-    @memset(zero, '0');
-    var updates: std.ArrayList(Git.RefUpdate) = .empty;
-    var moving: std.ArrayList([]const u8) = .empty;
-    var deleting: std.ArrayList([]const u8) = .empty;
-    for (intent.changes) |change| {
-        const actual = try readExpectedRef(git, change.name);
-        if (equal(actual, change.new)) {
-            try updates.append(git.allocator, .{ .verify = .{ .name = change.name, .oid = change.new orelse zero } });
-        } else if (equal(actual, change.old)) {
-            try updates.append(git.allocator, if (change.new) |new|
-                if (change.old) |old|
-                    .{ .update = .{ .name = change.name, .new = new, .old = old } }
-                else
-                    .{ .create = .{ .name = change.name, .oid = new } }
-            else
-                .{ .delete = .{ .name = change.name, .oid = change.old.? } });
-            if (std.mem.startsWith(u8, change.name, layout.branch_prefix)) {
-                try moving.append(git.allocator, change.name);
-                if (equal(change.new, null)) try deleting.append(git.allocator, change.name);
-            }
+    var remaining: std.ArrayList(RefUpdate) = .empty;
+    var moves_branch = false;
+    for (loaded.updates) |update| {
+        const actual = try readExpectedRef(git, update.name());
+        if (types.equalOids(actual, update.newOid())) {
+            try remaining.append(git.allocator, .{ .verify = .{ .name = update.name(), .expected = update.newOid() } });
+        } else if (types.equalOids(actual, update.oldOid())) {
+            try remaining.append(git.allocator, update);
+            if (std.mem.startsWith(u8, update.name().bytes, layout.branch_prefix)) moves_branch = true;
         } else return error.RefTransactionChanged;
     }
-    if (moving.items.len != 0) {
-        try coordination.requireNoGitOperation(git, .{});
-        try coordination.requireAvailable(git, moving.items);
-        if (deleting.items.len != 0) try coordination.requireDeletable(git, deleting.items);
-    }
+    if (moves_branch) try coordination.requireNoGitOperation(git, .{});
+    const policy = try recoveryPolicy(git, loaded.intent);
+    try mutation_mod.validatePublication(git, remaining.items, policy);
     // Tags are archived as blobs, with their targets retained separately.
     // Recreate their exact bytes if pruning ran during the interruption.
-    for (intent.tags) |tag| {
-        if (!git_mod.isOid(tag.oid) or tag.oid.len != saved.len or
-            !git_mod.isOid(tag.blob) or tag.blob.len != saved.len)
-            return error.InvalidRefTransaction;
-        const tag_path = try std.fmt.allocPrint(git.allocator, "{s}:{s}", .{ saved, tag.oid });
-        const data = git.outputRaw(&.{ "cat-file", "blob", tag_path }) catch return error.InvalidRefTransaction;
-        if (!std.mem.eql(u8, try git.writeBlob(data), tag.blob)) return error.InvalidRefTransaction;
+    for (loaded.intent.tags) |tag| {
+        const tag_oid = Oid.init(loaded.oid.format, tag.oid) catch return error.InvalidRefTransaction;
+        const blob_oid = Oid.init(loaded.oid.format, tag.blob) catch return error.InvalidRefTransaction;
+        const tag_path = try std.fmt.allocPrint(git.allocator, "{s}:{s}", .{ loaded.oid.hex(), tag_oid.hex() });
+        const data = git.outputRaw(&.{ "cat-file", "blob", tag_path }) catch |err| switch (err) {
+            error.GitFailed => return error.InvalidRefTransaction,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, try git.writeBlob(data), blob_oid.hex())) return error.InvalidRefTransaction;
         const oid = try git.inputOutput(&.{ "hash-object", "-w", "-t", "tag", "--stdin" }, data);
-        if (!std.mem.eql(u8, oid, tag.oid)) return error.InvalidRefTransaction;
+        if (!std.mem.eql(u8, oid, tag_oid.hex())) return error.InvalidRefTransaction;
     }
-    try updates.append(git.allocator, .{ .verify = .{ .name = layout.transaction_ref, .oid = saved } });
-    try git.transactRaw(intent.label, updates.items);
-    try finish(git, saved, intent.changes, zero);
+    try remaining.append(git.allocator, .{ .verify = .{ .name = intent_name, .expected = loaded.oid } });
+    try backend.publish(git, loaded.intent.label, remaining.items);
+    try finish(git, loaded.oid, loaded.updates);
     return true;
+}
+
+fn recoveryPolicy(git: *const Git, intent: Intent) !types.CurrentBranchPolicy {
+    const branch = intent.current_branch orelse return .forbid;
+    const owner = try git.path(&.{ "rev-parse", "--absolute-git-dir" });
+    if (!std.mem.eql(u8, owner, intent.owner.?)) return .forbid;
+    return .{ .allow = try types.BranchRef.init(branch) };
 }
 
 /// Read-only callers may observe a completed publication awaiting intent cleanup.
 pub fn requirePublished(original: *const Git) !void {
     var arena = std.heap.ArenaAllocator.init(original.allocator);
     defer arena.deinit();
-    const scoped = original.withAllocator(arena.allocator());
+    var scoped = original.withAllocator(arena.allocator());
+    scoped.object_format = try original.objectFormat();
     const git = &scoped;
     const loaded = (try load(git)) orelse return;
-    for (loaded.intent.changes) |change| {
-        if (!equal(try readExpectedRef(git, change.name), change.new)) return error.RefTransactionPending;
+    for (loaded.updates) |update| {
+        if (!types.equalOids(try readExpectedRef(git, update.name()), update.newOid()))
+            return error.RefTransactionPending;
     }
 }
 
-/// Returned storage belongs to the caller's command arena.
+/// Returned names and metadata belong to the caller's command arena.
 fn load(git: *const Git) !?Loaded {
-    const saved = (try readExpectedRef(git, layout.transaction_ref)) orelse return null;
-    const path = try std.fmt.allocPrint(git.allocator, "{s}:transaction.json", .{saved});
+    const saved = (try readExpectedRef(git, intent_name)) orelse return null;
+    const path = try std.fmt.allocPrint(git.allocator, "{s}:transaction.json", .{saved.hex()});
     const raw = git.outputRaw(&.{ "cat-file", "blob", path }) catch |err| switch (err) {
         error.GitFailed => return error.InvalidRefTransaction,
         else => return err,
@@ -135,53 +144,81 @@ fn load(git: *const Git) !?Loaded {
         else => return error.InvalidRefTransaction,
     };
     const intent = parsed.value;
-    if (intent.version != 1 or intent.changes.len == 0) return error.InvalidRefTransaction;
-    validate(git, intent.changes, saved.len) catch |err| switch (err) {
-        error.InvalidRefName, error.InvalidOid => return error.InvalidRefTransaction,
+    if (intent.version != layout.transaction_version or intent.changes.len == 0)
+        return error.InvalidRefTransaction;
+    if (intent.current_branch) |branch| {
+        _ = types.BranchRef.init(branch) catch return error.InvalidRefTransaction;
+        if (intent.owner == null or intent.owner.?.len == 0)
+            return error.InvalidRefTransaction;
+    } else if (intent.owner != null) return error.InvalidRefTransaction;
+    const updates = try git.allocator.alloc(RefUpdate, intent.changes.len);
+    for (intent.changes, updates) |change, *update| {
+        const name = types.RefName.init(change.name) catch return error.InvalidRefTransaction;
+        const old = try decodeOid(saved.format, change.old);
+        const new = try decodeOid(saved.format, change.new);
+        update.* = if (types.equalOids(old, new))
+            .{ .verify = .{ .name = name, .expected = old } }
+        else if (new) |oid|
+            if (old) |previous|
+                .{ .update = .{ .name = name, .old = previous, .new = oid } }
+            else
+                .{ .create = .{ .name = name, .new = oid } }
+        else
+            .{ .delete = .{ .name = name, .old = old.? } };
+    }
+    validateNames(git, updates) catch |err| switch (err) {
+        error.InvalidRefName => return error.InvalidRefTransaction,
         else => return err,
     };
-    return .{ .oid = saved, .intent = intent };
+    // Validate every tag before recovery creates even an unreachable object.
+    for (intent.tags) |tag| {
+        _ = Oid.init(saved.format, tag.oid) catch return error.InvalidRefTransaction;
+        _ = Oid.init(saved.format, tag.blob) catch return error.InvalidRefTransaction;
+    }
+    return .{ .oid = saved, .intent = intent, .updates = updates };
 }
 
-fn readExpectedRef(git: *const Git, name: []const u8) !?[]u8 {
-    return git.readRef(name) catch |err| switch (err) {
+fn decodeOid(format: types.ObjectFormat, value: ?[]const u8) !?Oid {
+    const hex = value orelse return null;
+    return Oid.init(format, hex) catch return error.InvalidRefTransaction;
+}
+
+fn readExpectedRef(git: *const Git, name: types.RefName) !?Oid {
+    return git.readDirectRef(name) catch |err| switch (err) {
         error.SymbolicRef => error.RefTransactionChanged,
         else => return err,
     };
 }
 
-fn validate(git: *const Git, changes: []const Change, oid_len: ?usize) !void {
+fn validateNames(git: *const Git, updates: []const RefUpdate) !void {
     var names: std.StringHashMapUnmanaged(void) = .empty;
-    for (changes) |change| {
-        try Git.checkUpdate(change.name, &.{});
-        if (std.mem.eql(u8, change.name, layout.transaction_ref) or
-            std.mem.startsWith(u8, change.name, layout.transaction_ref ++ "/") or
-            (try names.getOrPut(git.allocator, change.name)).found_existing)
+    defer names.deinit(git.allocator);
+    for (updates) |update| {
+        const name = update.name().bytes;
+        _ = try types.RefName.init(name);
+        if (std.mem.eql(u8, name, layout.transaction_ref) or
+            std.mem.startsWith(u8, name, layout.transaction_ref ++ "/") or
+            (try names.getOrPut(git.allocator, name)).found_existing)
             return error.InvalidRefName;
-        for ([_]?[]const u8{ change.old, change.new }) |value| {
-            if (value) |oid| {
-                if (!git_mod.isOid(oid) or (oid_len != null and oid.len != oid_len.?)) return error.InvalidOid;
-            }
-        }
     }
 }
 
-fn expected(git: *const Git, changes: []const Change, zero: []const u8, comptime side: enum { old, new }) !std.ArrayList(Git.RefUpdate) {
-    var updates: std.ArrayList(Git.RefUpdate) = .empty;
+fn expected(git: *const Git, changes: []const RefUpdate, comptime side: enum { old, new }) !std.ArrayList(RefUpdate) {
+    var updates: std.ArrayList(RefUpdate) = .empty;
     for (changes) |change| try updates.append(git.allocator, .{ .verify = .{
-        .name = change.name,
-        .oid = @field(change, @tagName(side)) orelse zero,
+        .name = change.name(),
+        .expected = if (side == .old) change.oldOid() else change.newOid(),
     } });
     return updates;
 }
 
-fn finish(git: *const Git, saved: []const u8, changes: []const Change, zero: []const u8) !void {
-    var updates = try expected(git, changes, zero, .new);
-    try updates.append(git.allocator, .{ .delete = .{ .name = layout.transaction_ref, .oid = saved } });
-    try git.transactRaw("stakrr: finish transaction", updates.items);
+fn finish(git: *const Git, saved: Oid, changes: []const RefUpdate) !void {
+    var updates = try expected(git, changes, .new);
+    try updates.append(git.allocator, .{ .delete = .{ .name = intent_name, .old = saved } });
+    try backend.publish(git, "stakrr: finish transaction", updates.items);
 }
 
-fn save(git: *const Git, label: []const u8, changes: []const Change) ![]const u8 {
+fn save(git: *const Git, label: []const u8, changes: []const Change, policy: types.CurrentBranchPolicy) ![]const u8 {
     var objects: std.ArrayList([]const u8) = .empty;
     for (changes) |change| {
         if (change.old) |oid| try objects.append(git.allocator, oid);
@@ -194,7 +231,6 @@ fn save(git: *const Git, label: []const u8, changes: []const Change) ![]const u8
     var i: usize = 0;
     while (i < objects.items.len) : (i += 1) {
         const oid = objects.items[i];
-        if (std.mem.allEqual(u8, oid, '0')) continue; // Git's absent-ref sentinel
         if ((try seen.getOrPut(git.allocator, oid)).found_existing) continue;
         const kind = try git.output(&.{ "cat-file", "-t", oid });
         if (std.mem.eql(u8, kind, "commit")) {
@@ -202,7 +238,8 @@ fn save(git: *const Git, label: []const u8, changes: []const Change) ![]const u8
         } else if (std.mem.eql(u8, kind, "tag")) {
             const raw = try git.outputRaw(&.{ "cat-file", "tag", oid });
             const end = std.mem.indexOfScalar(u8, raw, '\n') orelse return error.InvalidGitOutput;
-            if (!std.mem.startsWith(u8, raw, "object ") or !git_mod.isOid(raw[7..end])) return error.InvalidGitOutput;
+            if (!std.mem.startsWith(u8, raw, "object ")) return error.InvalidGitOutput;
+            _ = Oid.init(try git.objectFormat(), raw[7..end]) catch return error.InvalidGitOutput;
             const blob = try git.writeBlob(raw);
             try entries.append(git.allocator, .{ .name = oid, .oid = blob });
             try tags.append(git.allocator, .{ .oid = oid, .blob = blob });
@@ -211,23 +248,21 @@ fn save(git: *const Git, label: []const u8, changes: []const Change) ![]const u8
             try entries.append(git.allocator, .{ .name = oid, .oid = oid, .tree = std.mem.eql(u8, kind, "tree") });
         } else return error.InvalidGitOutput;
     }
-    const intent: Intent = .{ .label = label, .changes = changes, .tags = tags.items };
+    const allowed: ?types.BranchRef = switch (policy) {
+        .forbid => null,
+        .allow => |branch| branch,
+    };
+    const intent: Intent = .{
+        .label = label,
+        .changes = changes,
+        .tags = tags.items,
+        .current_branch = if (allowed) |branch| branch.name.bytes else null,
+        .owner = if (allowed != null) try git.path(&.{ "rev-parse", "--absolute-git-dir" }) else null,
+    };
     const metadata = try git.writeBlob(try std.json.Stringify.valueAlloc(git.allocator, intent, .{}));
     try entries.append(git.allocator, .{ .name = "transaction.json", .oid = metadata });
     // Ref bookkeeping must also work before the user configures an identity.
-    var args: std.ArrayList([]const u8) = .empty;
-    try args.appendSlice(git.allocator, &.{
-        "-c", "user.name=stakrr",                "-c",          "user.email=stakrr@localhost",
-        "-c", "commit.gpgsign=false",            "commit-tree", try git.writeTree(entries.items),
-        "-m", "stakrr: pending ref transaction",
+    return git.commitTreeWithOptions(try git.writeTree(entries.items), parents.items, "stakrr: pending ref transaction", .{
+        .identity = .{ .name = "stakrr", .email = "stakrr@localhost" },
     });
-    for (parents.items) |parent| try args.appendSlice(git.allocator, &.{ "-p", parent });
-    return git.output(args.items);
-}
-
-fn equal(a: ?[]const u8, b: ?[]const u8) bool {
-    const left: ?[]const u8 = if (a) |oid| if (std.mem.allEqual(u8, oid, '0')) null else oid else null;
-    const right: ?[]const u8 = if (b) |oid| if (std.mem.allEqual(u8, oid, '0')) null else oid else null;
-    if (left == null or right == null) return left == null and right == null;
-    return std.mem.eql(u8, left.?, right.?);
 }

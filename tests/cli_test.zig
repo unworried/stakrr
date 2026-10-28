@@ -2,6 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const Repo = @import("support/repo.zig").Repo;
 const cli = @import("support/cli.zig");
+const Snapshot = @import("support/snapshot.zig").Snapshot;
 const stakrr = cli.run;
 const stakrrAt = cli.runAt;
 
@@ -363,14 +364,8 @@ test "cli: mutation lock is shared across worktrees and leaves user state unchan
         try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "user-file", .data = "unstaged work\n" });
         try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "untracked", .data = "keep me\n" });
 
-        const before_refs = try repo.git.output(&.{"show-ref"});
-        defer testing.allocator.free(before_refs);
-        const before_config = try repo.git.output(&.{ "config", "--local", "--list" });
-        defer testing.allocator.free(before_config);
-        const before_status = try repo.git.output(&.{ "status", "--porcelain=v1", "-z" });
-        defer testing.allocator.free(before_status);
-        const before_index = try repo.git.output(&.{"write-tree"});
-        defer testing.allocator.free(before_index);
+        var before = try Snapshot.capture(&repo);
+        defer before.deinit();
 
         {
             const guard = try repo.tmp.dir.createFile(testing.io, ".git/stakrr.lock", .{
@@ -393,6 +388,7 @@ test "cli: mutation lock is shared across worktrees and leaves user state unchan
                     try testing.expectEqual(@as(?u8, 1), result.code);
                     try testing.expectEqualStrings("", result.stdout);
                     try testing.expectEqualStrings("error: another stakrr mutation is running\n", result.stderr);
+                    try before.expectUnchanged(&repo);
                 }
                 const status = try stakrrAt(&repo, &.{"status"}, cwd);
                 defer status.deinit();
@@ -400,18 +396,7 @@ test "cli: mutation lock is shared across worktrees and leaves user state unchan
             }
         }
 
-        const after_refs = try repo.git.output(&.{"show-ref"});
-        defer testing.allocator.free(after_refs);
-        try testing.expectEqualStrings(before_refs, after_refs);
-        const after_config = try repo.git.output(&.{ "config", "--local", "--list" });
-        defer testing.allocator.free(after_config);
-        try testing.expectEqualStrings(before_config, after_config);
-        const after_status = try repo.git.output(&.{ "status", "--porcelain=v1", "-z" });
-        defer testing.allocator.free(after_status);
-        try testing.expectEqualStrings(before_status, after_status);
-        const after_index = try repo.git.output(&.{"write-tree"});
-        defer testing.allocator.free(after_index);
-        try testing.expectEqualStrings(before_index, after_index);
+        try before.expectUnchanged(&repo);
         for ([_]struct { path: []const u8, contents: []const u8 }{
             .{ .path = "user-file", .contents = "unstaged work\n" },
             .{ .path = "untracked", .contents = "keep me\n" },
@@ -420,7 +405,7 @@ test "cli: mutation lock is shared across worktrees and leaves user state unchan
             defer testing.allocator.free(contents);
             try testing.expectEqualStrings(file.contents, contents);
         }
-        const head = try repo.git.currentBranch();
+        const head = try repo.git.currentBranchAlloc();
         defer testing.allocator.free(head);
         try testing.expectEqualStrings("refs/heads/work", head);
         const linked_head = try repo.git.output(&.{ "-C", "linked", "symbolic-ref", "HEAD" });

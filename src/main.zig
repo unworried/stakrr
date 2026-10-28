@@ -104,10 +104,10 @@ fn runCommand(
                     "retained: stakrr log (" ++ stakrr.layout.oplog_ref ++ ")\n");
                 return;
             }
-            const branch = try git.currentBranch();
-            defer git.allocator.free(branch);
+            var branch = try git.currentBranch();
+            defer branch.deinit(git.allocator);
             try stdout.print("restack {s}; returned to ", .{if (request == .abort) "aborted" else "completed"});
-            try term.styled(out, .accent, "{s}", .{shortRef(branch)});
+            try term.styled(out, .accent, "{s}", .{branch.value.short()});
             try stdout.writeByte('\n');
             if (request == .abort)
                 try stdout.writeAll("retained edits: stakrr log (" ++ stakrr.layout.oplog_ref ++ ")\n");
@@ -211,6 +211,7 @@ fn userError(err: anyerror) ?[]const u8 {
         error.EditInProgress => "a restack is pending " ++
             "(finish with 'stakrr continue' or 'stakrr abort')",
         error.BranchOccupied => "a required branch is checked out in another worktree",
+        error.BranchCheckedOut => "a required branch is checked out in this worktree",
         error.DirtyWorkTree => "preserve uncommitted changes before proceeding",
         error.IgnoredFilesPresent => "preserve and remove ignored files before replaying descendants",
         error.GitOperationInProgress => "finish the active Git operation before proceeding",

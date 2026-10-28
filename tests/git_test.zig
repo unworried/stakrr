@@ -65,7 +65,7 @@ test "invalid repositories are failures rather than detached HEAD" {
         git.ensureWorkTree(),
     );
     try testing.expectError(error.GitFailed, git.head());
-    try testing.expectError(error.GitFailed, git.currentBranch());
+    try testing.expectError(error.GitFailed, git.currentBranchAlloc());
     try testing.expect(diagnostics.stderr().len > 0);
 }
 
@@ -74,7 +74,7 @@ test "currentBranch returns a full branch ref" {
     defer repo.deinit();
 
     // works even before the first commit
-    const branch = try repo.git.currentBranch();
+    const branch = try repo.git.currentBranchAlloc();
     defer testing.allocator.free(branch);
 
     try testing.expectEqualStrings(
@@ -99,7 +99,7 @@ test "currentBranch rejects detached HEAD" {
 
     try testing.expectError(
         error.DetachedHead,
-        repo.git.currentBranch(),
+        repo.git.currentBranchAlloc(),
     );
     try testing.expect((try repo.git.head()) == null);
 }
@@ -157,7 +157,7 @@ test "resolveCommit resolves a branch to its commit" {
     const expected = try repo.commit("base");
     defer testing.allocator.free(expected);
 
-    const actual = try repo.git.resolveCommit("main");
+    const actual = try repo.git.resolveCommitAlloc("main");
     defer testing.allocator.free(actual);
 
     try testing.expectEqualStrings(expected, actual);
@@ -169,7 +169,7 @@ test "resolveCommit rejects missing revisions" {
 
     try testing.expectError(
         error.GitFailed,
-        repo.git.resolveCommit("missing-revision"),
+        repo.git.resolveCommitAlloc("missing-revision"),
     );
 }
 
@@ -239,29 +239,21 @@ test "failed commands record git's stderr in diagnostics" {
 
     try testing.expectError(
         error.GitFailed,
-        repo.git.resolveCommit("missing-revision"),
+        repo.git.resolveCommitAlloc("missing-revision"),
     );
     try testing.expect(diagnostics.stderr().len > 0);
 }
 
-test "transact rejects malformed oids before writing to git" {
+test "ref constructors reject malformed names and OIDs without creating refs" {
     var repo = try Repo.init();
     defer repo.deinit();
-
-    try testing.expectError(
-        error.InvalidOid,
-        repo.git.transact("test", &.{.{ .create = .{
-            .name = "refs/stakrr/tip",
-            .oid = "HEAD",
-        } }}),
-    );
-    try testing.expectError(
-        error.InvalidRefName,
-        repo.git.transact("test", &.{.{ .create = .{
-            .name = "refs/heads/x\ndelete refs/heads/main",
-            .oid = &@as([40]u8, @splat('a')),
-        } }}),
-    );
+    try testing.expectError(error.InvalidOid, repo.git.createRef("refs/stakrr/tip", "HEAD"));
+    try testing.expectError(error.InvalidRefName, repo.git.createRef(
+        "refs/heads/x\ndelete refs/heads/main",
+        &@as([40]u8, @splat('a')),
+    ));
+    try repo.expectOutput(&.{ "for-each-ref", "--format=%(refname)" }, "");
+    try repo.expectNoRef(layout.transaction_ref);
 }
 
 test "configGet returns null when key is missing" {
@@ -322,17 +314,17 @@ test "configGet rejects empty values" {
     );
 }
 
-test "listRefs returns empty when the prefix has no refs" {
+test "listDirectRefs returns empty when the prefix has no refs" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    var refs = try repo.git.listRefs("refs/heads/stakrr/");
+    var refs = try repo.git.listDirectRefs("refs/heads/stakrr/");
     defer refs.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 0), refs.refs.len);
 }
 
-test "listRefs finds only branches under the requested prefix" {
+test "listDirectRefs finds only branches under the requested prefix" {
     var repo = try Repo.init();
     defer repo.deinit();
 
@@ -343,14 +335,14 @@ test "listRefs finds only branches under the requested prefix" {
     try repo.exec(&.{ "branch", "stakrr/second" });
     try repo.exec(&.{ "branch", "stakrr-other" });
 
-    var refs = try repo.git.listRefs("refs/heads/stakrr/");
+    var refs = try repo.git.listDirectRefs("refs/heads/stakrr/");
     defer refs.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 2), refs.refs.len);
-    try testing.expectEqualStrings("refs/heads/stakrr/first", refs.refs[0].name);
-    try testing.expectEqualStrings(oid, refs.refs[0].oid);
-    try testing.expectEqualStrings("refs/heads/stakrr/second", refs.refs[1].name);
-    try testing.expectEqualStrings(oid, refs.refs[1].oid);
+    try testing.expectEqualStrings("refs/heads/stakrr/first", refs.refs[0].name.bytes);
+    try testing.expectEqualStrings(oid, refs.refs[0].oid.hex());
+    try testing.expectEqualStrings("refs/heads/stakrr/second", refs.refs[1].name.bytes);
+    try testing.expectEqualStrings(oid, refs.refs[1].oid.hex());
 }
 
 test "history lists a range oldest first" {
@@ -395,7 +387,7 @@ test "history reports merges as non-linear" {
     const main = try repo.commit("main");
     defer testing.allocator.free(main);
     try repo.exec(&.{ "merge", "-q", "--no-edit", "side" });
-    const merge = try repo.git.resolveCommit("HEAD");
+    const merge = try repo.git.resolveCommitAlloc("HEAD");
     defer testing.allocator.free(merge);
 
     var linear = try repo.git.history(base, main);
@@ -450,13 +442,13 @@ test "typed queries support packed refs and sha256 history" {
     try repo.exec(&.{ "update-ref", "refs/stakrr/test-other", tip });
     try repo.exec(&.{ "pack-refs", "--all", "--prune" });
 
-    var refs = try repo.git.listRefs("refs/stakrr/test/");
+    var refs = try repo.git.listDirectRefs("refs/stakrr/test/");
     defer refs.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 2), refs.refs.len);
-    try testing.expectEqualStrings("refs/stakrr/test/a", refs.refs[0].name);
-    try testing.expectEqualStrings(tip, refs.refs[0].oid);
-    try testing.expectEqualStrings("refs/stakrr/test/z", refs.refs[1].name);
-    try testing.expectEqualStrings(base, refs.refs[1].oid);
+    try testing.expectEqualStrings("refs/stakrr/test/a", refs.refs[0].name.bytes);
+    try testing.expectEqualStrings(tip, refs.refs[0].oid.hex());
+    try testing.expectEqualStrings("refs/stakrr/test/z", refs.refs[1].name.bytes);
+    try testing.expectEqualStrings(base, refs.refs[1].oid.hex());
 
     var history = try repo.git.history(base, tip);
     defer history.deinit(testing.allocator);
@@ -517,7 +509,7 @@ test "writeTree and commitTree preserve object format parent order and the index
         defer testing.allocator.free(after_status);
         try testing.expectEqualStrings(before_status, after_status);
         try repo.expectOutput(&.{"show-ref"}, before_refs);
-        try repo.expectRef("HEAD", second);
+        try repo.expectOutput(&.{ "rev-parse", "--verify", "HEAD" }, second);
     }
 }
 
@@ -539,10 +531,12 @@ test "object plumbing works in bare repositories in both object formats" {
         defer testing.allocator.free(tree);
         const commit = try git.commitTree(tree, &.{}, "bare checkpoint");
         defer testing.allocator.free(commit);
-        try git.transact("bare refs", &.{
-            .{ .create = .{ .name = "refs/heads/main", .oid = commit } },
-            .{ .create = .{ .name = "refs/stakrr/test", .oid = commit } },
-        });
+        var mutation = try git.beginRefMutation();
+        defer mutation.deinit();
+        try mutation.publish(.{ .message = "bare refs", .updates = &.{
+            try git.createRef("refs/heads/main", commit),
+            try git.createRef("refs/stakrr/test", commit),
+        } });
         const bytes = try git.outputRaw(&.{ "cat-file", "blob", blob });
         defer testing.allocator.free(bytes);
         try testing.expectEqualStrings("bare\x00bytes\xff\n", bytes);
@@ -667,7 +661,7 @@ test "mergeTree uses the explicit base and preserves refs and dirty work" {
         const after_status = try repo.git.outputRaw(&.{ "status", "--porcelain=v1", "-z" });
         defer testing.allocator.free(after_status);
         try testing.expectEqualStrings(before_status, after_status);
-        try repo.expectRef("HEAD", base);
+        try repo.expectOutput(&.{ "rev-parse", "--verify", "HEAD" }, base);
     }
 }
 
@@ -727,35 +721,47 @@ test "rewriteCommit replaces links and drops signatures while preserving metadat
             const original = try repo.git.outputRaw(&.{ "cat-file", "commit", source });
             defer testing.allocator.free(original);
             try testing.expectEqualStrings(raw, original);
-            try repo.expectRef("HEAD", second);
+            try repo.expectOutput(&.{ "rev-parse", "--verify", "HEAD" }, second);
         }
     }
 }
 
-test "merge and rewrite reject invalid object IDs before spawning Git" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-    // A missing executable proves validation occurs before any Git command.
-    try repo.env.put("PATH", "/nonexistent/stakrr-test-bin");
-    const block = try repo.env.createPosixBlock(testing.allocator, .{});
-    defer block.deinit(testing.allocator);
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = .{ .block = block } });
-    defer threaded.deinit();
-    var git = repo.git;
-    git.io = threaded.io();
-    const valid = &@as([40]u8, @splat('a'));
-    const arguments = [_][3][]const u8{
-        .{ "HEAD", valid, valid }, .{ valid, "--bad", valid }, .{ valid, valid, "bad\nvalue" },
-    };
-    for (arguments) |args| {
-        try testing.expectError(error.InvalidOid, git.mergeTree(args[0], args[1], args[2]));
-        try testing.expectError(error.InvalidOid, git.rewriteCommit(args[0], args[1], args[2]));
+test "object plumbing rejects invalid object IDs before spawning Git" {
+    for ([_][]const u8{ "sha1", "sha256" }) |format_name| {
+        var repo = try Repo.initOptions(.{ .object_format = format_name });
+        defer repo.deinit();
+        const format = try repo.git.objectFormat();
+        // Once repository metadata is known, invalid input must not spawn Git.
+        try repo.env.put("PATH", "/nonexistent/stakrr-test-bin");
+        const block = try repo.env.createPosixBlock(testing.allocator, .{});
+        defer block.deinit(testing.allocator);
+        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = .{ .block = block } });
+        defer threaded.deinit();
+        var git = repo.git;
+        git.io = threaded.io();
+        git.object_format = format;
+        const hex: [64]u8 = @splat('a');
+        const zero: [64]u8 = @splat('0');
+        const valid = hex[0..format.hexLength()];
+        const other_len: usize = if (format == .sha1) 64 else 40;
+        for ([_][]const u8{ "HEAD", "--bad", "bad\nvalue", zero[0..valid.len], hex[0..other_len] }) |invalid| {
+            try testing.expectError(error.InvalidOid, git.writeTree(&.{.{ .name = "file", .oid = invalid }}));
+            try testing.expectError(error.InvalidOid, git.commitTree(invalid, &.{}, "invalid tree"));
+            try testing.expectError(error.InvalidOid, git.commitTree(valid, &.{invalid}, "invalid parent"));
+            for ([_][3][]const u8{
+                .{ invalid, valid, valid }, .{ valid, invalid, valid }, .{ valid, valid, invalid },
+            }) |args| {
+                try testing.expectError(error.InvalidOid, git.mergeTree(args[0], args[1], args[2]));
+                try testing.expectError(error.InvalidOid, git.rewriteCommit(args[0], args[1], args[2]));
+            }
+        }
     }
 }
 
-test "mergeTree distinguishes unsupported options from fatal Git errors" {
+test "object plumbing preserves failure diagnostics and rejects invalid Git output" {
     var repo = try Repo.init();
     defer repo.deinit();
+    const format = try repo.git.objectFormat();
     try repo.tmp.dir.createDir(testing.io, "bin", .default_dir);
     const bin = try repo.tmp.dir.realPathFileAlloc(testing.io, "bin", testing.allocator);
     defer testing.allocator.free(bin);
@@ -767,6 +773,7 @@ test "mergeTree distinguishes unsupported options from fatal Git errors" {
     defer threaded.deinit();
     var git = repo.git;
     git.io = threaded.io();
+    git.object_format = format;
     var diagnostics: stakrr_git.Diagnostics = .{};
     git.diagnostics = &diagnostics;
     const valid = &@as([40]u8, @splat('a'));
@@ -774,6 +781,14 @@ test "mergeTree distinguishes unsupported options from fatal Git errors" {
         .{ .script = "#!/bin/sh\nexit 129\n", .expected = error.UnsupportedGitVersion },
         .{ .script = "#!/bin/sh\necho 'fatal: injected failure' >&2\nexit 128\n", .expected = error.GitFailed },
         .{ .script = "#!/bin/sh\nkill -TERM $$\n", .expected = error.GitTerminated },
+        .{
+            .script = "#!/bin/sh\ncase \"$1\" in hash-object|mktree) while IFS= read -r line; do :; done ;; esac\nprintf '%040d\\n' 0\n",
+            .expected = error.InvalidGitOutput,
+        },
+        .{
+            .script = "#!/bin/sh\ncase \"$1\" in hash-object|mktree) while IFS= read -r line; do :; done ;; esac\nprintf '%064d\\n' 1\n",
+            .expected = error.InvalidGitOutput,
+        },
     }) |case| {
         try repo.tmp.dir.writeFile(testing.io, .{
             .sub_path = "bin/git",
@@ -781,6 +796,11 @@ test "mergeTree distinguishes unsupported options from fatal Git errors" {
             .flags = .{ .permissions = .executable_file },
         });
         try testing.expectError(case.expected, git.mergeTree(valid, valid, valid));
+        if (case.expected == error.InvalidGitOutput) {
+            try testing.expectError(error.InvalidGitOutput, git.writeBlob("contents\n"));
+            try testing.expectError(error.InvalidGitOutput, git.writeTree(&.{}));
+            try testing.expectError(error.InvalidGitOutput, git.commitTree(valid, &.{}, "invalid output"));
+        }
         if (case.expected == error.GitFailed)
             try testing.expectEqualStrings("fatal: injected failure", diagnostics.stderr());
     }
@@ -839,7 +859,7 @@ test "publication intent retains annotated tags through pruning" {
     const commit = try repo.commit("target");
     defer testing.allocator.free(commit);
     try repo.exec(&.{ "tag", "-a", "snapshot", "-m", "annotated snapshot", commit });
-    const tag = (try repo.git.readRef("refs/tags/snapshot")).?;
+    const tag = (try repo.readRef("refs/tags/snapshot")).?;
     defer testing.allocator.free(tag);
     try repo.tmp.dir.createDir(testing.io, ".git/ref-hooks", .default_dir);
     try repo.tmp.dir.writeFile(testing.io, .{
@@ -853,43 +873,48 @@ test "publication intent retains annotated tags through pruning" {
             "  esac\ndone\nexit 1\n",
     });
     try repo.exec(&.{ "config", "core.hooksPath", ".git/ref-hooks" });
-    try testing.expectError(error.GitFailed, repo.git.transact("tag copies", &.{
-        .{ .create = .{ .name = "refs/stakrr/copy-a", .oid = tag } },
-        .{ .create = .{ .name = "refs/stakrr/copy-b", .oid = tag } },
-    }));
+    {
+        var mutation = try repo.git.beginRefMutation();
+        defer mutation.deinit();
+        try testing.expectError(error.GitFailed, mutation.publish(.{ .message = "tag copies", .updates = &.{
+            try repo.git.createRef("refs/stakrr/copy-a", tag),
+            try repo.git.createRef("refs/stakrr/copy-b", tag),
+        } }));
+    }
     try testing.expect(try repo.hasRef(layout.transaction_ref));
     try repo.exec(&.{ "config", "core.hooksPath", "/dev/null" });
     try repo.exec(&.{ "update-ref", "-d", "refs/tags/snapshot", tag });
     try repo.exec(&.{ "reflog", "expire", "--expire=now", "--all" });
     try repo.exec(&.{ "gc", "--prune=now" });
     try testing.expectError(error.GitFailed, repo.git.output(&.{ "cat-file", "-t", tag }));
-    try repo.git.transact("resume tag copies", &.{});
+    var recovered = try repo.git.beginRefMutation();
+    defer recovered.deinit();
+    try testing.expect(recovered.recovered);
     try repo.expectRef("refs/stakrr/copy-a", tag);
     try repo.expectRef("refs/stakrr/copy-b", tag);
     try repo.expectNoRef(layout.transaction_ref);
     try repo.exec(&.{ "fsck", "--no-reflogs" });
 }
 
-test "journaled transactions preserve Git zero-OID absence and deletion semantics" {
+test "journaled transactions encode explicit absence and deletion in both object formats" {
     for ([_][]const u8{ "sha1", "sha256" }) |format| {
         var repo = try Repo.initOptions(.{ .object_format = format });
         defer repo.deinit();
         const blob = try repo.git.writeBlob("ref contents");
         defer testing.allocator.free(blob);
-        const zero = try testing.allocator.alloc(u8, blob.len);
-        defer testing.allocator.free(zero);
-        @memset(zero, '0');
-        try repo.git.transact("verify absence and create", &.{
-            .{ .verify = .{ .name = "refs/stakrr/absent", .oid = zero } },
-            .{ .create = .{ .name = "refs/stakrr/a", .oid = blob } },
-            .{ .create = .{ .name = "refs/stakrr/b", .oid = blob } },
-        });
+        var mutation = try repo.git.beginRefMutation();
+        defer mutation.deinit();
+        try mutation.publish(.{ .message = "verify absence and create", .updates = &.{
+            try repo.git.verifyRef("refs/stakrr/absent", null),
+            try repo.git.createRef("refs/stakrr/a", blob),
+            try repo.git.createRef("refs/stakrr/b", blob),
+        } });
         try repo.expectRef("refs/stakrr/a", blob);
         try repo.expectRef("refs/stakrr/b", blob);
-        try repo.git.transact("delete with zero OIDs", &.{
-            .{ .update = .{ .name = "refs/stakrr/a", .new = zero, .old = blob } },
-            .{ .update = .{ .name = "refs/stakrr/b", .new = zero, .old = blob } },
-        });
+        try mutation.publish(.{ .message = "delete refs", .updates = &.{
+            try repo.git.deleteRef("refs/stakrr/a", blob),
+            try repo.git.deleteRef("refs/stakrr/b", blob),
+        } });
         try repo.expectNoRef("refs/stakrr/a");
         try repo.expectNoRef("refs/stakrr/b");
         try repo.expectNoRef(layout.transaction_ref);

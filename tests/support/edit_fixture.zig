@@ -90,3 +90,16 @@ pub fn linked(repo: *const Repo, path: []const u8, branch: []const u8) !stakrr.g
     git.cwd = dir;
     return git;
 }
+
+/// The three-layer conflict fixture after completion or restoration.
+pub fn validConflict(repo: *const Repo) !void {
+    var snapshot = try stack.inspect(&repo.git);
+    defer snapshot.deinit();
+    try testing.expectEqual(@as(usize, 3), snapshot.layers.len);
+    for (snapshot.layers, [_][]const u8{ "models", "api", "conflict" }) |layer, name| {
+        const ref_name = try std.fmt.allocPrint(testing.allocator, layout.layer_prefix ++ "{s}", .{name});
+        defer testing.allocator.free(ref_name);
+        try testing.expectEqualStrings(ref_name, layer.ref_name);
+        try testing.expect(!layer.stale());
+    }
+}

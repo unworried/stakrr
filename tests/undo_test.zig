@@ -47,9 +47,9 @@ test "global undo refuses drift dirty work active sessions and occupied branches
     defer repo.deinit();
     try fixture.setup(&repo);
     try finishEdit(&repo);
-    const oplog = (try repo.git.readRef(layout.oplog_ref)).?;
+    const oplog = (try repo.readRef(layout.oplog_ref)).?;
     defer testing.allocator.free(oplog);
-    const models = try repo.git.resolveCommit("stakrr/models");
+    const models = try repo.git.resolveCommitAlloc("stakrr/models");
     defer testing.allocator.free(models);
     try repo.exec(&.{ "update-ref", "refs/heads/stakrr/models", "main" });
     const drifted = try positions(&repo);
@@ -80,20 +80,20 @@ test "global undo refuses drift dirty work active sessions and occupied branches
     try edit.undo(&repo.git); // an aborted session does not hide the completed edit
 }
 
-test "v2 journal retains checkpoints plans and edited commits through immediate pruning" {
+test "v1 journal retains checkpoints plans and edited commits through immediate pruning" {
     var repo = try Repo.init();
     defer repo.deinit();
     try fixture.setup(&repo);
     try fixture.correctModels(&repo);
-    const correction = try repo.git.resolveCommit("stakrr/models");
+    const correction = try repo.git.resolveCommitAlloc("stakrr/models");
     defer testing.allocator.free(correction);
     try cli.installFaultShim(&repo);
     try repo.env.put("STAKRR_TEST_FAULT", "after:1");
     const killed = try cli.run(&repo, &.{"restack"});
     defer killed.deinit();
-    try testing.expect(killed.code != 0);
+    try killed.expectKilled();
     _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
-    const checkpoint = (try repo.git.readRef(layout.session_ref)).?;
+    const checkpoint = (try repo.readRef(layout.session_ref)).?;
     defer testing.allocator.free(checkpoint);
     const plan = try repo.git.output(&.{ "rev-parse", "refs/stakrr/edit:plan" });
     defer testing.allocator.free(plan);
@@ -129,7 +129,7 @@ test "log lists timestamps branch moves and rescue commits across completed sess
     var moved_work = false;
     for (log.steps) |step| {
         try testing.expect(step.time.len >= 20 and step.time[10] == 'T');
-        try testing.expect(stakrr.git.isOid(step.rescue));
+        _ = try repo.git.parseOid(step.rescue);
         for (step.moves) |move| {
             try testing.expect(!std.mem.eql(u8, move.before, move.after));
             if (std.mem.eql(u8, move.name, "refs/heads/stakrr/models")) moved_models = true;
@@ -156,7 +156,7 @@ test "undo restoration resumes around every boundary transaction" {
         try repo.env.put("STAKRR_TEST_FAULT", fault);
         const killed = try cli.run(&repo, &.{"undo"});
         defer killed.deinit();
-        try testing.expect(killed.code != 0);
+        try killed.expectKilled();
         _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
         if (std.mem.eql(u8, fault, "before:1")) {
             try cli.expectSuccess(&repo, &.{"undo"});
@@ -183,7 +183,7 @@ test "restack archives its final checkpoint atomically" {
         try repo.env.put("STAKRR_TEST_FAULT", fault);
         const killed = try cli.run(&repo, &.{"restack"});
         defer killed.deinit();
-        try testing.expect(killed.code != 0);
+        try killed.expectKilled();
         _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
         if (std.mem.eql(u8, fault, "before:archive")) {
             try repo.expectNoRef(layout.oplog_ref);
@@ -213,7 +213,7 @@ test "abort and quit archive their final checkpoints atomically" {
             const args: []const []const u8 = &.{command};
             const killed = try cli.run(&repo, args);
             defer killed.deinit();
-            try testing.expect(killed.code != 0);
+            try killed.expectKilled();
             _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
             if (std.mem.eql(u8, fault, "before:archive")) {
                 try repo.expectNoRef(layout.oplog_ref);

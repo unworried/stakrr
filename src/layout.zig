@@ -28,6 +28,8 @@ pub const transaction_ref = "refs/stakrr/transaction";
 /// git config key holding "<version> <base_ref> <work_ref>"
 pub const state_key = "stakrr.state";
 pub const state_version = "v1";
+pub const checkpoint_version: u8 = 1;
+pub const transaction_version: u8 = 1;
 
 /// `refs/heads/x` → `x`; other refs are returned unchanged
 pub fn shortBranch(ref_name: []const u8) []const u8 {

@@ -2,6 +2,8 @@
 //! above it. The whole rewrite happens in object storage via in-memory merges, so
 //! the index, the worktree and unstaged edits are never touched. Nothing is
 //! published unless every step merges cleanly; a refused fix changes nothing.
+const Mutation = @import("mutation.zig").Mutation;
+const RefName = @import("git.zig").RefName;
 const std = @import("std");
 const git_mod = @import("git.zig");
 const Git = git_mod.Git;
@@ -42,29 +44,23 @@ pub fn fix(original_git: *const Git, options: Options) !Result {
     var arena: std.heap.ArenaAllocator = .init(original_git.allocator);
     defer arena.deinit();
     const scoped = original_git.withAllocator(arena.allocator());
-    const git = &scoped;
+    var mutation = try scoped.beginStackMutation();
+    defer mutation.deinit();
+    const git = mutation.repo();
     const allocator = git.allocator;
-
-    // an active edit session excludes this, like every stack mutation
-    const guard = try coordination.lockStack(git);
-    defer guard.close(git.io);
 
     var snapshot = try stack.inspect(git);
     defer snapshot.deinit();
     const layers = snapshot.layers;
 
-    const current = try git.currentBranch();
-    if (!std.mem.eql(u8, current, snapshot.config.work_ref)) return error.NotOnWorkBranch;
+    var current = try git.currentBranch();
+    defer current.deinit(allocator);
+    if (!std.mem.eql(u8, current.value.name.bytes, snapshot.config.work_ref.name.bytes)) return error.NotOnWorkBranch;
     try coordination.requireNoGitOperation(git, .{});
     if (layers.len == 0) return error.NoLayers;
     // commits made on a layer must be restacked before anything else moves it
     for (layers) |layer| if (layer.stale()) return error.StaleLayers;
     const index = try findLayer(layers, options.layer);
-
-    // rewritten branches must not be checked out in another worktree
-    const touched = try allocator.alloc([]const u8, layers.len - index);
-    for (layers[index..], touched) |layer, *ref| ref.* = layer.ref_name;
-    try coordination.requireAvailable(git, touched);
 
     if (try git.check(&.{ "diff", "--no-relative", "--cached", "--quiet" }, 1)) return error.NothingStaged;
     const work_old = snapshot.work_oid;
@@ -103,7 +99,7 @@ pub fn fix(original_git: *const Git, options: Options) !Result {
     const tip_tree = try git.output(&.{ "rev-parse", try std.fmt.allocPrint(allocator, "{s}^{{tree}}", .{work_new}) });
     if (!eql(tip_tree, staged_tree)) return error.FixDiverged;
 
-    try publish(git, snapshot, index, moved, work_new);
+    try publish(&mutation, snapshot, index, moved, work_new);
 
     return .{
         .layer = try original_git.allocator.dupe(u8, layout.layerName(layers[index].ref_name).?),
@@ -114,18 +110,19 @@ pub fn fix(original_git: *const Git, options: Options) !Result {
 /// Every moved ref, the tip guard and the operation log land in one transaction,
 /// so `stakrr undo` can reverse the fix like any finished edit.
 fn publish(
-    git: *const Git,
+    mutation: *const Mutation,
     snapshot: stack.Snapshot,
     index: usize,
     moved: []const []const u8,
     work_new: []const u8,
 ) !void {
+    const git = mutation.repo();
     const allocator = git.allocator;
     const layers = snapshot.layers;
 
     const nodes = try allocator.alloc(checkpoint.Node, layers.len + 1);
     for (layers, nodes[0..layers.len]) |layer, *node| node.* = try checkpoint.Node.init(allocator, layer.ref_name, layer.oid);
-    nodes[layers.len] = try checkpoint.Node.init(allocator, snapshot.config.work_ref, snapshot.work_oid);
+    nodes[layers.len] = try checkpoint.Node.init(allocator, snapshot.config.work_ref.name.bytes, snapshot.work_oid);
     for (nodes[index..layers.len], moved) |*node, oid| {
         node.published_oid = oid;
         node.pending_oid = oid;
@@ -134,13 +131,13 @@ fn publish(
     nodes[layers.len].pending_oid = work_new;
 
     const config = (try git.configGet(layout.state_key)) orelse return error.InvalidConfig;
-    const oplog = try git.readRef(layout.oplog_ref);
+    const oplog = try git.readDirectRefAlloc(try RefName.init(layout.oplog_ref));
     var s: checkpoint.Session = .{
         .oplog_parent = oplog,
         .outcome = .finished,
         .id = "",
         .owner = try git.path(&.{ "rev-parse", "--absolute-git-dir" }),
-        .origin = snapshot.config.work_ref,
+        .origin = snapshot.config.work_ref.name.bytes,
         .config = config,
         .branches = try stack.parseConfig(config),
         .anchor = snapshot.config.anchor_oid,
@@ -156,29 +153,21 @@ fn publish(
 
     var updates: std.ArrayList(Git.RefUpdate) = .empty;
     for (layers[index..], moved) |layer, oid| {
-        try updates.append(allocator, .{ .update = .{ .name = layer.ref_name, .new = oid, .old = layer.oid } });
-        try updates.append(allocator, .{ .update = .{
-            .name = try layout.recordRef(allocator, layer.ref_name),
-            .new = oid,
-            .old = layer.oid,
-        } });
+        try updates.append(allocator, try git.updateRef(layer.ref_name, layer.oid, oid));
+        try updates.append(allocator, try git.updateRef(try layout.recordRef(allocator, layer.ref_name), layer.oid, oid));
     }
-    try updates.append(allocator, .{ .update = .{
-        .name = snapshot.config.work_ref,
-        .new = work_new,
-        .old = snapshot.work_oid,
-    } });
-    try updates.append(allocator, .{ .update = .{
-        .name = layout.tip_ref,
-        .new = moved[moved.len - 1],
-        .old = layers[layers.len - 1].oid,
-    } });
+    try updates.append(allocator, try git.updateRef(snapshot.config.work_ref.name.bytes, snapshot.work_oid, work_new));
+    try updates.append(allocator, try git.updateRef(layout.tip_ref, layers[layers.len - 1].oid, moved[moved.len - 1]));
     try updates.append(allocator, if (oplog) |previous|
-        .{ .update = .{ .name = layout.oplog_ref, .new = saved, .old = previous } }
+        try git.updateRef(layout.oplog_ref, previous, saved)
     else
-        .{ .create = .{ .name = layout.oplog_ref, .oid = saved } });
-    try updates.append(allocator, .{ .verify = .{ .name = layout.anchor_ref, .oid = snapshot.config.anchor_oid } });
-    try git.transact(label, updates.items);
+        try git.createRef(layout.oplog_ref, saved));
+    try updates.append(allocator, try git.verifyRef(layout.anchor_ref, snapshot.config.anchor_oid));
+    try mutation.publish(.{
+        .message = label,
+        .updates = updates.items,
+        .current_branch = .{ .allow = snapshot.config.work_ref },
+    });
 }
 
 fn findLayer(layers: []const stack.Layer, name: ?[]const u8) !usize {
