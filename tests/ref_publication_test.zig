@@ -1,0 +1,279 @@
+//! Ref identity matters even when a symbolic ref resolves to the expected OID.
+//! Publication races must fail with GitFailed while preserving the symbolic
+//! ref and its target, even when the alias resolves to the expected OID.
+const std = @import("std");
+const testing = std.testing;
+const stakrr = @import("stakrr");
+const publication_ref = "refs/stakrr/publication-test";
+const Repo = @import("support/repo.zig").Repo;
+const cli = @import("support/cli.zig");
+
+const victim = "refs/heads/victim";
+const formats = [_][]const u8{ "sha1", "sha256" };
+
+// Include ref types, config, HEAD, the index and working files when checking
+// refusal. Resolved OIDs alone would hide a symbolic substitution.
+const Snapshot = struct {
+    const commands = [_][]const []const u8{
+        &.{ "for-each-ref", "--format=%(refname)%09%(objectname)%09%(symref)" },
+        &.{ "config", "--local", "--null", "--list" },
+        &.{ "symbolic-ref", "--no-recurse", "HEAD" },
+        &.{ "rev-parse", "--verify", "HEAD" },
+        &.{ "ls-files", "--stage", "-z" },
+        &.{ "diff", "--no-relative", "--no-ext-diff", "--binary", "HEAD" },
+        &.{ "status", "--porcelain=v1", "-z" },
+    };
+    values: [commands.len][]u8,
+
+    fn capture(repo: *const Repo) !Snapshot {
+        var result: Snapshot = undefined;
+        var initialized: usize = 0;
+        errdefer for (result.values[0..initialized]) |value| testing.allocator.free(value);
+        for (commands, &result.values) |command, *value| {
+            value.* = try repo.git.outputRaw(command);
+            initialized += 1;
+        }
+        return result;
+    }
+
+    fn deinit(self: *Snapshot) void {
+        for (self.values) |value| testing.allocator.free(value);
+    }
+
+    fn expectUnchanged(self: *const Snapshot, repo: *const Repo) !void {
+        for (commands, self.values) |command, expected| {
+            const actual = try repo.git.outputRaw(command);
+            defer testing.allocator.free(actual);
+            try testing.expectEqualStrings(expected, actual);
+        }
+    }
+};
+
+fn expectSymbolic(repo: *const Repo, name: []const u8) !void {
+    // for-each-ref omits dangling symbolic refs, so assert their identity too.
+    try repo.expectOutput(&.{ "symbolic-ref", "--no-recurse", name }, victim);
+}
+
+fn expectAbsent(repo: *const Repo, name: []const u8) !void {
+    try repo.expectNoRef(name);
+    try testing.expect(!(try repo.git.check(&.{ "symbolic-ref", "--quiet", "--no-recurse", name }, 1)));
+}
+
+fn driver(repo: *const Repo, args: []const []const u8) !cli.Run {
+    const exe = try std.Io.Dir.cwd().realPathFileAlloc(testing.io, @import("cli_options").ref_driver_path, testing.allocator);
+    defer testing.allocator.free(exe);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(testing.allocator);
+    try argv.append(testing.allocator, exe);
+    try argv.appendSlice(testing.allocator, args);
+    const result = try std.process.run(testing.allocator, testing.io, .{
+        .argv = argv.items,
+        .cwd = .{ .dir = repo.tmp.dir },
+        .environ_map = repo.env,
+    });
+    return .{
+        .code = switch (result.term) {
+            .exited => |code| code,
+            else => null,
+        },
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+    };
+}
+
+fn expectDriverError(result: cli.Run, expected: anyerror) !void {
+    try testing.expectEqual(@as(?u8, 1), result.code);
+    try testing.expectEqualStrings(@errorName(expected), result.stderr);
+}
+
+fn expectDirect(repo: *const Repo, name: []const u8, oid: []const u8) !void {
+    try repo.expectRef(name, oid);
+    try testing.expect(!(try repo.git.check(&.{ "symbolic-ref", "--quiet", "--no-recurse", name }, 1)));
+}
+
+fn restore(repo: *const Repo, name: []const u8, oid: ?[]const u8) !void {
+    if (oid) |value|
+        try repo.exec(&.{ "update-ref", "--no-deref", name, value })
+    else
+        try repo.exec(&.{ "update-ref", "--no-deref", "-d", name });
+}
+
+fn alias(repo: *const Repo, name: []const u8, oid: ?[]const u8) !void {
+    if (oid) |value| try repo.exec(&.{ "update-ref", victim, value });
+    try repo.exec(&.{ "symbolic-ref", name, victim });
+    try expectSymbolic(repo, name);
+}
+
+fn race(repo: *Repo, label: []const u8, name: []const u8) !void {
+    try cli.installFaultShim(repo);
+    try repo.env.put("STAKRR_TEST_SYMREF_LABEL", label);
+    try repo.env.put("STAKRR_TEST_SYMREF_REF", name);
+    try repo.env.put("STAKRR_TEST_SYMREF_TARGET", victim);
+    const marker = try std.fmt.allocPrint(testing.allocator, "{s}.symref", .{repo.env.get("STAKRR_TEST_COUNTER").?});
+    defer testing.allocator.free(marker);
+    try repo.env.put("STAKRR_TEST_SYMREF_MARKER", marker);
+}
+
+fn expectRaceFired(repo: *const Repo) !void {
+    const marker = try repo.tmp.dir.readFileAlloc(testing.io, repo.env.get("STAKRR_TEST_SYMREF_MARKER").?, testing.allocator, .limited(1024));
+    defer testing.allocator.free(marker);
+    try testing.expectEqualStrings(repo.env.get("STAKRR_TEST_SYMREF_LABEL").?, marker);
+}
+
+fn dirty(repo: *const Repo) !void {
+    try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "tracked", .data = "staged work\n" });
+    try repo.exec(&.{ "add", "tracked" });
+    try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "tracked", .data = "unstaged work\n" });
+    try repo.tmp.dir.writeFile(testing.io, .{ .sub_path = "untracked", .data = "untracked work\n" });
+}
+
+// Exercise both formats even when one fails, so a red regression does not
+// hide the remaining cases in the matrix.
+fn eachFormat(comptime run: anytype, args: anytype) !void {
+    var failed = false;
+    for (formats) |format| {
+        @call(.auto, run, .{format} ++ args) catch |err| {
+            std.debug.print("symbolic-ref case ({s}): {s}\n", .{ format, @errorName(err) });
+            failed = true;
+        };
+    }
+    if (failed) return error.TestUnexpectedResult;
+}
+
+test "ref publication returns StreamTooLong without crashing during pipe cleanup" {
+    try publicationTransportFailure("stderr-overflow", error.StreamTooLong);
+}
+
+test "ref publication returns BrokenPipe without crashing during pipe cleanup" {
+    try publicationTransportFailure("closed-stdin", error.BrokenPipe);
+}
+
+fn publicationTransportFailure(fault: []const u8, expected_error: anyerror) !void {
+    for (formats) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+        const old = try repo.commit("old");
+        defer testing.allocator.free(old);
+        const new = try repo.commit("new");
+        defer testing.allocator.free(new);
+        try restore(&repo, publication_ref, old);
+        try dirty(&repo);
+        try cli.installFaultShim(&repo);
+        const marker = try std.fmt.allocPrint(testing.allocator, "{s}.transport-fault", .{repo.env.get("STAKRR_TEST_COUNTER").?});
+        defer testing.allocator.free(marker);
+        try repo.env.put("STAKRR_TEST_TRANSACTION_FAULT", fault);
+        try repo.env.put("STAKRR_TEST_TRANSACTION_FAULT_MARKER", marker);
+        var before = try Snapshot.capture(&repo);
+        defer before.deinit();
+
+        // Isolate the API call in a child so a cleanup panic fails this test
+        // without taking down the test runner or hiding the other regressions.
+        const result = try driver(&repo, &.{ "update", old, new });
+        defer result.deinit();
+        const phase = try repo.tmp.dir.readFileAlloc(testing.io, marker, testing.allocator, .limited(32));
+        defer testing.allocator.free(phase);
+        try testing.expectEqualStrings("prepare\n", phase);
+        try before.expectUnchanged(&repo);
+        if (result.code == null) std.debug.print("ref publication terminated abnormally:\n{s}\n", .{result.stderr});
+        try expectDriverError(result, expected_error);
+
+        // The same request must succeed through real Git when the transport
+        // fault is removed, ruling out an invalid transaction as the cause.
+        _ = repo.env.swapRemove("STAKRR_TEST_TRANSACTION_FAULT");
+        const control = try driver(&repo, &.{ "update", old, new });
+        defer control.deinit();
+        try testing.expectEqual(@as(?u8, 0), control.code);
+        try testing.expectEqualStrings("", control.stderr);
+        try expectDirect(&repo, publication_ref, new);
+        try expectDirect(&repo, "refs/stakrr/unrelated", new);
+    }
+}
+
+const PublicationCase = enum { verify, verify_absent, create, update, delete };
+
+fn publication(kind: PublicationCase, inject: bool) !void {
+    try eachFormat(publicationCase, .{ kind, inject, false });
+}
+
+fn publicationCase(format: []const u8, kind: PublicationCase, inject: bool, lock_probe: bool) !void {
+    var repo = try Repo.initOptions(.{ .object_format = format });
+    defer repo.deinit();
+    const old = try repo.commit("old");
+    defer testing.allocator.free(old);
+    const new = try repo.commit("new");
+    defer testing.allocator.free(new);
+    const zero = try testing.allocator.alloc(u8, old.len);
+    defer testing.allocator.free(zero);
+    @memset(zero, '0');
+    const absent = kind == .create or kind == .verify_absent;
+    const initial: ?[]const u8 = if (absent) null else old;
+    try restore(&repo, publication_ref, initial);
+    try dirty(&repo);
+    if (lock_probe) {
+        try cli.installFaultShim(&repo);
+        try repo.env.put("STAKRR_TEST_LOCK_REF", publication_ref);
+        const marker = try std.fmt.allocPrint(testing.allocator, "{s}.locked", .{repo.env.get("STAKRR_TEST_COUNTER").?});
+        defer testing.allocator.free(marker);
+        try repo.env.put("STAKRR_TEST_LOCK_MARKER", marker);
+        try restore(&repo, victim, old);
+    }
+    if (inject) {
+        try race(&repo, "test symbolic publication", publication_ref);
+        try alias(&repo, publication_ref, initial);
+        var before = try Snapshot.capture(&repo);
+        defer before.deinit();
+        try restore(&repo, publication_ref, initial);
+        const result = try driver(&repo, &.{ @tagName(kind), if (absent) zero else old, new });
+        defer result.deinit();
+        try expectRaceFired(&repo);
+        try before.expectUnchanged(&repo);
+        try expectSymbolic(&repo, publication_ref);
+        if (initial) |oid| try expectDirect(&repo, victim, oid) else try expectAbsent(&repo, victim);
+        try expectAbsent(&repo, "refs/stakrr/unrelated");
+        try expectDriverError(result, error.GitFailed);
+    } else {
+        const result = try driver(&repo, &.{ @tagName(kind), if (absent) zero else old, new });
+        defer result.deinit();
+        try testing.expectEqual(@as(?u8, 0), result.code);
+        switch (kind) {
+            .verify => try expectDirect(&repo, publication_ref, old),
+            .verify_absent, .delete => try expectAbsent(&repo, publication_ref),
+            .create, .update => try expectDirect(&repo, publication_ref, new),
+        }
+        try expectDirect(&repo, "refs/stakrr/unrelated", new);
+    }
+    if (lock_probe) {
+        const status = try repo.tmp.dir.readFileAlloc(testing.io, repo.env.get("STAKRR_TEST_LOCK_MARKER").?, testing.allocator, .limited(32));
+        defer testing.allocator.free(status);
+        try testing.expect((try std.fmt.parseInt(u8, status, 10)) != 0);
+        try expectDirect(&repo, victim, old);
+    }
+}
+
+test "direct ref publication controls accept verify create update and delete" {
+    for (std.enums.values(PublicationCase)) |kind| try publication(kind, false);
+}
+
+test "publication keeps every requested ref locked during type validation" {
+    for (std.enums.values(PublicationCase)) |kind| try eachFormat(publicationCase, .{ kind, false, true });
+}
+
+test "verify refuses a symbolic ref substituted at publication" {
+    try publication(.verify, true);
+}
+
+test "absence verification refuses a dangling symbolic ref substituted at publication" {
+    try publication(.verify_absent, true);
+}
+
+test "create refuses a dangling symbolic ref substituted at publication" {
+    try publication(.create, true);
+}
+
+test "update refuses a symbolic ref substituted at publication" {
+    try publication(.update, true);
+}
+
+test "delete refuses a symbolic ref substituted at publication" {
+    try publication(.delete, true);
+}

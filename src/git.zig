@@ -9,6 +9,7 @@ pub const Error = error{
     GitFailed,
     GitTerminated,
     InvalidRefName,
+    SymbolicRef,
     InvalidOid,
     NotGitRepository,
     NotWorkingTree,
@@ -205,6 +206,18 @@ pub const Git = struct {
         if ((try exitCode(result)) != 0) return error.InvalidRefName;
     }
 
+    /// Managed refs are direct. HEAD and Git's operation pseudorefs retain
+    /// their ordinary semantics; symbolic HEAD is used throughout the app.
+    pub fn requireDirectRef(self: *const Git, ref_name: []const u8) !void {
+        const target = (try self.query(&.{ "symbolic-ref", "--quiet", "--no-recurse", ref_name }, 1)) orelse return;
+        defer self.allocator.free(target);
+        if (self.diagnostics) |diag| {
+            var buf: [1024]u8 = undefined;
+            diag.record(std.fmt.bufPrint(&buf, "symbolic ref {s} points to {s}; restore a direct ref before retrying", .{ ref_name, target }) catch "managed refs must be direct, not symbolic");
+        }
+        return error.SymbolicRef;
+    }
+
     /// read the exact ref oid. a missing ref is distinct from a git failure
     pub fn readRef(self: *const Git, ref_name: []const u8) !?[]u8 {
         return self.query(&.{
@@ -376,10 +389,10 @@ pub const Git = struct {
         delete: ExpectedRef,
     };
 
-    /// Atomically apply `updates` in one ref transaction; either every
-    /// update lands or none do. Names must be Git-valid refs and every oid
-    /// a full object id, since both are written into the stdin protocol.
-    /// Updates affect the named refs themselves, never symbolic-ref targets.
+    /// Publish direct refs with compare-and-swap checks in one Git transaction.
+    /// Validate ref types under the prepared transaction locks before commit.
+    /// Names must be Git-valid refs and every oid a full object id.
+    /// Individual ref writes are crash-atomic; a crash can partly publish.
     pub fn transact(
         self: *const Git,
         message: []const u8,
@@ -408,9 +421,12 @@ pub const Git = struct {
                 try w.print("delete {s} {s}\n", .{ ref.name, ref.oid });
             },
         };
-        try w.writeAll("prepare\ncommit\n");
+        try w.writeAll("prepare\n");
 
-        try self.updateRefStdin(message, transaction.written());
+        const publication = try self.inputRefTransaction(message, transaction.written(), updates);
+        defer self.freeResult(publication.result);
+        if (publication.rejected or !publication.result.term.success())
+            return self.fail(publication.result.stderr);
     }
 
     fn checkUpdate(name: []const u8, oids: []const []const u8) Error!void {
@@ -421,49 +437,77 @@ pub const Git = struct {
         }
     }
 
-    fn updateRefStdin(self: *const Git, message: []const u8, transaction: []const u8) !void {
-        const argv = try self.argvFor(&.{
-            "update-ref", "--no-deref", "--create-reflog", "-m", message, "--stdin",
-        });
+    const Publication = struct { result: std.process.RunResult, rejected: bool };
+
+    /// --no-deref locks the requested names, including symbolic and absent
+    /// refs. Check their types only after prepare acknowledges those locks,
+    /// and keep stdin open so Git cannot publish before we choose commit.
+    fn inputRefTransaction(self: *const Git, message: []const u8, data: []const u8, updates: []const RefUpdate) !Publication {
+        const argv = try self.argvFor(&.{ "update-ref", "--no-deref", "--create-reflog", "-m", message, "--stdin" });
         defer self.allocator.free(argv);
         var child = try std.process.spawn(self.io, .{
             .argv = argv,
             .cwd = self.childCwd(),
             .environ_map = self.environ_map,
             .stdin = .pipe,
-            .stdout = .ignore,
+            .stdout = .pipe,
             .stderr = .pipe,
         });
+        defer child.kill(self.io);
 
-        var reaped = false;
-        errdefer {
-            if (!reaped) {
-                if (child.stdin) |pipe| pipe.close(self.io);
-                child.kill(self.io);
+        var input_task = try self.io.concurrent(writePreparedInput, .{ self.io, child.stdin.?, data });
+        defer input_task.cancel(self.io) catch {};
+        var buffer: Io.File.MultiReader.Buffer(2) = undefined;
+        var reader: Io.File.MultiReader = undefined;
+        reader.init(self.allocator, self.io, buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+        defer reader.deinit();
+        var decided = false;
+        var rejection: ?[]u8 = null;
+        defer if (rejection) |reason| self.allocator.free(reason);
+        var validation_error: ?anyerror = null;
+        while (reader.fill(64, .none)) |_| {
+            try reader.checkAnyError();
+            const stdout = reader.reader(0).buffered();
+            if (stdout.len > stdout_limit or reader.reader(1).buffered().len > stderr_limit)
+                return error.StreamTooLong;
+            if (!decided and std.mem.endsWith(u8, stdout, "prepare: ok\n")) {
+                try input_task.await(self.io);
+                for (updates) |update| {
+                    const name = switch (update) {
+                        inline else => |ref| ref.name,
+                    };
+                    self.requireDirectRef(name) catch |err| {
+                        if (err == error.SymbolicRef) {
+                            rejection = try std.fmt.allocPrint(self.allocator, "cannot publish symbolic ref {s}; managed refs must be direct", .{name});
+                        } else validation_error = err;
+                        break;
+                    };
+                }
+                const command = if (rejection != null or validation_error != null) "abort\n" else "commit\n";
+                try child.stdin.?.writeStreamingAll(self.io, command);
+                child.stdin.?.close(self.io);
+                child.stdin = null;
+                decided = true;
             }
+        } else |err| switch (err) {
+            error.EndOfStream => {},
+            else => return err,
         }
-
-        try child.stdin.?.writeStreamingAll(self.io, transaction);
-        child.stdin.?.close(self.io);
-        child.stdin = null;
-
-        // capture git's stderr instead of forwarding it to the terminal
-        var stderr_buffer: [4096]u8 = undefined;
-        var stderr_reader = child.stderr.?.reader(
-            self.io,
-            &stderr_buffer,
-        );
-
-        const stderr = try stderr_reader.interface.allocRemaining(
-            self.allocator,
-            .limited(stderr_limit),
-        );
-        defer self.allocator.free(stderr);
-
+        try reader.checkAnyError();
         const term = try child.wait(self.io);
-        reaped = true;
+        if (term.success()) {
+            try input_task.await(self.io);
+            if (!decided) return error.InvalidGitOutput;
+            if (validation_error) |err| return err;
+        }
+        const stdout = try reader.toOwnedSlice(0);
+        errdefer self.allocator.free(stdout);
+        const stderr = if (rejection) |reason| try self.allocator.dupe(u8, reason) else try reader.toOwnedSlice(1);
+        return .{ .result = .{ .term = term, .stdout = stdout, .stderr = stderr }, .rejected = rejection != null };
+    }
 
-        if (!term.success()) return self.fail(stderr);
+    fn writePreparedInput(io: Io, pipe: Io.File, data: []const u8) !void {
+        try pipe.writeStreamingAll(io, data);
     }
 
     /// atomically create a layer and advance the internal tip guard

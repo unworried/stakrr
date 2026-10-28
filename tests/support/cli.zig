@@ -47,3 +47,32 @@ pub fn runAt(repo: *const Repo, args: []const []const u8, cwd: std.Io.Dir) !Run 
         .stderr = result.stderr,
     };
 }
+
+/// Put support/git_fault.sh first on PATH as `git` for publication faults.
+pub fn installFaultShim(repo: *const Repo) !void {
+    const result = try std.process.run(testing.allocator, testing.io, .{
+        .argv = &.{ "/bin/sh", "-c", "command -v git" },
+        .environ_map = repo.env,
+    });
+    defer repo.git.freeResult(result);
+    try testing.expect(result.term.success());
+    try repo.env.put("STAKRR_TEST_GIT", std.mem.trimEnd(u8, result.stdout, "\r\n"));
+    const common = try repo.git.path(&.{ "rev-parse", "--path-format=absolute", "--git-common-dir" });
+    defer testing.allocator.free(common);
+    const bin = try std.fs.path.join(testing.allocator, &.{ common, "test-bin" });
+    defer testing.allocator.free(bin);
+    try repo.tmp.dir.createDir(testing.io, bin, .default_dir);
+    const shim = try std.fs.path.join(testing.allocator, &.{ bin, "git" });
+    defer testing.allocator.free(shim);
+    try repo.tmp.dir.writeFile(testing.io, .{
+        .sub_path = shim,
+        .data = @embedFile("git_fault.sh"),
+        .flags = .{ .permissions = .executable_file },
+    });
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}:{s}", .{ bin, repo.env.get("PATH").? });
+    defer testing.allocator.free(path);
+    try repo.env.put("PATH", path);
+    const counter = try std.fs.path.join(testing.allocator, &.{ common, "test-fault-count" });
+    defer testing.allocator.free(counter);
+    try repo.env.put("STAKRR_TEST_COUNTER", counter);
+}

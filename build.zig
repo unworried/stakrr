@@ -51,6 +51,16 @@ pub fn build(b: *std.Build) void {
     // end-to-end tests drive the built binary
     const cli_options = b.addOptions();
     cli_options.addOptionPath("exe_path", exe.getEmittedBin());
+    const ref_driver = b.addExecutable(.{
+        .name = "ref-test-driver",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/support/ref_driver.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "stakrr", .module = mod }},
+        }),
+    });
+    cli_options.addOptionPath("ref_driver_path", ref_driver.getEmittedBin());
 
     const integration_tests = [_][]const u8{
         "tests/git_test.zig",
@@ -58,6 +68,7 @@ pub fn build(b: *std.Build) void {
         "tests/cut_test.zig",
         "tests/reset_test.zig",
         "tests/cli_test.zig",
+        "tests/ref_publication_test.zig",
     };
 
     for (integration_tests) |path| {

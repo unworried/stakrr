@@ -3,7 +3,7 @@ const testing = std.testing;
 const stack = @import("stakrr").stack;
 const Repo = @import("support/repo.zig").Repo;
 
-test "reset deletes symbolic stakrr refs without deleting their targets" {
+test "reset refuses symbolic stakrr refs without changing refs or config" {
     for ([_][]const u8{ "refs/stakrr/anchor", "refs/stakrr/tip", "refs/heads/stakrr/p1" }) |ref_name| {
         var repo = try Repo.init();
         defer repo.deinit();
@@ -14,10 +14,20 @@ test "reset deletes symbolic stakrr refs without deleting their targets" {
         defer testing.allocator.free(b);
         try stack.cut(&repo.git, "p1", null);
 
-        // Even corrupt refs must not let reset escape its own namespace.
+        // Ref identity must survive refusal, even when the OID matches.
         try repo.exec(&.{ "symbolic-ref", ref_name, "refs/heads/work" });
         const delete_layers = std.mem.startsWith(u8, ref_name, "refs/heads/");
-        _ = try stack.reset(&repo.git, delete_layers);
+        const refs = try repo.git.outputRaw(&.{ "for-each-ref", "--format=%(refname)%09%(objectname)%09%(symref)" });
+        defer testing.allocator.free(refs);
+        const config = try repo.git.outputRaw(&.{ "config", "--local", "--null", "--list" });
+        defer testing.allocator.free(config);
+        try testing.expectError(error.GitFailed, stack.reset(&repo.git, delete_layers));
+        const refs_after = try repo.git.outputRaw(&.{ "for-each-ref", "--format=%(refname)%09%(objectname)%09%(symref)" });
+        defer testing.allocator.free(refs_after);
+        const config_after = try repo.git.outputRaw(&.{ "config", "--local", "--null", "--list" });
+        defer testing.allocator.free(config_after);
+        try testing.expectEqualStrings(refs, refs_after);
+        try testing.expectEqualStrings(config, config_after);
 
         const work = try repo.git.readRef("refs/heads/work");
         defer if (work) |value| testing.allocator.free(value);
@@ -27,10 +37,10 @@ test "reset deletes symbolic stakrr refs without deleting their targets" {
         defer if (main) |value| testing.allocator.free(value);
         try testing.expect(main != null);
         try testing.expectEqualStrings(base, main.?);
-        try repo.expectNoRef(ref_name);
+        try repo.expectOutput(&.{ "symbolic-ref", "--no-recurse", ref_name }, "refs/heads/work");
         const state = try repo.git.configGet(stack.state_key);
         defer if (state) |value| testing.allocator.free(value);
-        try testing.expect(state == null);
+        try testing.expect(state != null);
     }
 }
 
