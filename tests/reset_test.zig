@@ -21,7 +21,7 @@ test "reset refuses symbolic stakrr refs without changing refs or config" {
         defer testing.allocator.free(refs);
         const config = try repo.git.outputRaw(&.{ "config", "--local", "--null", "--list" });
         defer testing.allocator.free(config);
-        try testing.expectError(error.GitFailed, stack.reset(&repo.git, delete_layers));
+        try testing.expectError(error.SymbolicRef, stack.reset(&repo.git, delete_layers));
         const refs_after = try repo.git.outputRaw(&.{ "for-each-ref", "--format=%(refname)%09%(objectname)%09%(symref)" });
         defer testing.allocator.free(refs_after);
         const config_after = try repo.git.outputRaw(&.{ "config", "--local", "--null", "--list" });

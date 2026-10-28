@@ -1,9 +1,11 @@
 //! Ref identity matters even when a symbolic ref resolves to the expected OID.
-//! Publication races must fail with GitFailed while preserving the symbolic
-//! ref and its target, even when the alias resolves to the expected OID.
+//! Discovery refuses symbolic refs before using their resolved values.
+//! Publication races must fail with GitFailed while preserving the alias.
 const std = @import("std");
 const testing = std.testing;
 const stakrr = @import("stakrr");
+const layout = stakrr.layout;
+const subject = "refs/heads/stakrr/models";
 const publication_ref = "refs/stakrr/publication-test";
 const Repo = @import("support/repo.zig").Repo;
 const cli = @import("support/cli.zig");
@@ -276,4 +278,228 @@ test "update refuses a symbolic ref substituted at publication" {
 
 test "delete refuses a symbolic ref substituted at publication" {
     try publication(.delete, true);
+}
+
+fn setup(repo: *const Repo) !void {
+    testing.allocator.free(try repo.initStack());
+    testing.allocator.free(try repo.commit("models"));
+    try stakrr.stack.cut(&repo.git, "models", null);
+}
+
+fn reset(repo: *const Repo, delete_layers: bool) !void {
+    _ = try stakrr.stack.reset(&repo.git, delete_layers);
+}
+
+fn resetRef(name: []const u8) !void {
+    var failed = false;
+    for ([_]bool{ false, true }) |delete_layers| {
+        for ([_]bool{ false, true }) |dangling| {
+            eachFormat(resetRefCase, .{ name, delete_layers, dangling }) catch {
+                std.debug.print("reset case (delete_layers={}, dangling={}) failed\n", .{ delete_layers, dangling });
+                failed = true;
+            };
+        }
+    }
+    if (failed) return error.TestUnexpectedResult;
+}
+
+fn resetRefCase(format: []const u8, name: []const u8, delete_layers: bool, dangling: bool) !void {
+    var repo = try Repo.initOptions(.{ .object_format = format });
+    defer repo.deinit();
+    try setup(&repo);
+    try dirty(&repo);
+    const old = (try repo.git.readRef(name)).?;
+    defer testing.allocator.free(old);
+    try alias(&repo, name, if (dangling) null else old);
+    var before = try Snapshot.capture(&repo);
+    defer before.deinit();
+
+    const result = reset(&repo, delete_layers);
+    try before.expectUnchanged(&repo);
+    try expectSymbolic(&repo, name);
+    if (dangling) try expectAbsent(&repo, victim) else try expectDirect(&repo, victim, old);
+    try testing.expectError(error.SymbolicRef, result);
+}
+
+test "reset refuses symbolic layer branches including dangling refs and kept layers" {
+    try resetRef(subject);
+}
+
+test "reset refuses a symbolic tip including a dangling ref" {
+    try resetRef(layout.tip_ref);
+}
+
+test "reset refuses a symbolic anchor including a dangling ref" {
+    try resetRef(layout.anchor_ref);
+}
+
+test "init refuses a symbolic work branch without adopting its target" {
+    for (formats) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+        const old = try repo.initWork();
+        defer testing.allocator.free(old);
+        try alias(&repo, "refs/heads/work", old);
+        var before = try Snapshot.capture(&repo);
+        defer before.deinit();
+        try testing.expectError(error.SymbolicRef, stakrr.stack.initStack(&repo.git, "main"));
+        try before.expectUnchanged(&repo);
+        try expectSymbolic(&repo, "refs/heads/work");
+        try expectDirect(&repo, victim, old);
+    }
+}
+
+test "reset refuses an orphan dangling symbolic layer without a record" {
+    for (formats) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+        try setup(&repo);
+        try alias(&repo, "refs/heads/stakrr/orphan/nested", null);
+        var before = try Snapshot.capture(&repo);
+        defer before.deinit();
+        try testing.expectError(error.SymbolicRef, reset(&repo, true));
+        try before.expectUnchanged(&repo);
+        try expectSymbolic(&repo, "refs/heads/stakrr/orphan/nested");
+        try expectAbsent(&repo, victim);
+    }
+}
+
+test "prefix discovery preserves unrelated symbolic refs and supports packed refs" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try setup(&repo);
+    try repo.exec(&.{ "pack-refs", "--all", "--prune" });
+    try repo.exec(&.{ "symbolic-ref", "refs/remotes/origin/HEAD", "refs/heads/main" });
+    try repo.exec(&.{ "symbolic-ref", "refs/heads/unrelated", "refs/heads/missing" });
+    try reset(&repo, true);
+    try repo.expectOutput(&.{ "symbolic-ref", "refs/remotes/origin/HEAD" }, "refs/heads/main");
+    try repo.expectOutput(&.{ "symbolic-ref", "refs/heads/unrelated" }, "refs/heads/missing");
+    try expectAbsent(&repo, subject);
+}
+
+test "reftable prefix discovery refuses safely while explicit ref transactions remain supported" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    const old = try repo.commit("old");
+    defer testing.allocator.free(old);
+    const migrated = try repo.git.run(&.{ "refs", "migrate", "--ref-format=reftable" });
+    defer repo.git.freeResult(migrated);
+    if (!migrated.term.success()) {
+        // refs migrate is unavailable on the older Git versions we support.
+        if (std.mem.indexOf(u8, migrated.stderr, "not a git command") != null or
+            std.mem.indexOf(u8, migrated.stderr, "unknown subcommand") != null)
+            return error.SkipZigTest;
+        return error.GitFailed;
+    }
+    try repo.exec(&.{ "symbolic-ref", "refs/heads/stakrr/orphan", "refs/heads/missing" });
+    try testing.expectError(error.UnsupportedRefStorage, repo.git.listRefs(layout.layer_prefix));
+    try repo.git.transact("reftable direct publication", &.{.{ .create = .{ .name = "refs/stakrr/direct", .oid = old } }});
+    try expectDirect(&repo, "refs/stakrr/direct", old);
+    try repo.expectOutput(&.{ "symbolic-ref", "refs/heads/stakrr/orphan" }, "refs/heads/missing");
+}
+
+test "full ref reads and commit resolution reject direct and dangling symbolic aliases" {
+    for (formats) |format| {
+        for ([_]bool{ false, true }) |dangling| {
+            var repo = try Repo.initOptions(.{ .object_format = format });
+            defer repo.deinit();
+            const old = try repo.commit("old");
+            defer testing.allocator.free(old);
+            try alias(&repo, subject, if (dangling) null else old);
+            var diagnostics: stakrr.git.Diagnostics = .{};
+            repo.git.diagnostics = &diagnostics;
+            var before = try Snapshot.capture(&repo);
+            defer before.deinit();
+
+            try testing.expectError(error.SymbolicRef, repo.git.readRef(subject));
+            try testing.expectError(error.SymbolicRef, repo.git.resolveCommit(subject));
+            try testing.expectError(error.SymbolicRef, repo.git.listRefs(layout.layer_prefix));
+            try testing.expect(std.mem.indexOf(u8, diagnostics.stderr(), subject) != null);
+            try testing.expect(std.mem.indexOf(u8, diagnostics.stderr(), victim) != null);
+            try before.expectUnchanged(&repo);
+            try expectSymbolic(&repo, subject);
+            try repo.expectRef("HEAD", old);
+        }
+    }
+}
+
+test "head preserves its immediate target while currentBranch refuses nested aliases" {
+    for (formats) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+        const old = try repo.commit("old");
+        defer testing.allocator.free(old);
+        try repo.exec(&.{ "symbolic-ref", "refs/heads/alias", "refs/heads/main" });
+        try repo.exec(&.{ "symbolic-ref", "refs/heads/outer", "refs/heads/alias" });
+        try repo.exec(&.{ "symbolic-ref", "HEAD", "refs/heads/outer" });
+        const head = (try repo.git.head()).?;
+        defer testing.allocator.free(head);
+        try testing.expectEqualStrings("refs/heads/outer", head);
+        try testing.expectError(error.SymbolicRef, repo.git.currentBranch());
+        try repo.expectRef("HEAD", old);
+        try repo.expectOutput(&.{ "symbolic-ref", "--no-recurse", "HEAD" }, "refs/heads/outer");
+    }
+}
+
+test "init refuses a symbolic base without adopting its target or changing state" {
+    for (formats) |format| {
+        for ([_]bool{ false, true }) |dangling| {
+            var repo = try Repo.initOptions(.{ .object_format = format });
+            defer repo.deinit();
+            const old = try repo.initWork();
+            defer testing.allocator.free(old);
+            try alias(&repo, "refs/heads/main", if (dangling) null else old);
+            try dirty(&repo);
+            var before = try Snapshot.capture(&repo);
+            defer before.deinit();
+            try testing.expectError(error.SymbolicRef, stakrr.stack.initStack(&repo.git, "main"));
+            try before.expectUnchanged(&repo);
+            try expectSymbolic(&repo, "refs/heads/main");
+        }
+    }
+}
+
+test "linked worktree discovery checks shared loose refs and ignores lock files" {
+    for (formats) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+        const old = try repo.commit("old");
+        defer testing.allocator.free(old);
+        try restore(&repo, subject, old);
+        try repo.exec(&.{ "worktree", "add", "-q", "-b", "linked", ".git/linked worktree" });
+        const dir = try repo.tmp.dir.openDir(testing.io, ".git/linked worktree", .{});
+        defer dir.close(testing.io);
+        var git = repo.git;
+        git.cwd = dir;
+        try repo.tmp.dir.writeFile(testing.io, .{
+            .sub_path = ".git/refs/heads/stakrr/probe.lock",
+            .data = "ref: refs/heads/missing\n",
+        });
+        var refs = try git.listRefs(layout.layer_prefix);
+        defer refs.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 1), refs.refs.len);
+        try testing.expectEqualStrings(subject, refs.refs[0].name);
+        try testing.expectEqualStrings(old, refs.refs[0].oid);
+        try alias(&repo, "refs/heads/stakrr/nested/orphan", null);
+        try testing.expectError(error.SymbolicRef, git.listRefs(layout.layer_prefix));
+        try expectSymbolic(&repo, "refs/heads/stakrr/nested/orphan");
+    }
+}
+
+test "CLI reports the symbolic ref and target while preserving user work" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try setup(&repo);
+    try alias(&repo, layout.tip_ref, null);
+    try dirty(&repo);
+    var before = try Snapshot.capture(&repo);
+    defer before.deinit();
+    const result = try cli.run(&repo, &.{"status"});
+    defer result.deinit();
+    try testing.expectEqual(@as(?u8, 1), result.code);
+    try testing.expect(std.mem.indexOf(u8, result.stderr, "managed refs must be direct") != null);
+    try testing.expect(std.mem.indexOf(u8, result.stderr, layout.tip_ref) != null);
+    try testing.expect(std.mem.indexOf(u8, result.stderr, victim) != null);
+    try before.expectUnchanged(&repo);
+    try expectSymbolic(&repo, layout.tip_ref);
 }

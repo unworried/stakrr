@@ -33,6 +33,24 @@ preserving author, committer, message and other metadata while dropping
 invalidated signatures and merge tags. Both operations leave refs, HEAD,
 the index and working files in place.
 
+## Ref discovery
+
+Managed branches and internal refs must be direct refs. Reject symbolic aliases
+when reading full ref names or resolving them to commits, even when their target
+has the expected object ID or is missing. Read HEAD's immediate target without
+following branch aliases; commands requiring a current branch reject those aliases.
+Ordinary symbolic HEAD and Git operation pseudorefs keep their usual behavior.
+
+Prefix discovery checks loose ref names as well as `for-each-ref` output, because
+Git omits dangling symbolic refs from its listings. Inspect only names under the
+requested prefix, ignore lock files, and support packed refs. In linked worktrees,
+use Git's resolved refs directory. Refuse discovery on ref storage other than
+Git's files backend rather than overlooking dangling aliases.
+
+`init`, `status`, `cut`, navigation and `reset` refuse managed symbolic refs
+without changing refs, config, HEAD, the index or user files. Reset also refuses
+symbolic layer refs when keeping layers. Restore direct refs before retrying.
+
 ## Ref publication
 
 Publish with `update-ref --no-deref --stdin`, full object IDs and explicit

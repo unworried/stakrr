@@ -18,6 +18,7 @@ pub const Error = error{
     InvalidGitOutput,
     StreamTooLong,
     UnsupportedGitVersion,
+    UnsupportedRefStorage,
 };
 
 /// Optional sink for the stderr of the last failed Git command.
@@ -218,8 +219,9 @@ pub const Git = struct {
         return error.SymbolicRef;
     }
 
-    /// read the exact ref oid. a missing ref is distinct from a git failure
+    /// Read a direct ref OID, distinguishing absence from a Git failure.
     pub fn readRef(self: *const Git, ref_name: []const u8) !?[]u8 {
+        if (std.mem.startsWith(u8, ref_name, "refs/")) try self.requireDirectRef(ref_name);
         return self.query(&.{
             "rev-parse",
             "--verify",
@@ -285,18 +287,24 @@ pub const Git = struct {
             return error.NotWorkingTree;
     }
 
-    /// The full current branch ref, or null when HEAD is detached.
+    /// HEAD's immediate symbolic target, without following branch aliases;
+    /// null when HEAD is detached.
     pub fn head(self: *const Git) !?[]u8 {
-        return self.query(&.{ "symbolic-ref", "--quiet", "HEAD" }, 1);
+        return self.query(&.{ "symbolic-ref", "--quiet", "--no-recurse", "HEAD" }, 1);
     }
 
-    /// Like `head`, but a detached HEAD is an error.
+    /// Require an attached HEAD whose immediate target is a direct branch ref.
+    /// Reject detached HEADs and symbolic branch aliases.
     pub fn currentBranch(self: *const Git) ![]u8 {
-        return (try self.head()) orelse error.DetachedHead;
+        const name = (try self.head()) orelse return error.DetachedHead;
+        errdefer self.allocator.free(name);
+        try self.requireDirectRef(name);
+        return name;
     }
 
     /// resolve a revision to an actual commit oid
     pub fn resolveCommit(self: *const Git, revision: []const u8) ![]u8 {
+        if (std.mem.startsWith(u8, revision, "refs/")) try self.requireDirectRef(revision);
         const peeled = try std.fmt.allocPrint(
             self.allocator,
             "{s}^{{commit}}",
@@ -355,9 +363,17 @@ pub const Git = struct {
     };
 
     pub fn listRefs(self: *const Git, prefix: []const u8) !RefList {
+        const storage = try self.configGet("extensions.refStorage");
+        defer if (storage) |name| self.allocator.free(name);
+        if (storage) |name| {
+            if (!std.mem.eql(u8, name, "files")) return error.UnsupportedRefStorage;
+        }
+        // Git omits dangling symbolic refs from for-each-ref. Inspect loose
+        // names as well, letting Git interpret symbolic-ref candidates.
+        try self.requireDirectLooseRefs(prefix);
         const raw = try self.output(&.{
             "for-each-ref",
-            "--format=%(refname)%09%(objectname)",
+            "--format=%(refname)%09%(objectname)%09%(symref)",
             prefix,
         });
         errdefer self.allocator.free(raw);
@@ -368,11 +384,45 @@ pub const Git = struct {
         while (lines.next()) |line| {
             const tab = std.mem.indexOfScalar(u8, line, '\t') orelse
                 return error.InvalidGitOutput;
-            const oid = line[tab + 1 ..];
+            const last_tab = std.mem.lastIndexOfScalar(u8, line, '\t') orelse return error.InvalidGitOutput;
+            if (last_tab == tab) return error.InvalidGitOutput;
+            if (last_tab + 1 != line.len) return error.SymbolicRef;
+            const oid = line[tab + 1 .. last_tab];
             if (!isOid(oid)) return error.InvalidGitOutput;
             try refs.append(self.allocator, .{ .name = line[0..tab], .oid = oid });
         }
         return .{ .raw = raw, .refs = try refs.toOwnedSlice(self.allocator) };
+    }
+
+    fn requireDirectLooseRefs(self: *const Git, prefix: []const u8) !void {
+        const root = try self.path(&.{ "rev-parse", "--git-path", "refs" });
+        defer self.allocator.free(root);
+        const cwd = self.cwd orelse Io.Dir.cwd();
+        var dir = cwd.openDir(self.io, root, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close(self.io);
+        var walker = try dir.walk(self.allocator);
+        defer walker.deinit();
+        while (try walker.next(self.io)) |entry| {
+            if (entry.kind == .directory) continue;
+            const name = try std.fmt.allocPrint(self.allocator, "refs/{s}", .{entry.path});
+            defer self.allocator.free(name);
+            if (!std.mem.startsWith(u8, name, prefix) or std.mem.endsWith(u8, name, ".lock")) continue;
+            if (entry.kind == .sym_link) {
+                try self.requireDirectRef(name);
+                continue;
+            }
+            const file = entry.dir.openFile(self.io, entry.basename, .{}) catch |err| switch (err) {
+                error.FileNotFound => continue, // a concurrent pack/prune removed the loose copy
+                else => return err,
+            };
+            defer file.close(self.io);
+            var header: [4]u8 = undefined;
+            const len = try file.readPositionalAll(self.io, &header, 0);
+            if (len == header.len and std.mem.eql(u8, &header, "ref:")) try self.requireDirectRef(name);
+        }
     }
 
     pub const ExpectedRef = struct {
