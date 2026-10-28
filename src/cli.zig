@@ -1,15 +1,21 @@
 //! command-line parsing. pure: no git, no output
 const std = @import("std");
+const stakrr = @import("stakrr");
+const stack = stakrr.stack;
+const edit = stakrr.edit;
 
 pub const Command = union(enum) {
     help,
     version,
     init: struct { base: []const u8 },
     status,
+    log,
+    undo,
     cut: struct { name: []const u8, at: ?[]const u8 = null },
-    reset: struct { delete_layers: bool = false },
-    up,
-    down,
+    reset: stack.ResetOptions,
+    navigate: stack.Direction,
+    go: []const u8,
+    edit: edit.Request,
 };
 
 pub const ParseError = error{ InvalidArguments, UnknownCommand };
@@ -34,6 +40,16 @@ pub fn parseArgs(args: []const []const u8) ParseError!Command {
         if (rest.len == 1 and std.mem.startsWith(u8, rest[0], "--base="))
             return .{ .init = .{ .base = try value(rest[0]["--base=".len..]) } };
         return error.InvalidArguments;
+    }
+
+    if (eql(command, "undo")) {
+        if (rest.len != 0) return error.InvalidArguments;
+        return .undo;
+    }
+
+    if (eql(command, "log")) {
+        if (rest.len != 0) return error.InvalidArguments;
+        return .log;
     }
 
     if (eql(command, "status")) {
@@ -66,6 +82,23 @@ pub fn parseArgs(args: []const []const u8) ParseError!Command {
         } };
     }
 
+    if (eql(command, "go")) {
+        if (rest.len != 1) return error.InvalidArguments;
+        return .{ .go = try value(rest[0]) };
+    }
+
+    inline for (.{
+        .{ "restack", edit.Request.restack },
+        .{ "continue", edit.Request.continue_edit },
+        .{ "abort", edit.Request.abort },
+        .{ "quit", edit.Request.quit },
+    }) |entry| {
+        if (eql(command, entry[0])) {
+            if (rest.len != 0) return error.InvalidArguments;
+            return .{ .edit = entry[1] };
+        }
+    }
+
     if (eql(command, "reset")) {
         if (rest.len == 0) return .{ .reset = .{} };
         if (rest.len == 1 and eql(rest[0], "--delete-layers"))
@@ -73,14 +106,9 @@ pub fn parseArgs(args: []const []const u8) ParseError!Command {
         return error.InvalidArguments;
     }
 
-    if (eql(command, "up")) {
+    if (std.meta.stringToEnum(stack.Direction, command)) |direction| {
         if (rest.len != 0) return error.InvalidArguments;
-        return .up;
-    }
-
-    if (eql(command, "down")) {
-        if (rest.len != 0) return error.InvalidArguments;
-        return .down;
+        return .{ .navigate = direction };
     }
 
     return error.UnknownCommand;
@@ -113,7 +141,10 @@ test "parseArgs: init" {
     try testing.expectEqualStrings("main", b.init.base);
 
     try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "init" }));
-    try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "init", "--base", "--x" }));
+    try testing.expectError(
+        error.InvalidArguments,
+        parseArgs(&.{ "stakrr", "init", "--base", "--x" }),
+    );
     try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "init", "--base=" }));
 }
 
@@ -140,6 +171,46 @@ test "parseArgs: status and reset" {
     try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "status", "x" }));
 
     try testing.expect(!(try parseArgs(&.{ "stakrr", "reset" })).reset.delete_layers);
-    try testing.expect((try parseArgs(&.{ "stakrr", "reset", "--delete-layers" })).reset.delete_layers);
+    try testing.expect(
+        (try parseArgs(&.{ "stakrr", "reset", "--delete-layers" })).reset.delete_layers,
+    );
     try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "reset", "--force" }));
+}
+
+test "parseArgs: up and down" {
+    try testing.expectEqual(stack.Direction.up, (try parseArgs(&.{ "stakrr", "up" })).navigate);
+    try testing.expectEqual(stack.Direction.down, (try parseArgs(&.{ "stakrr", "down" })).navigate);
+    try testing.expectError(error.InvalidArguments, parseArgs(&.{ "stakrr", "up", "2" }));
+}
+
+test "parseArgs: go and session verbs" {
+    try testing.expectEqual(edit.Request.restack, (try parseArgs(&.{ "stakrr", "restack" })).edit);
+    try testing.expectEqualStrings("models", (try parseArgs(&.{ "stakrr", "go", "models" })).go);
+    try testing.expectEqual(
+        edit.Request.continue_edit,
+        (try parseArgs(&.{ "stakrr", "continue" })).edit,
+    );
+    try testing.expectEqual(edit.Request.abort, (try parseArgs(&.{ "stakrr", "abort" })).edit);
+    try testing.expectEqual(edit.Request.quit, (try parseArgs(&.{ "stakrr", "quit" })).edit);
+    for ([_][]const []const u8{
+        &.{ "stakrr", "go" },
+        &.{ "stakrr", "go", "models", "api" },
+        &.{ "stakrr", "go", "--abort" },
+        &.{ "stakrr", "abort", "now" },
+        &.{ "stakrr", "restack", "models" },
+    }) |args| try testing.expectError(error.InvalidArguments, parseArgs(args));
+}
+
+test "parseArgs: the old edit command is gone" {
+    try testing.expectError(error.UnknownCommand, parseArgs(&.{ "stakrr", "edit" }));
+    try testing.expectError(error.UnknownCommand, parseArgs(&.{ "stakrr", "edit", "--abort" }));
+}
+
+test "parseArgs: log and undo reject extra arguments" {
+    try testing.expectEqual(Command.log, try parseArgs(&.{ "stakrr", "log" }));
+    try testing.expectEqual(Command.undo, try parseArgs(&.{ "stakrr", "undo" }));
+    for ([_][]const []const u8{
+        &.{ "stakrr", "log", "extra" },
+        &.{ "stakrr", "undo", "extra" },
+    }) |args| try testing.expectError(error.InvalidArguments, parseArgs(args));
 }

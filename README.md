@@ -153,3 +153,24 @@ using it.
 ---
 
 <sub>[changelog](CHANGELOG.md) · [contributing](CONTRIBUTING.md) · [mit](LICENSE)</sub>
+
+## // editing earlier cuts
+
+Use `stakrr go <cut>` to switch to a layer, then commit or amend with Git.
+`stakrr status` marks changed layers as stale. Run `stakrr restack` to replay
+what follows the changed layer and return to the branch where you started.
+Only one layer may be stale at a time. Replaying descendants requires a clean
+worktree with no ignored files.
+
+For a conflict, resolve files, stage them, and run `stakrr continue`. Preserve
+uncommitted resolutions before `stakrr abort`, which restores the original
+recorded boundaries. `stakrr quit` drops a pending session while retaining HEAD,
+branches and recovery history; the stack may then need `stakrr reset`.
+
+`stakrr log` shows retained checkpoints and rescue commits. `stakrr undo`
+reverses the last completed restack or undo, provided its published refs still
+match. Sessions belong to their originating worktree.
+
+Exit codes are 0 success, 1 failure, 2 usage, 3 replay conflict pending,
+4 dirty or ignored work or an active Git operation, and 5 externally changed
+edit or publication state.

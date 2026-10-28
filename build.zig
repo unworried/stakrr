@@ -69,6 +69,9 @@ pub fn build(b: *std.Build) void {
         "tests/reset_test.zig",
         "tests/cli_test.zig",
         "tests/symbolic_ref_test.zig",
+        "tests/edit_test.zig",
+        "tests/edit_recovery_test.zig",
+        "tests/undo_test.zig",
         "tests/transaction_test.zig",
     };
 

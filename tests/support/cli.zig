@@ -48,6 +48,14 @@ pub fn runAt(repo: *const Repo, args: []const []const u8, cwd: std.Io.Dir) !Run 
     };
 }
 
+/// run and require exit 0, printing stderr on failure
+pub fn expectSuccess(repo: *const Repo, args: []const []const u8) !void {
+    const result = try run(repo, args);
+    defer result.deinit();
+    if (result.code != 0) std.debug.print("stakrr stderr: {s}\n", .{result.stderr});
+    try testing.expectEqual(@as(?u8, 0), result.code);
+}
+
 /// Put support/git_fault.sh first on PATH as `git` for publication faults.
 pub fn installFaultShim(repo: *const Repo) !void {
     const result = try std.process.run(testing.allocator, testing.io, .{

@@ -23,8 +23,17 @@ pub const Style = enum {
     }
 };
 
-pub fn detect(io: Io, file: Io.File, env: *const std.process.Environ.Map) Io.Cancelable!Terminal.Mode {
-    return Terminal.Mode.detect(io, file, isSet(env, "NO_COLOR"), isSet(env, "CLICOLOR_FORCE"));
+pub fn detect(
+    io: Io,
+    file: Io.File,
+    env: *const std.process.Environ.Map,
+) Io.Cancelable!Terminal.Mode {
+    return Terminal.Mode.detect(
+        io,
+        file,
+        isSet(env, "NO_COLOR"),
+        isSet(env, "CLICOLOR_FORCE"),
+    );
 }
 
 /// set and non-empty, matching the NO_COLOR and CLICOLOR_FORCE conventions

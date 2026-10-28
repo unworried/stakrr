@@ -1,5 +1,14 @@
 #!/bin/sh
-# Test-only publication races and transport failures.
+# Test-only Git wrapper. Kill stakrr immediately before/after a chosen ref
+# checkpoint, or after a successful pick, to exercise persisted recovery.
+if [ "${STAKRR_TEST_OLD_MERGE_TREE:-}" = 1 ]; then
+    for arg do
+        if [ "$arg" = merge-tree ]; then
+            printf '%s\n' "error: unknown option 'merge-base'" >&2
+            exit 129
+        fi
+    done
+fi
 # Attempt a competing symbolic-ref write during the client's post-prepare
 # validation. The named ref must remain locked until commit or abort.
 if [ "${1:-}" = symbolic-ref ] && [ -n "${STAKRR_TEST_LOCK_REF:-}" ] &&
@@ -10,13 +19,21 @@ if [ "${1:-}" = symbolic-ref ] && [ -n "${STAKRR_TEST_LOCK_REF:-}" ] &&
         printf '%s' "$?" > "$STAKRR_TEST_LOCK_MARKER" || exit $?
     fi
 fi
+checkpoint=false
+pick=false
+archive=false
 update=false
 partial=false
 race=false
 for arg do
     [ "$arg" != update-ref ] || update=true
+    [ "$arg" != 'stakrr: edit checkpoint' ] || checkpoint=true
+    [ "$arg" != 'cherry-pick' ] || pick=true
     [ "$arg" != "${STAKRR_TEST_PARTIAL_LABEL:-}" ] || partial=true
     [ "$arg" != "${STAKRR_TEST_RACE_LABEL:-}" ] || race=true
+    case "$arg" in
+        'stakrr: restack'|'stakrr: abort restack'|'stakrr: quit edit'|'stakrr: undo edit') archive=true ;;
+    esac
 done
 # Read the full request before injecting a transport failure, so cleanup tests
 # do not depend on a blocked input writer or the scheduling of short pipe writes.
@@ -96,4 +113,29 @@ EOF
     { printf '%s' "$payload"; cat; } | "$STAKRR_TEST_GIT" "$@"
     exit $?
 fi
-exec "$STAKRR_TEST_GIT" "$@"
+[ "$update" = true ] || archive=false
+fault=${STAKRR_TEST_FAULT:-}
+if [ "$checkpoint" = true ] && [ -n "$fault" ]; then
+    count=0
+    [ ! -f "$STAKRR_TEST_COUNTER" ] || read -r count < "$STAKRR_TEST_COUNTER"
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$STAKRR_TEST_COUNTER"
+    if [ "$fault" = "before:$count" ]; then
+        kill -KILL "$PPID"
+        exit 1
+    fi
+fi
+if [ "$archive" = true ] && [ "$fault" = before:archive ]; then
+    kill -KILL "$PPID"
+    exit 1
+fi
+"$STAKRR_TEST_GIT" "$@"
+result=$?
+if [ "$result" = 0 ]; then
+    if { [ "$checkpoint" = true ] && [ "$fault" = "after:$count" ]; } ||
+       { [ "$pick" = true ] && [ "$fault" = pick ]; } ||
+       { [ "$archive" = true ] && [ "$fault" = after:archive ]; }; then
+        kill -KILL "$PPID"
+    fi
+fi
+exit "$result"
