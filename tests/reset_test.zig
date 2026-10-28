@@ -18,6 +18,37 @@ fn refExists(repo: *const Repo, ref_name: []const u8) !bool {
     return oid != null;
 }
 
+test "reset deletes symbolic stakrr refs without deleting their targets" {
+    for ([_][]const u8{ "refs/stakrr/anchor", "refs/stakrr/tip", "refs/heads/stakrr/p1" }) |ref_name| {
+        var repo = try Repo.init();
+        defer repo.deinit();
+
+        const base = try initialize(&repo);
+        defer testing.allocator.free(base);
+        const b = try repo.commit("B");
+        defer testing.allocator.free(b);
+        try stack.cut(&repo.git, "p1", null);
+
+        // Even corrupt refs must not let reset escape its own namespace.
+        try repo.exec(&.{ "symbolic-ref", ref_name, "refs/heads/work" });
+        const delete_layers = std.mem.startsWith(u8, ref_name, "refs/heads/");
+        _ = try stack.reset(&repo.git, delete_layers);
+
+        const work = try repo.git.readRef("refs/heads/work");
+        defer if (work) |value| testing.allocator.free(value);
+        try testing.expect(work != null);
+        try testing.expectEqualStrings(b, work.?);
+        const main = try repo.git.readRef("refs/heads/main");
+        defer if (main) |value| testing.allocator.free(value);
+        try testing.expect(main != null);
+        try testing.expectEqualStrings(base, main.?);
+        try testing.expect(!try refExists(&repo, ref_name));
+        const state = try repo.git.configGet(stack.state_key);
+        defer if (state) |value| testing.allocator.free(value);
+        try testing.expect(state == null);
+    }
+}
+
 test "reset on an uninitialized repository reports NotInitialized" {
     var repo = try Repo.init();
     defer repo.deinit();
