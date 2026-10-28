@@ -475,15 +475,14 @@ pub fn reset(git: *const Git, delete_layers: bool) !ResetResult {
         } });
     }
 
-    // deleting a checked-out branch would leave HEAD pointing nowhere
+    // Shared refs may be checked out in any worktree, including when this
+    // worktree has a detached HEAD. NUL fields keep unusual paths unambiguous.
     if (delete_layers and layer_count != 0) {
-        const head: ?[]u8 = git.currentBranch() catch |err| switch (err) {
-            error.DetachedHead => null,
-            else => return err,
-        };
-        defer if (head) |ref_name| allocator.free(ref_name);
-        if (head) |ref_name| {
-            if (std.mem.startsWith(u8, ref_name, git_mod.layer_prefix))
+        const worktrees = try git.output(&.{ "worktree", "list", "--porcelain", "-z" });
+        defer allocator.free(worktrees);
+        var fields = std.mem.splitScalar(u8, worktrees, 0);
+        while (fields.next()) |field| {
+            if (std.mem.startsWith(u8, field, "branch " ++ git_mod.layer_prefix))
                 return error.LayerCheckedOut;
         }
     }
