@@ -139,7 +139,7 @@ fn interrupt(repo: *Repo, args: []const []const u8, label: []const u8, count: []
 
 test "cut resumes before its first write after partial publication and after interrupted cleanup" {
     for ([_][]const u8{ "sha1", "sha256" }) |format| {
-        for ([_][]const u8{ "0", "1", "2", "cleanup" }) |phase| {
+        for ([_][]const u8{ "0", "1", "2", "3", "cleanup" }) |phase| {
             var repo = try Repo.initOptions(.{ .object_format = format });
             defer repo.deinit();
             try setup(&repo);
@@ -158,11 +158,12 @@ test "cut resumes before its first write after partial publication and after int
             const status = try cli.run(&repo, &.{"status"});
             defer status.deinit();
             // A fully published operation awaiting cleanup is safe to inspect.
-            try testing.expectEqual(@as(?u8, if (cleanup or std.mem.eql(u8, phase, "2")) 0 else 1), status.code);
+            try testing.expectEqual(@as(?u8, if (cleanup or std.mem.eql(u8, phase, "3")) 0 else 1), status.code);
             try repo.expectOutput(&.{"show-ref"}, refs);
             try expectSuccess(&repo, &.{"up"});
             try repo.expectNoRef(intent_ref);
             try repo.expectRef("refs/heads/stakrr/rolling", head);
+            try repo.expectRef("refs/stakrr/layers/rolling", head);
             try repo.expectRef("refs/stakrr/tip", head);
             try repo.expectRef("HEAD", head);
             try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/work");

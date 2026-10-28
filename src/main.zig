@@ -73,7 +73,7 @@ fn runCommand(
             try stdout.writeByte('\n');
         },
         .reset => |options| {
-            const result = try stack.reset(git, options.delete_layers);
+            const result = try stack.reset(git, .{ .delete_layers = options.delete_layers });
             try stdout.writeAll("stack reset\n");
             if (result.deleted_layers != 0)
                 try stdout.print("deleted {d} layer {s}\n", .{
@@ -181,6 +181,11 @@ fn userError(err: anyerror) ?[]const u8 {
         error.OutOfMemory => "out of memory",
         error.MutationInProgress => "another stakrr mutation is running",
         error.NotOnStackBranch => "current branch is outside the configured stack",
+        error.EditInProgress => "a restack is pending (finish with 'stakrr continue' or 'stakrr abort')",
+        error.DirtyWorkTree => "preserve uncommitted changes before proceeding",
+        error.IgnoredFilesPresent => "preserve and remove ignored files before replaying descendants",
+        error.UnknownCut => "cut not found (use its short name)",
+        error.StaleLayers => "a layer has commits that are not restacked yet (run 'stakrr restack')",
         else => null,
     };
 }

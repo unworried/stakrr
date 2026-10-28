@@ -287,7 +287,7 @@ fn setup(repo: *const Repo) !void {
 }
 
 fn reset(repo: *const Repo, delete_layers: bool) !void {
-    _ = try stakrr.stack.reset(&repo.git, delete_layers);
+    _ = try stakrr.stack.reset(&repo.git, .{ .delete_layers = delete_layers });
 }
 
 fn resetRef(name: []const u8) !void {

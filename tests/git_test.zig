@@ -1,4 +1,5 @@
 const std = @import("std");
+const layout = @import("stakrr").layout;
 const testing = std.testing;
 
 const stakrr_git = @import("stakrr").git;
@@ -782,5 +783,115 @@ test "mergeTree distinguishes unsupported options from fatal Git errors" {
         try testing.expectError(case.expected, git.mergeTree(valid, valid, valid));
         if (case.expected == error.GitFailed)
             try testing.expectEqualStrings("fatal: injected failure", diagnostics.stderr());
+    }
+}
+
+test "Git paths preserve trailing newline bytes" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    const path = try repo.git.path(&.{ "rev-parse", "--git-path", "trailing\n\n" });
+    defer testing.allocator.free(path);
+    try testing.expectEqualStrings(".git/trailing\n\n", path);
+}
+
+test "ensureWorkTree rejects an invalid repository" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // prevent git from discovering an enclosing repository
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = ".git",
+        .data = "gitdir: does-not-exist\n",
+    });
+
+    const env = try support.hermeticEnv();
+    defer support.destroyEnv(env);
+
+    const git = Git{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .cwd = tmp.dir,
+        .environ_map = env,
+    };
+
+    try testing.expectError(
+        error.NotGitRepository,
+        git.ensureWorkTree(),
+    );
+}
+
+test "configGet rejects trailing empty values and embedded newlines" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    for ([_][]const u8{ "", "\n", "\r\n" }) |suffix| {
+        try repo.exec(&.{ "config", "--local", "--replace-all", layout.state_key, "v1 refs/heads/main refs/heads/work" });
+        try repo.exec(&.{ "config", "--local", "--add", layout.state_key, suffix });
+        try testing.expectError(error.InvalidGitConfig, repo.git.configGet(layout.state_key));
+    }
+    try repo.exec(&.{ "config", "--local", "--replace-all", layout.state_key, "v1 refs/heads/main refs/heads/work\n" });
+    try testing.expectError(error.InvalidGitConfig, repo.git.configGet(layout.state_key));
+}
+
+test "publication intent retains annotated tags through pruning" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    const commit = try repo.commit("target");
+    defer testing.allocator.free(commit);
+    try repo.exec(&.{ "tag", "-a", "snapshot", "-m", "annotated snapshot", commit });
+    const tag = (try repo.git.readRef("refs/tags/snapshot")).?;
+    defer testing.allocator.free(tag);
+    try repo.tmp.dir.createDir(testing.io, ".git/ref-hooks", .default_dir);
+    try repo.tmp.dir.writeFile(testing.io, .{
+        .sub_path = ".git/ref-hooks/reference-transaction",
+        .flags = .{ .permissions = .executable_file },
+        // Permit the intent, then refuse both publication and cancellation.
+        .data = "#!/bin/sh\n[ \"$1\" = prepared ] || exit 0\n" ++
+            "while read -r old new ref; do\n" ++
+            "  case \"$old $ref\" in\n" ++
+            "    '0000000000000000000000000000000000000000 refs/stakrr/transaction') exit 0 ;;\n" ++
+            "  esac\ndone\nexit 1\n",
+    });
+    try repo.exec(&.{ "config", "core.hooksPath", ".git/ref-hooks" });
+    try testing.expectError(error.GitFailed, repo.git.transact("tag copies", &.{
+        .{ .create = .{ .name = "refs/stakrr/copy-a", .oid = tag } },
+        .{ .create = .{ .name = "refs/stakrr/copy-b", .oid = tag } },
+    }));
+    try testing.expect(try repo.hasRef(layout.transaction_ref));
+    try repo.exec(&.{ "config", "core.hooksPath", "/dev/null" });
+    try repo.exec(&.{ "update-ref", "-d", "refs/tags/snapshot", tag });
+    try repo.exec(&.{ "reflog", "expire", "--expire=now", "--all" });
+    try repo.exec(&.{ "gc", "--prune=now" });
+    try testing.expectError(error.GitFailed, repo.git.output(&.{ "cat-file", "-t", tag }));
+    try repo.git.transact("resume tag copies", &.{});
+    try repo.expectRef("refs/stakrr/copy-a", tag);
+    try repo.expectRef("refs/stakrr/copy-b", tag);
+    try repo.expectNoRef(layout.transaction_ref);
+    try repo.exec(&.{ "fsck", "--no-reflogs" });
+}
+
+test "journaled transactions preserve Git zero-OID absence and deletion semantics" {
+    for ([_][]const u8{ "sha1", "sha256" }) |format| {
+        var repo = try Repo.initOptions(.{ .object_format = format });
+        defer repo.deinit();
+        const blob = try repo.git.writeBlob("ref contents");
+        defer testing.allocator.free(blob);
+        const zero = try testing.allocator.alloc(u8, blob.len);
+        defer testing.allocator.free(zero);
+        @memset(zero, '0');
+        try repo.git.transact("verify absence and create", &.{
+            .{ .verify = .{ .name = "refs/stakrr/absent", .oid = zero } },
+            .{ .create = .{ .name = "refs/stakrr/a", .oid = blob } },
+            .{ .create = .{ .name = "refs/stakrr/b", .oid = blob } },
+        });
+        try repo.expectRef("refs/stakrr/a", blob);
+        try repo.expectRef("refs/stakrr/b", blob);
+        try repo.git.transact("delete with zero OIDs", &.{
+            .{ .update = .{ .name = "refs/stakrr/a", .new = zero, .old = blob } },
+            .{ .update = .{ .name = "refs/stakrr/b", .new = zero, .old = blob } },
+        });
+        try repo.expectNoRef("refs/stakrr/a");
+        try repo.expectNoRef("refs/stakrr/b");
+        try repo.expectNoRef(layout.transaction_ref);
     }
 }

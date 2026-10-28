@@ -21,7 +21,7 @@ test "reset refuses symbolic stakrr refs without changing refs or config" {
         defer testing.allocator.free(refs);
         const config = try repo.git.outputRaw(&.{ "config", "--local", "--null", "--list" });
         defer testing.allocator.free(config);
-        try testing.expectError(error.SymbolicRef, stack.reset(&repo.git, delete_layers));
+        try testing.expectError(error.SymbolicRef, stack.reset(&repo.git, .{ .delete_layers = delete_layers }));
         const refs_after = try repo.git.outputRaw(&.{ "for-each-ref", "--format=%(refname)%09%(objectname)%09%(symref)" });
         defer testing.allocator.free(refs_after);
         const config_after = try repo.git.outputRaw(&.{ "config", "--local", "--null", "--list" });
@@ -38,7 +38,7 @@ test "reset refuses symbolic stakrr refs without changing refs or config" {
         try testing.expect(main != null);
         try testing.expectEqualStrings(base, main.?);
         try repo.expectOutput(&.{ "symbolic-ref", "--no-recurse", ref_name }, "refs/heads/work");
-        const state = try repo.git.configGet(stack.state_key);
+        const state = try repo.git.configGet(@import("stakrr").layout.state_key);
         defer if (state) |value| testing.allocator.free(value);
         try testing.expect(state != null);
     }
@@ -53,7 +53,7 @@ test "reset on an uninitialized repository reports NotInitialized" {
 
     try testing.expectError(
         error.NotInitialized,
-        stack.reset(&repo.git, false),
+        stack.reset(&repo.git, .{ .delete_layers = false }),
     );
 }
 
@@ -68,7 +68,7 @@ test "reset keeps layers by default and blocks re-init until they go" {
     defer testing.allocator.free(b);
     try stack.cut(&repo.git, "p1", null);
 
-    const result = try stack.reset(&repo.git, false);
+    const result = try stack.reset(&repo.git, .{ .delete_layers = false });
     try testing.expectEqual(@as(usize, 1), result.kept_layers);
     try testing.expectEqual(@as(usize, 0), result.deleted_layers);
 
@@ -101,7 +101,7 @@ test "reset --delete-layers allows a clean re-init" {
     defer testing.allocator.free(c);
     try stack.cut(&repo.git, "p2", null);
 
-    const result = try stack.reset(&repo.git, true);
+    const result = try stack.reset(&repo.git, .{ .delete_layers = true });
     try testing.expectEqual(@as(usize, 2), result.deleted_layers);
     try repo.expectNoRef("refs/heads/stakrr/p1");
     try repo.expectNoRef("refs/heads/stakrr/p2");
@@ -129,7 +129,7 @@ test "reset recovers from corrupt and outdated state" {
         stack.inspect(&repo.git),
     );
 
-    _ = try stack.reset(&repo.git, false);
+    _ = try stack.reset(&repo.git, .{ .delete_layers = false });
     try stack.initStack(&repo.git, "main");
 }
 
@@ -148,7 +148,7 @@ test "reset refuses to delete a checked-out layer" {
 
     try testing.expectError(
         error.LayerCheckedOut,
-        stack.reset(&repo.git, true),
+        stack.reset(&repo.git, .{ .delete_layers = true }),
     );
     try testing.expect(try repo.hasRef("refs/stakrr/anchor"));
 }
@@ -168,7 +168,7 @@ test "reset refuses to delete a layer checked out in another worktree" {
         try repo.exec(&.{ "worktree", "add", "-q", "linked\nbranch refs/heads/stakrr/other", "stakrr/p1" });
         if (detached) try repo.exec(&.{ "switch", "-q", "--detach", "HEAD" });
 
-        try testing.expectError(error.BranchOccupied, stack.reset(&repo.git, true));
+        try testing.expectError(error.BranchOccupied, stack.reset(&repo.git, .{ .delete_layers = true }));
 
         // Refusal must leave both the shared state and the linked HEAD intact.
         var snapshot = try stack.inspect(&repo.git);
@@ -191,7 +191,7 @@ test "reset can keep a layer checked out in another worktree" {
     try stack.cut(&repo.git, "p1", null);
     try repo.exec(&.{ "worktree", "add", "-q", "linked", "stakrr/p1" });
 
-    const result = try stack.reset(&repo.git, false);
+    const result = try stack.reset(&repo.git, .{ .delete_layers = false });
     try testing.expectEqual(@as(usize, 1), result.kept_layers);
     const linked_head = try repo.git.output(&.{ "-C", "linked", "rev-parse", "HEAD" });
     defer testing.allocator.free(linked_head);
@@ -211,7 +211,7 @@ test "reset allows another worktree on an unrelated branch" {
     const path = "linked\nbranch refs/heads/stakrr/fake";
     try repo.exec(&.{ "worktree", "add", "-q", path, "main" });
 
-    const result = try stack.reset(&repo.git, true);
+    const result = try stack.reset(&repo.git, .{ .delete_layers = true });
     try testing.expectEqual(@as(usize, 1), result.deleted_layers);
     try repo.expectNoRef("refs/heads/stakrr/p1");
     const linked_head = try repo.git.output(&.{ "-C", path, "rev-parse", "HEAD" });
