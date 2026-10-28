@@ -301,14 +301,7 @@ fn userError(err: anyerror) ?[]const u8 {
     };
 }
 
-fn shortRef(ref_name: []const u8) []const u8 {
-    const prefix = "refs/heads/";
-
-    if (std.mem.startsWith(u8, ref_name, prefix))
-        return ref_name[prefix.len..];
-
-    return ref_name;
-}
+const shortRef = stakrr.layout.shortBranch;
 
 fn plural(n: usize, one: []const u8, many: []const u8) []const u8 {
     return if (n == 1) one else many;

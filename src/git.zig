@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const layout = @import("layout.zig");
 
 /// Domain errors raised by the Git wrapper. Allocation and process
 /// spawning errors are propagated separately.
@@ -47,7 +48,7 @@ pub fn isOid(text: []const u8) bool {
 /// update-ref protocol: must be under refs/heads/ and contain no whitespace
 /// or control characters. Git applies its full naming rules on use.
 pub fn isSafeBranchRef(text: []const u8) bool {
-    const prefix = "refs/heads/";
+    const prefix = layout.branch_prefix;
     if (!std.mem.startsWith(u8, text, prefix) or text.len == prefix.len)
         return false;
     for (text) |c| {
@@ -318,7 +319,7 @@ pub const Git = struct {
         return self.output(&.{
             "for-each-ref",
             "--format=%(refname)%09%(objectname)",
-            "refs/heads/stakrr/",
+            layout.layer_prefix,
         });
     }
 
@@ -483,9 +484,9 @@ pub const Git = struct {
         count += 1;
 
         updates[count] = if (previous) |ref|
-            .{ .update = .{ .name = tip_ref, .new = oid, .old = ref.oid } }
+            .{ .update = .{ .name = layout.tip_ref, .new = oid, .old = ref.oid } }
         else
-            .{ .create = .{ .name = tip_ref, .oid = oid } };
+            .{ .create = .{ .name = layout.tip_ref, .oid = oid } };
         count += 1;
 
         try self.transact("stakrr: cut", updates[0..count]);
@@ -494,7 +495,7 @@ pub const Git = struct {
     pub fn switchBranch(self: *const Git, ref_name: []const u8) !void {
         if (!isSafeBranchRef(ref_name)) return error.InvalidRefName;
 
-        const branch = ref_name["refs/heads/".len..];
+        const branch = ref_name[layout.branch_prefix.len..];
 
         // Reject option-like names and Git's "-" previous-branch shorthand.
         if (branch[0] == '-') return error.InvalidRefName;
@@ -506,10 +507,55 @@ pub const Git = struct {
 };
 
 /// internal guard pointing at the highest layer
-pub const tip_ref = "refs/stakrr/tip";
+pub const tip_ref = layout.tip_ref;
 
 /// the stack's starting commit; also keeps it reachable for gc
-pub const anchor_ref = "refs/stakrr/anchor";
+pub const anchor_ref = layout.anchor_ref;
 
 /// namespace for stakrr-managed layer branches
-pub const layer_prefix = "refs/heads/stakrr/";
+pub const layer_prefix = layout.layer_prefix;
+
+const testing = std.testing;
+
+test "isOid accepts only full lowercase sha1/sha256 ids" {
+    const sha1: [40]u8 = @splat('a');
+    const sha256: [64]u8 = @splat('f');
+    const upper: [40]u8 = @splat('A');
+    const option: [40]u8 = ("--output=x" ++ @as([30]u8, @splat('a'))).*;
+
+    try testing.expect(isOid(&sha1));
+    try testing.expect(isOid(&sha256));
+    try testing.expect(!isOid("abc"));
+    try testing.expect(!isOid(&upper));
+    try testing.expect(!isOid(&option));
+}
+
+test "isSafeBranchRef rejects options and protocol injection" {
+    try testing.expect(isSafeBranchRef("refs/heads/main"));
+    try testing.expect(isSafeBranchRef("refs/heads/stakrr/p1"));
+    try testing.expect(!isSafeBranchRef("refs/heads/"));
+    try testing.expect(!isSafeBranchRef("refs/tags/v1"));
+    try testing.expect(!isSafeBranchRef("--output=x"));
+    try testing.expect(!isSafeBranchRef("refs/heads/a\nverify x"));
+    try testing.expect(!isSafeBranchRef("refs/heads/a b"));
+    try testing.expect(!isSafeBranchRef("refs/heads/a\tb"));
+    try testing.expect(!isSafeBranchRef("refs/heads/a\x00b"));
+    try testing.expect(!isSafeBranchRef("refs/heads/a\x7fb"));
+}
+
+test "checkUpdate guards every name and oid written to update-ref" {
+    const oid: [40]u8 = @splat('a');
+    try Git.checkUpdate("refs/stakrr/tip", &.{&oid});
+    try Git.checkUpdate("refs/heads/main", &.{ &oid, &oid });
+    for ([_][]const u8{
+        "heads/main",
+        "-refs/heads/main",
+        "refs/heads/a b",
+        "refs/heads/a\nverify x",
+        "refs/heads/a\x00",
+        "refs/heads/a\x7f",
+    }) |name| {
+        try testing.expectError(error.InvalidRefName, Git.checkUpdate(name, &.{&oid}));
+    }
+    try testing.expectError(error.InvalidOid, Git.checkUpdate("refs/x", &.{ &oid, "HEAD" }));
+}
