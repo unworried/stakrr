@@ -55,25 +55,26 @@ fn expectNoState(repo: *const Repo) !void {
     try testing.expect(anchor == null);
 }
 
-test "loadConfig rejects missing state" {
+test "inspect: config rejects missing state" {
     var repo = try Repo.init();
     defer repo.deinit();
 
     try testing.expectError(
         error.NotInitialized,
-        stack.loadConfig(&repo.git),
+        stack.inspect(&repo.git),
     );
 }
 
-test "loadConfig parses initialized state" {
+test "inspect: config parses initialized state" {
     var repo = try Repo.init();
     defer repo.deinit();
 
     const base = try initialize(&repo);
     defer testing.allocator.free(base);
 
-    var config = try stack.loadConfig(&repo.git);
-    defer config.deinit(repo.git.allocator);
+    var snapshot = try stack.inspect(&repo.git);
+    defer snapshot.deinit();
+    const config = snapshot.config;
 
     try testing.expectEqualStrings(
         "refs/heads/main",
@@ -89,7 +90,7 @@ test "loadConfig parses initialized state" {
     );
 }
 
-test "loadConfig rejects malformed state" {
+test "inspect: config rejects malformed state" {
     var repo = try Repo.init();
     defer repo.deinit();
 
@@ -131,12 +132,12 @@ test "loadConfig rejects malformed state" {
         try setState(&repo, case.value);
         try testing.expectError(
             case.expected,
-            stack.loadConfig(&repo.git),
+            stack.inspect(&repo.git),
         );
     }
 }
 
-test "loadConfig reports a missing anchor ref as an inconsistent stack" {
+test "inspect: config reports a missing anchor ref as an inconsistent stack" {
     var repo = try Repo.init();
     defer repo.deinit();
 
@@ -147,7 +148,7 @@ test "loadConfig reports a missing anchor ref as an inconsistent stack" {
 
     try testing.expectError(
         error.InvalidStack,
-        stack.loadConfig(&repo.git),
+        stack.inspect(&repo.git),
     );
 }
 
@@ -174,8 +175,9 @@ test "initStack accepts a full base ref" {
     try repo.exec(&.{ "switch", "-q", "-c", "work" });
     try stack.initStack(&repo.git, "refs/heads/main");
 
-    var config = try stack.loadConfig(&repo.git);
-    defer config.deinit(repo.git.allocator);
+    var snapshot = try stack.inspect(&repo.git);
+    defer snapshot.deinit();
+    const config = snapshot.config;
 
     try testing.expectEqualStrings("refs/heads/main", config.base_ref);
 }
@@ -209,8 +211,9 @@ test "initStack refuses repeated initialization" {
     );
 
     // failed initialization must leave state intact
-    var config = try stack.loadConfig(&repo.git);
-    defer config.deinit(repo.git.allocator);
+    var snapshot = try stack.inspect(&repo.git);
+    defer snapshot.deinit();
+    const config = snapshot.config;
 
     try testing.expectEqualStrings(
         base,
@@ -307,7 +310,7 @@ test "inspect reports layers, depths and unstacked commits" {
     try stack.cut(&repo.git, "p2", "HEAD~1");
 
     var snapshot = try stack.inspect(&repo.git);
-    defer snapshot.deinit(testing.allocator);
+    defer snapshot.deinit();
 
     try testing.expectEqual(@as(usize, 2), snapshot.layers.len);
     try testing.expectEqual(@as(usize, 1), snapshot.layers[0].depth);
@@ -316,6 +319,42 @@ test "inspect reports layers, depths and unstacked commits" {
     try testing.expectEqual(@as(usize, 2), snapshot.layers[1].commits);
     try testing.expectEqual(@as(usize, 1), snapshot.unstacked_commits);
     try testing.expect(!snapshot.base_moved);
+}
+
+test "inspect snapshots own independent storage across stack changes" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+
+    const base = try initialize(&repo);
+    defer testing.allocator.free(base);
+    const first = try repo.commit("first");
+    defer testing.allocator.free(first);
+    try stack.cut(&repo.git, "first", null);
+
+    var original = try stack.inspect(&repo.git);
+    defer original.deinit();
+
+    const second = try repo.commit("second");
+    defer testing.allocator.free(second);
+    try stack.cut(&repo.git, "second", null);
+    {
+        var updated = try stack.inspect(&repo.git);
+        defer updated.deinit();
+        try testing.expectEqual(@as(usize, 2), updated.layers.len);
+        try testing.expectEqualStrings(second, updated.work_oid);
+        _ = try stack.reset(&repo.git, true);
+    }
+
+    try testing.expectEqualStrings("refs/heads/main", original.config.base_ref);
+    try testing.expectEqualStrings("refs/heads/work", original.config.work_ref);
+    try testing.expectEqualStrings(base, original.config.anchor_oid);
+    try testing.expectEqualStrings(first, original.work_oid);
+    try testing.expectEqual(@as(usize, 1), original.layers.len);
+    try testing.expectEqualStrings("refs/heads/stakrr/first", original.layers[0].ref_name);
+    try testing.expectEqualStrings(first, original.layers[0].oid);
+    try testing.expectEqual(@as(usize, 1), original.layers[0].depth);
+    try testing.expectEqual(@as(usize, 1), original.layers[0].commits);
+    try testing.expectEqual(@as(usize, 0), original.unstacked_commits);
 }
 
 test "inspect rejects a merge committed after init" {
@@ -443,7 +482,7 @@ test "stacks work in SHA-256 repositories" {
     try stack.cut(&repo.git, "p1", null);
 
     var snapshot = try stack.inspect(&repo.git);
-    defer snapshot.deinit(testing.allocator);
+    defer snapshot.deinit();
 
     try testing.expectEqual(@as(usize, 1), snapshot.layers.len);
     try testing.expectEqualStrings(b, snapshot.layers[0].oid);

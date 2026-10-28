@@ -177,7 +177,7 @@ test "reset refuses to delete a layer checked out in another worktree" {
 
         // Refusal must leave both the shared state and the linked HEAD intact.
         var snapshot = try stack.inspect(&repo.git);
-        defer snapshot.deinit(testing.allocator);
+        defer snapshot.deinit();
         try testing.expectEqual(@as(usize, 1), snapshot.layers.len);
         const linked_head = try repo.git.output(&.{ "-C", "linked\nbranch refs/heads/stakrr/other", "rev-parse", "HEAD" });
         defer testing.allocator.free(linked_head);

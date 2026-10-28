@@ -14,6 +14,11 @@ zig build test -Doptimize=ReleaseSafe
 `./mktemprepo.sh` drops you into a throwaway repo with a fresh build on `PATH`
 for poking at the cli by hand.
 
+Stack inspection returns an owned `Snapshot`. Its config, layers and object IDs
+remain valid until `snapshot.deinit()`, which releases all snapshot storage.
+Read configuration through `snapshot.config`; config and layer slices borrow
+from the snapshot and need no separate cleanup.
+
 ## // commits
 
 [conventional commits](https://www.conventionalcommits.org), lowercase,

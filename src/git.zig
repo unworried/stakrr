@@ -169,6 +169,13 @@ pub const Git = struct {
         return true;
     }
 
+    /// A copy that allocates from `allocator`, e.g. a command arena.
+    pub fn withAllocator(self: *const Git, allocator: Allocator) Git {
+        var copy = self.*;
+        copy.allocator = allocator;
+        return copy;
+    }
+
     pub fn checkRefFormat(self: *const Git, ref_name: []const u8) !void {
         const result = try self.run(&.{ "check-ref-format", ref_name });
         defer self.freeResult(result);
