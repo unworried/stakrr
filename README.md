@@ -36,7 +36,7 @@ grab a build from [releases](https://github.com/unworried/stakrr/releases),
 verify it and put it on your `PATH`:
 
 ```sh
-tag=v0.0.2             # latest from the releases page
+tag=v0.1.0
 target=aarch64-macos   # x86_64-macos · aarch64-linux-musl · x86_64-linux-musl
 curl -fsSLO https://github.com/unworried/stakrr/releases/download/$tag/stakrr-$tag-$target.tar.gz
 curl -fsSLO https://github.com/unworried/stakrr/releases/download/$tag/SHA256SUMS
@@ -92,6 +92,7 @@ stakrr status
 | ● | `stakrr cut <name> [--at <rev>]` | cut the next layer at `<rev>`, the tip by default |
 | ● | `stakrr status` | draw the stack: layers, commit counts, unstacked work |
 | ● | `stakrr reset [--delete-layers]` | forget the stack so it can be re-initialised |
+| ● | `stakrr up` / `stakrr down` | switch between the base, layers, and rolling work |
 | ● | `stakrr version` | print the version |
 | ○ | `stakrr amend` | amend a lower layer and restack the descendants |
 | ○ | `stakrr submit` | publish review branches, excluding rolling work |
@@ -130,7 +131,7 @@ tree, and refuses to delete layers while one of them is checked out.
 ## // roadmap
 
 ```
-m1  safe rolling stacks      ■■■□  init · cut · status · reset, no history rewrites
+m1  safe rolling stacks      ■■■■  init · cut · status · reset, no history rewrites
 m2  publishing + recovery    □□□□  submit via gh stack · operation journal · undo
 m3  patch-level extraction   □□□□  move hunks into a lower layer · replay descendants
 ```
