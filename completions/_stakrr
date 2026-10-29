@@ -2,7 +2,7 @@
 
 _stakrr_cuts() {
   local -a cuts
-  cuts=("${(@f)$(git for-each-ref --format='%(refname:strip=3)' refs/stakrr/layers/ 2>/dev/null)}")
+  cuts=("${(@f)$(git for-each-ref --format='%(refname:strip=3)' refs/heads/stakrr/ 2>/dev/null)}")
   _wanted cuts expl 'cut' compadd -a cuts
 }
 
@@ -37,7 +37,6 @@ commands=(
   'abort:Restore the stack before a pending restack'
   'log:List edit checkpoints'
   'quit:Drop a pending restack'
-  'undo:Reverse the last restack or fix'
   'help:Show help'
 )
 
