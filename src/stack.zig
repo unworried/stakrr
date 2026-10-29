@@ -1,3 +1,6 @@
+const Mutation = @import("mutation.zig").Mutation;
+const BranchRef = @import("git.zig").BranchRef;
+const RefName = @import("git.zig").RefName;
 const std = @import("std");
 const git_mod = @import("git.zig");
 const Git = git_mod.Git;
@@ -34,13 +37,13 @@ pub const Error = git_mod.Error || coordination.Error || error{
 /// Validated branch pair from the persisted state, borrowing from it.
 /// Shared by stack loading and edit checkpoint validation.
 pub const Branches = struct {
-    base_ref: []const u8,
-    work_ref: []const u8,
+    base_ref: BranchRef,
+    work_ref: BranchRef,
 };
 
 pub const Config = struct {
-    base_ref: []const u8,
-    work_ref: []const u8,
+    base_ref: BranchRef,
+    work_ref: BranchRef,
     anchor_oid: []const u8,
 };
 
@@ -77,13 +80,14 @@ pub const Snapshot = struct {
 };
 
 pub fn initStack(
-    git: *const Git,
+    original_git: *const Git,
     base_name: []const u8,
 ) !void {
-    const guard = try coordination.lockStack(git);
-    defer guard.close(git.io);
+    var mutation = try original_git.beginStackMutation();
+    defer mutation.deinit();
+    const git = mutation.repo();
     const allocator = git.allocator;
-    // lock() also validates the working tree.
+    // The mutation context also validates the working tree.
 
     // refuse existing initialisation
     if (try git.configGet(layout.state_key)) |existing| {
@@ -92,20 +96,20 @@ pub fn initStack(
     }
 
     // reserve stakrr's branch namespace and internal refs for managed layers
-    var existing_layers = try git.listRefs(layout.layer_prefix);
+    var existing_layers = try git.listDirectRefs(layout.layer_prefix);
     defer existing_layers.deinit(allocator);
     if (existing_layers.refs.len != 0) return error.ExistingStackRefs;
-    var existing_records = try git.listRefs(layout.record_prefix);
+    var existing_records = try git.listDirectRefs(layout.record_prefix);
     defer existing_records.deinit(allocator);
     if (existing_records.refs.len != 0) return error.ExistingStackRefs;
     for ([_][]const u8{ layout.tip_ref, layout.anchor_ref }) |ref_name| {
-        const existing = try git.readRef(ref_name);
+        const existing = try git.readDirectRefAlloc(try RefName.init(ref_name));
         defer if (existing) |oid| allocator.free(oid);
         if (existing != null) return error.ExistingStackRefs;
     }
 
     // identify rolling branch and base
-    const work_ref = try git.currentBranch();
+    const work_ref = try git.currentBranchAlloc();
     defer allocator.free(work_ref);
 
     // accept either a branch name or its full refs/heads/ ref
@@ -120,16 +124,16 @@ pub fn initStack(
         std.mem.startsWith(u8, base_ref, layout.layer_prefix))
         return error.ReservedBranchNamespace;
 
-    try git.checkRefFormat(base_ref);
+    const base_branch = try BranchRef.init(base_ref);
 
     if (std.mem.eql(u8, work_ref, base_ref))
         return error.BaseEqualsWork;
 
     // resolve both branch tips
-    const base_oid = (try git.readRef(base_ref)) orelse
+    const base_oid = (try git.readDirectRefAlloc(base_branch.name)) orelse
         return error.BaseNotFound;
     defer allocator.free(base_oid);
-    const work_oid = try git.resolveCommit(work_ref);
+    const work_oid = try git.branchCommitAlloc(try BranchRef.init(work_ref));
     defer allocator.free(work_oid);
 
     // check ancestry
@@ -142,9 +146,9 @@ pub fn initStack(
     if (!history.linear) return error.MergeCommitsUnsupported;
 
     // claim the anchor; `create` fails if a concurrent init won the race
-    const anchor: Git.ExpectedRef = .{ .name = layout.anchor_ref, .oid = base_oid };
-    try git.transact("stakrr: init", &.{.{ .create = anchor }});
-    errdefer git.transact("stakrr: init rollback", &.{.{ .delete = anchor }}) catch {};
+    const anchor = try git.expectedRef(layout.anchor_ref, base_oid);
+    try mutation.publish(.{ .message = "stakrr: init", .updates = &.{anchor.create()} });
+    errdefer mutation.publish(.{ .message = "stakrr: init rollback", .updates = &.{anchor.delete()} }) catch {};
 
     // persist the branch pair
     const state = try std.fmt.allocPrint(
@@ -176,15 +180,15 @@ pub fn parseConfig(raw: []const u8) Error!Branches {
         return error.InvalidConfig;
 
     // config is user-editable: validate before refs reach argv or update-ref
-    if (!git_mod.isSafeBranchRef(base) or !git_mod.isSafeBranchRef(work))
-        return error.InvalidConfig;
+    const base_ref = BranchRef.init(base) catch return error.InvalidConfig;
+    const work_ref = BranchRef.init(work) catch return error.InvalidConfig;
 
     if (std.mem.eql(u8, base, work) or
         std.mem.startsWith(u8, base, layout.layer_prefix) or
         std.mem.startsWith(u8, work, layout.layer_prefix))
         return error.InvalidConfig;
 
-    return .{ .base_ref = base, .work_ref = work };
+    return .{ .base_ref = base_ref, .work_ref = work_ref };
 }
 
 /// Slices are allocated from `git.allocator` and never freed individually;
@@ -194,11 +198,8 @@ fn loadConfig(git: *const Git) !Config {
         return error.NotInitialized;
     const branches = try parseConfig(raw);
 
-    const anchor = (try git.readRef(layout.anchor_ref)) orelse
+    const anchor = (try git.readDirectRefAlloc(try RefName.init(layout.anchor_ref))) orelse
         return error.InvalidStack;
-    if (!git_mod.isOid(anchor))
-        return error.InvalidGitOutput;
-
     return .{
         .base_ref = branches.base_ref,
         .work_ref = branches.work_ref,
@@ -208,18 +209,19 @@ fn loadConfig(git: *const Git) !Config {
 
 pub fn inspect(parent_git: *const Git) !Snapshot {
     try parent_git.ensureWorkTree();
-    try parent_git.requireNoPendingTransaction();
 
     // The snapshot owns everything inspection allocates.
     var arena: std.heap.ArenaAllocator = .init(parent_git.allocator);
     errdefer arena.deinit();
-    const scoped = parent_git.withAllocator(arena.allocator());
+    var scoped = parent_git.withAllocator(arena.allocator());
+    scoped.object_format = try parent_git.objectFormat();
     const git = &scoped;
     const allocator = git.allocator;
+    try git.requireNoPendingTransaction();
 
     const config = try loadConfig(git);
-    const base_oid = try git.resolveCommit(config.base_ref);
-    const work_oid = try git.resolveCommit(config.work_ref);
+    const base_oid = try git.branchCommitAlloc(config.base_ref);
+    const work_oid = try git.branchCommitAlloc(config.work_ref);
 
     // anchor must be reachable from the rolling branch
     if (!try git.isAncestor(config.anchor_oid, work_oid))
@@ -237,17 +239,17 @@ pub fn inspect(parent_git: *const Git) !Snapshot {
     const chain_len = history.commits.len;
 
     // discover branches owned by stakrr, and where each was last published
-    const listed = try git.listRefs(layout.layer_prefix);
-    const records = try git.listRefs(layout.record_prefix);
+    const listed = try git.listDirectRefs(layout.layer_prefix);
+    const records = try git.listDirectRefs(layout.record_prefix);
     if (records.refs.len != listed.refs.len) return error.InvalidStack;
 
     // Both listings have the same suffix order. Match them in one pass,
     // keeping cumulative depths in `commits` until the layers are sorted.
     const layers = try allocator.alloc(Layer, listed.refs.len);
     for (listed.refs, records.refs, layers) |ref, record, *layer| {
-        if (!std.mem.eql(u8, layout.layerName(ref.name).?, record.name[layout.record_prefix.len..]))
+        if (!std.mem.eql(u8, layout.layerName(ref.name.bytes).?, record.name.bytes[layout.record_prefix.len..]))
             return error.InvalidStack;
-        const recorded = record.oid;
+        const recorded = try record.oid.dupeHex(allocator);
 
         // every recorded boundary must sit on the chain between the anchor and
         // work; the branch itself may have moved on since
@@ -255,9 +257,9 @@ pub fn inspect(parent_git: *const Git) !Snapshot {
             return error.InvalidStack;
 
         layer.* = .{
-            .ref_name = ref.name,
+            .ref_name = ref.name.bytes,
             .oid = recorded,
-            .branch_oid = ref.oid,
+            .branch_oid = try ref.oid.dupeHex(allocator),
             .commits = depth,
         };
     }
@@ -285,7 +287,7 @@ pub fn inspect(parent_git: *const Git) !Snapshot {
     }
 
     // the private tip guard must match the highest committed layer
-    const tip = try git.readRef(layout.tip_ref);
+    const tip = try git.readDirectRefAlloc(try RefName.init(layout.tip_ref));
     if (layers.len == 0) {
         if (tip != null) return error.InvalidStack;
     } else {
@@ -322,12 +324,13 @@ fn isPathPrefix(prefix: []const u8, full: []const u8) bool {
 /// carve the next stack layer out of the linear rolling branch
 /// head, index, working tree and existing branch refs remain untouched
 pub fn cut(
-    git: *const Git,
+    original_git: *const Git,
     name: []const u8,
     revision: ?[]const u8,
 ) !void {
-    const guard = try coordination.lockStack(git);
-    defer guard.close(git.io);
+    var mutation = try original_git.beginStackMutation();
+    defer mutation.deinit();
+    const git = mutation.repo();
     const allocator = git.allocator;
 
     // validate the name before inspecting the stack
@@ -349,10 +352,11 @@ pub fn cut(
     var snapshot = try inspect(git);
     defer snapshot.deinit();
 
-    const current_ref = try git.currentBranch();
-    defer allocator.free(current_ref);
+    var current_branch = try git.currentBranch();
+    defer current_branch.deinit(allocator);
+    const current_ref = current_branch.value.name.bytes;
 
-    if (!std.mem.eql(u8, current_ref, snapshot.config.work_ref))
+    if (!std.mem.eql(u8, current_ref, snapshot.config.work_ref.name.bytes))
         return error.NotOnWorkBranch;
 
     for (snapshot.layers) |layer| {
@@ -362,7 +366,7 @@ pub fn cut(
     }
 
     const target = if (revision) |rev|
-        try git.resolveCommit(rev)
+        try git.resolveCommitAlloc(rev)
     else
         try allocator.dupe(u8, snapshot.work_oid);
     defer allocator.free(target);
@@ -388,12 +392,12 @@ pub fn cut(
 
     // The base may have moved since init; layers are carved relative to
     // the anchor, which the transaction pins instead of the base branch.
-    try createLayerRef(git, .{
-        .layer = .{ .name = new_ref, .oid = target },
-        .anchor = .{ .name = layout.anchor_ref, .oid = snapshot.config.anchor_oid },
-        .work = .{ .name = snapshot.config.work_ref, .oid = snapshot.work_oid },
+    try createLayerRef(&mutation, .{
+        .layer = try git.expectedRef(new_ref, target),
+        .anchor = try git.expectedRef(layout.anchor_ref, snapshot.config.anchor_oid),
+        .work = try git.expectedRef(snapshot.config.work_ref.name.bytes, snapshot.work_oid),
         .previous = if (last_layer) |layer|
-            .{ .name = layer.ref_name, .oid = layer.oid }
+            try git.expectedRef(layer.ref_name, layer.oid)
         else
             null,
     });
@@ -407,32 +411,29 @@ pub const LayerCreation = struct {
 };
 
 /// Create a boundary and advance the stack guard in one compare-and-swap.
-pub fn createLayerRef(git: *const Git, expected: LayerCreation) !void {
-    const record = try layout.recordRef(git.allocator, expected.layer.name);
+pub fn createLayerRef(mutation: *const Mutation, expected: LayerCreation) !void {
+    const git = mutation.repo();
+    const record = try layout.recordRef(git.allocator, expected.layer.name.bytes);
     defer git.allocator.free(record);
 
     var updates: [6]Git.RefUpdate = undefined;
-    updates[0] = .{ .verify = expected.anchor };
-    updates[1] = .{ .verify = expected.work };
+    updates[0] = expected.anchor.verify();
+    updates[1] = expected.work.verify();
     var count: usize = 2;
     if (expected.previous) |previous| {
-        updates[count] = .{ .verify = previous };
+        updates[count] = previous.verify();
         count += 1;
     }
-    updates[count] = .{ .create = expected.layer };
+    updates[count] = expected.layer.create();
     count += 1;
-    updates[count] = .{ .create = .{ .name = record, .oid = expected.layer.oid } };
+    updates[count] = try git.createRef(record, expected.layer.oid.hex());
     count += 1;
     updates[count] = if (expected.previous) |previous|
-        .{ .update = .{
-            .name = layout.tip_ref,
-            .new = expected.layer.oid,
-            .old = previous.oid,
-        } }
+        try git.updateRef(layout.tip_ref, previous.oid.hex(), expected.layer.oid.hex())
     else
-        .{ .create = .{ .name = layout.tip_ref, .oid = expected.layer.oid } };
+        try git.createRef(layout.tip_ref, expected.layer.oid.hex());
     count += 1;
-    try git.transact("stakrr: cut", updates[0..count]);
+    try mutation.publish(.{ .message = "stakrr: cut", .updates = updates[0..count] });
 }
 
 pub const ResetResult = struct {
@@ -445,13 +446,14 @@ pub const ResetOptions = struct { delete_layers: bool = false };
 /// Remove stakrr's state and internal refs so the stack can be
 /// re-initialised. Layer branches are kept unless `delete_layers` is set.
 /// Works on corrupt or outdated state, so it never parses the config.
-pub fn reset(git: *const Git, options: ResetOptions) !ResetResult {
+pub fn reset(original_git: *const Git, options: ResetOptions) !ResetResult {
     const delete_layers = options.delete_layers;
-    const guard = try coordination.lockStack(git);
-    defer guard.close(git.io);
+    var mutation = try original_git.beginStackMutation();
+    defer mutation.deinit();
+    const git = mutation.repo();
     const allocator = git.allocator;
 
-    var layers = try git.listRefs(layout.layer_prefix);
+    var layers = try git.listDirectRefs(layout.layer_prefix);
     defer layers.deinit(allocator);
 
     var updates: std.ArrayList(Git.RefUpdate) = .empty;
@@ -462,34 +464,26 @@ pub fn reset(git: *const Git, options: ResetOptions) !ResetResult {
     defer for (internal_oids) |maybe| if (maybe) |oid| allocator.free(oid);
 
     for (internal, &internal_oids) |ref_name, *slot| {
-        slot.* = try git.readRef(ref_name);
+        slot.* = try git.readDirectRefAlloc(try RefName.init(ref_name));
         if (slot.*) |oid|
             try updates.append(
                 allocator,
-                .{ .delete = .{ .name = ref_name, .oid = oid } },
+                try git.deleteRef(ref_name, oid),
             );
     }
 
-    var records = try git.listRefs(layout.record_prefix);
+    var records = try git.listDirectRefs(layout.record_prefix);
     defer records.deinit(allocator);
-    for (records.refs) |ref| try updates.append(allocator, .{ .delete = ref });
+    for (records.refs) |ref| try updates.append(allocator, ref.delete());
 
     const layer_count = layers.refs.len;
     if (delete_layers) for (layers.refs) |ref| {
-        try updates.append(allocator, .{ .delete = ref });
+        try updates.append(allocator, ref.delete());
     };
-
-    // deleting a checked-out branch would leave HEAD pointing nowhere
-    if (delete_layers and layer_count != 0) {
-        const names = try allocator.alloc([]const u8, layer_count);
-        defer allocator.free(names);
-        for (layers.refs, names) |ref, *name| name.* = ref.name;
-        try coordination.requireDeletable(git, names);
-    }
 
     // refs first: if unsetting config fails, reset can simply be re-run
     if (updates.items.len != 0)
-        try git.transact("stakrr: reset", updates.items);
+        try mutation.publish(.{ .message = "stakrr: reset", .updates = updates.items });
 
     const had_state = try git.configUnset(layout.state_key);
 
@@ -506,21 +500,23 @@ pub const Direction = enum { up, down };
 
 /// Navigation positions: base, ordered layers, rolling work.
 fn navigationRef(snapshot: *const Snapshot, index: usize) []const u8 {
-    if (index == 0) return snapshot.config.base_ref;
+    if (index == 0) return snapshot.config.base_ref.name.bytes;
     if (index == snapshot.layers.len + 1)
-        return snapshot.config.work_ref;
+        return snapshot.config.work_ref.name.bytes;
     return snapshot.layers[index - 1].ref_name;
 }
 
 /// Returns false when already at the requested end of the stack.
-pub fn navigate(git: *const Git, direction: Direction) !bool {
-    const guard = try coordination.lockStack(git);
-    defer guard.close(git.io);
+pub fn navigate(original_git: *const Git, direction: Direction) !bool {
+    var mutation = try original_git.beginStackMutation();
+    defer mutation.deinit();
+    const git = mutation.repo();
     var snapshot = try inspect(git);
     defer snapshot.deinit();
 
-    const current = try git.currentBranch();
-    defer git.allocator.free(current);
+    var current_branch = try git.currentBranch();
+    defer current_branch.deinit(git.allocator);
+    const current = current_branch.value.name.bytes;
 
     const top = snapshot.layers.len + 1;
     const index = for (0..(top + 1)) |i| {
@@ -533,21 +529,22 @@ pub fn navigate(git: *const Git, direction: Direction) !bool {
         .down => if (index == 0) return false else index - 1,
     };
 
-    try git.switchBranch(navigationRef(&snapshot, target_index));
+    try mutation.switchBranch(try BranchRef.init(navigationRef(&snapshot, target_index)));
     return true;
 }
 
 /// Switch to a layer's branch by its short name. Commits made there are picked
 /// up by the next restack.
-pub fn go(git: *const Git, name: []const u8) !void {
-    const guard = try coordination.lockStack(git);
-    defer guard.close(git.io);
+pub fn go(original_git: *const Git, name: []const u8) !void {
+    var mutation = try original_git.beginStackMutation();
+    defer mutation.deinit();
+    const git = mutation.repo();
     var snapshot = try inspect(git);
     defer snapshot.deinit();
     for (snapshot.layers) |layer| {
         const short = layout.layerName(layer.ref_name) orelse continue;
         if (!std.mem.eql(u8, short, name)) continue;
-        return git.switchBranch(layer.ref_name);
+        return mutation.switchBranch(try BranchRef.init(layer.ref_name));
     }
     return error.UnknownCut;
 }

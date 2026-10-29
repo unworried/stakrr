@@ -232,6 +232,7 @@ HEAD plus the checkpoint are retained in `refs/stakrr/oplog` (inspect them with
 | ● | `stakrr version` | print the version |
 | ● | `stakrr fix [<cut>] -m <msg>\|--amend` | fold staged changes into a cut and replay what sits above it |
 | ● | `stakrr go <cut>` | switch to a cut's branch to edit it with ordinary commits |
+| ● | `stakrr up` / `stakrr down` | switch to the adjacent branch in the stack |
 | ● | `stakrr restack` | replay what sits above a cut you committed on |
 | ● | `stakrr continue` | resume a restack after a conflict |
 | ● | `stakrr abort` | restore the stack from before a pending restack |
@@ -258,12 +259,12 @@ Git mutations, publication transactions and recovery behavior.
 | `refs/stakrr/tip` | concurrency guard at the highest layer, compare-and-swapped in the same ref transaction as each new layer |
 | `refs/heads/stakrr/*` | layer branches |
 | `refs/stakrr/layers/<name>` | where each cut was last published; the cut's branch differing from it means it is stale |
-| `refs/stakrr/edit` | v2 checkpoint commit for the pending restack, shared by all worktrees and bound to one owner |
+| `refs/stakrr/edit` | v1 checkpoint commit for the pending restack, shared by all worktrees and bound to one owner |
 | `refs/stakrr/oplog` | latest completed checkpoint, retaining previous sessions and undo operations |
 | `refs/stakrr/transaction` | pending ref publication, retaining old/new values until recovery completes |
 | `<git-common-dir>/stakrr.lock` | advisory lock held for each stakrr mutation; released automatically on process exit |
 
-Each v2 checkpoint tree contains `session.json`, an immutable replay `plan`
+Each v1 checkpoint tree contains `session.json`, an immutable replay `plan`
 when needed, and the previous checkpoint and rescue metadata. Its first parent
 is the previous checkpoint; additional parents retain original and rewritten
 commits, as in `git stash`. The session ref advances in the same compare-and-swap
@@ -311,10 +312,29 @@ worktree.
 ## // roadmap
 
 ```
-m1  safe rolling stacks      ■■■□  init · cut · status · reset, no history rewrites
-m2  publishing + recovery    ■■■□  operation journal · log · undo · submit via gh stack (planned)
-m3  patch-level extraction   □□□□  move hunks into a lower layer · replay descendants
+m1  safe rolling stacks       ■■■■  init · cut · status · reset · go · up · down
+m2  publishing + recovery     ■■■□  local editing + recovery shipped; submit planned
+m3  base + stack maintenance  □□□□  update base · retire landed layers · replay remaining work
 ```
+
+m1 is complete: cuts record boundaries without rewriting history.
+
+m2 already includes `fix`, `restack`, conflict continuation, `abort`, `quit`,
+the operation journal, `log`, `undo` and interrupted ref publication recovery.
+Remote publication with `submit` remains planned.
+
+m3 will keep stacks current as upstream changes land:
+
+- restack layers and rolling work onto an updated base; today's `restack` only
+  replays descendants of an edited cut
+- explicitly retire merged layers from stack tracking while preserving the
+  remaining work
+- support conflict continuation, journal checkpoints, abort and undo for these
+  operations using the existing recovery machinery
+
+Later: extract hunks from existing commits into a lower layer, rewriting their
+original commits too. `fix` already folds staged changes into a cut; moving
+already-committed changes between layers remains a separate idea beyond m3.
 
 ## // principles
 

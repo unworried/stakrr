@@ -1,35 +1,26 @@
 //! Coordination shared by every stakrr mutation, including linked worktrees.
 const std = @import("std");
 const Git = @import("git.zig").Git;
-const layout = @import("layout.zig");
 
 pub const Error = error{
     MutationInProgress,
     EditInProgress,
     BranchOccupied,
+    BranchCheckedOut,
     LayerCheckedOut,
     DirtyWorkTree,
     IgnoredFilesPresent,
     GitOperationInProgress,
 };
 
-pub const Guard = struct {
-    file: std.Io.File,
-    recovered: bool,
-
-    pub fn close(self: Guard, io: std.Io) void {
-        self.file.close(io);
-    }
-};
-
 /// Keep the inode: unlinking an advisory lock would allow two owners.
-pub fn lock(git: *const Git) !Guard {
-    try git.ensureWorkTree();
+/// Internal primitive; Mutation owns the lock and performs recovery.
+pub fn acquireLock(git: *const Git) !std.Io.File {
     const common = try git.path(&.{ "rev-parse", "--path-format=absolute", "--git-common-dir" });
     defer git.allocator.free(common);
     const path = try std.fs.path.join(git.allocator, &.{ common, "stakrr.lock" });
     defer git.allocator.free(path);
-    const guard = std.Io.Dir.cwd().createFile(git.io, path, .{
+    return std.Io.Dir.cwd().createFile(git.io, path, .{
         .truncate = false,
         .lock = .exclusive,
         .lock_nonblocking = true,
@@ -37,19 +28,6 @@ pub fn lock(git: *const Git) !Guard {
         error.WouldBlock => return error.MutationInProgress,
         else => return err,
     };
-    errdefer guard.close(git.io);
-    return .{ .file = guard, .recovered = try git.recoverTransaction() };
-}
-
-/// Lock for a stack mutation, which an active edit session excludes.
-pub fn lockStack(git: *const Git) !Guard {
-    const guard = try lock(git);
-    errdefer guard.close(git.io);
-    if (try git.readRef(layout.session_ref)) |oid| {
-        git.allocator.free(oid);
-        return error.EditInProgress;
-    }
-    return guard;
 }
 
 /// A clean working tree with no Git operation in progress.
@@ -74,6 +52,13 @@ pub fn requireAvailable(git: *const Git, refs: []const []const u8) !void {
 /// Deleting a branch must also refuse its checkout in the caller's worktree.
 pub fn requireDeletable(git: *const Git, refs: []const []const u8) !void {
     return requireAvailability(git, refs, false);
+}
+
+pub fn requireUnoccupied(git: *const Git, refs: []const []const u8) !void {
+    return requireAvailability(git, refs, false) catch |err| switch (err) {
+        error.LayerCheckedOut => error.BranchCheckedOut,
+        else => err,
+    };
 }
 
 fn requireAvailability(git: *const Git, refs: []const []const u8, allow_current: bool) !void {
@@ -117,8 +102,6 @@ fn requireAvailability(git: *const Git, refs: []const []const u8, allow_current:
     }
 }
 
-pub const cherry_pick_head = "CHERRY_PICK_HEAD";
-
 pub const OperationOptions = struct {
     /// the caller owns and validates a stopped cherry-pick
     allow_cherry_pick: bool = false,
@@ -126,8 +109,7 @@ pub const OperationOptions = struct {
 
 pub fn requireNoGitOperation(git: *const Git, options: OperationOptions) !void {
     if (!options.allow_cherry_pick) {
-        if (try git.readRef(cherry_pick_head)) |oid| {
-            git.allocator.free(oid);
+        if (try git.cherryPickHead() != null) {
             return error.GitOperationInProgress;
         }
     }

@@ -64,6 +64,8 @@ pub fn build(b: *std.Build) void {
 
     const integration_tests = [_][]const u8{
         "tests/git_test.zig",
+        "tests/git_values_test.zig",
+        "tests/support_test.zig",
         "tests/stack_test.zig",
         "tests/cut_test.zig",
         "tests/reset_test.zig",

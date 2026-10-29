@@ -12,23 +12,32 @@ zig build test -Doptimize=ReleaseSafe
 ```
 
 `scripts/mktemprepo.sh` drops you into a throwaway repo with a fresh build on `PATH`
-for poking at the cli by hand.
+for poking at the cli by hand. See [the test guide](tests/README.md) for shared
+fixtures, fault injection and the manual regression checklist.
 
-The source layout stays flat: `layout.zig` names every ref and config key
-stakrr persists; `git.zig` runs Git, parses its output and applies generic ref
-transactions; `ref_transaction.zig` retains publication intent for recovery;
-`coordination.zig` owns locks and worktree guards; `stack.zig`
+The source layout stays flat: `layout.zig` names every ref, config key and
+persisted format version; `git_types.zig` defines validated refs, branch names,
+OIDs and ref updates; `git.zig` provides Git queries, object plumbing and
+subprocess helpers. `mutation.zig` owns the shared lock from recovery through
+publication, checkout and replay. `ref_transaction.zig` retains publication
+intent for recovery; `ref_backend.zig` implements Git's ref transaction protocol;
+`coordination.zig` provides lock acquisition and worktree guards. `stack.zig`
 owns stack policy and snapshots; `edit.zig` advances the edit workflow;
 `edit_session.zig` holds its private model and checkpoint codec. On the CLI
 side, `cli.zig` parses arguments, `render.zig` draws output, `term.zig` styles
 it, and `main.zig` dispatches commands and maps errors to messages.
 
-Public snapshots and edit status views own their storage and need `deinit`.
+Public snapshots, edit status views and mutation contexts own resources and need
+`deinit`. Validated ref and branch names borrow their input; OIDs store their
+bytes inline. Owned branch results and ref listings have explicit `deinit`
+methods. See [the Git API](docs/git-api.md) for signatures and ownership rules.
 Edit internals use a command arena, with a separate scratch arena for each
-checkpoint. Keep history inspection batched and publish refs with the journal
-in one compare-and-swap transaction. Recovery tests kill the process around
-checkpoints and simulate partial ref publication; preserve their coverage when
-changing edit phases or transaction recovery.
+checkpoint. Acquire a mutation context before observing state used for a write;
+publish refs and perform checkout/replay through that context. Keep history
+inspection batched and retain publication intent around multi-ref changes.
+Recovery tests kill the process around checkpoints and simulate partial ref
+publication; preserve their coverage when changing edit phases or transaction
+recovery.
 
 ## // command behavior
 
@@ -37,6 +46,11 @@ shipped command. Follow its check order, allowed Git mutations, transaction
 boundaries and recovery rules. When changing behavior, update the matching flow
 and regression coverage in the same change. Keep the README focused on usage;
 keep the exact command flow in that one reference.
+
+Stack configuration, edit checkpoints and publication intents currently use v1.
+While the project is pre-1.0, revise those schemas directly and keep readers,
+writers and format documentation aligned; no migration between development
+formats is maintained.
 
 ## // commits
 
@@ -48,7 +62,7 @@ imperative, one change per commit. each commit should build and pass tests.
 
 feat(cli): render status as a stack
 fix(stack): validate persisted state before use
-feat(stack)!: bump the state format to v2
+refactor(git)!: require mutation contexts for ref publication
 ```
 
 - **types**: `feat` `fix` `perf` `refactor` `test` `docs` `build` `ci` `chore`

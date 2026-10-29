@@ -26,7 +26,7 @@ test "fix adds a commit to a lower layer and replays everything above it" {
     var repo = try Repo.init();
     defer repo.deinit();
     try fixture.setup(&repo);
-    var before = try repo.git.listRefs(layout.branch_prefix);
+    var before = try repo.git.listDirectRefs(layout.branch_prefix);
     defer before.deinit(testing.allocator);
     try stage(&repo, "model", "fixed\n");
 
@@ -59,9 +59,9 @@ test "fix adds a commit to a lower layer and replays everything above it" {
         try testing.expect(!std.mem.eql(u8, move.before, move.after));
         try repo.expectRef(move.name, move.after);
         const old = for (before.refs) |ref| {
-            if (std.mem.eql(u8, ref.name, move.name)) break ref.oid;
+            if (std.mem.eql(u8, ref.name.bytes, move.name)) break ref.oid;
         } else return error.TestExpectedRef;
-        try testing.expectEqualStrings(old, move.before);
+        try testing.expectEqualStrings(old.hex(), move.before);
     }
 }
 
@@ -75,7 +75,7 @@ test "fix log starts from the actual refs after work between operations" {
 
     try repo.write("tail", "new rolling work\n");
     try repo.commitAll("new work");
-    const old_work = try repo.git.resolveCommit("work");
+    const old_work = try repo.git.resolveCommitAlloc("work");
     defer testing.allocator.free(old_work);
     try stage(&repo, "model", "second fix\n");
     var second = try fix.fix(&repo.git, .{ .layer = "models", .how = .{ .message = "second" } });
@@ -113,7 +113,7 @@ test "fix targets the highest layer by default" {
     var repo = try Repo.init();
     defer repo.deinit();
     try fixture.setup(&repo);
-    const models = try repo.git.resolveCommit("stakrr/models");
+    const models = try repo.git.resolveCommitAlloc("stakrr/models");
     defer testing.allocator.free(models);
     try stage(&repo, "api", "fixed api\n");
 

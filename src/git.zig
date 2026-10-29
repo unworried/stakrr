@@ -2,6 +2,14 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const layout = @import("layout.zig");
+const types = @import("git_types.zig");
+pub const RefName = types.RefName;
+pub const BranchRef = types.BranchRef;
+pub const Oid = types.Oid;
+pub const RefUpdate = types.RefUpdate;
+pub const CurrentBranchPolicy = types.CurrentBranchPolicy;
+pub const PublishOptions = types.PublishOptions;
+pub const Mutation = @import("mutation.zig").Mutation;
 
 /// Domain errors raised by the Git wrapper. Allocation and process
 /// spawning errors are propagated separately.
@@ -40,32 +48,9 @@ pub const Diagnostics = struct {
     }
 };
 
-/// True if `text` is a full hexadecimal SHA-1 or SHA-256 object id.
-pub fn isOid(text: []const u8) bool {
-    if (text.len != 40 and text.len != 64) return false;
-    for (text) |c| switch (c) {
-        '0'...'9', 'a'...'f' => {},
-        else => return false,
-    };
-    return true;
-}
-
-/// Cheap guard for persisted branch refs before they reach argv or the
-/// update-ref protocol: must be under refs/heads/ and contain no whitespace
-/// or control characters. Git applies its full naming rules on use.
+/// Full naming and namespace validation for persisted local branch refs.
 pub fn isSafeBranchRef(text: []const u8) bool {
-    const prefix = layout.branch_prefix;
-    return std.mem.startsWith(u8, text, prefix) and
-        text.len != prefix.len and
-        isProtocolSafe(text);
-}
-
-/// No whitespace or control bytes, which would split argv words or
-/// update-ref stdin lines.
-fn isProtocolSafe(text: []const u8) bool {
-    for (text) |c| {
-        if (c <= ' ' or c == 0x7f) return false;
-    }
+    _ = BranchRef.init(text) catch return false;
     return true;
 }
 
@@ -76,6 +61,7 @@ pub const Git = struct {
     /// replaces the child environment when set (used for hermetic tests)
     environ_map: ?*const std.process.Environ.Map = null,
     diagnostics: ?*Diagnostics = null,
+    object_format: ?types.ObjectFormat = null,
 
     const stdout_limit = 16 * 1024 * 1024;
     const stderr_limit = 64 * 1024;
@@ -126,7 +112,7 @@ pub const Git = struct {
     }
 
     /// record git's stderr for the caller and report the failure
-    fn fail(self: *const Git, stderr: []const u8) error{GitFailed} {
+    pub fn recordFailure(self: *const Git, stderr: []const u8) error{GitFailed} {
         if (self.diagnostics) |diag| diag.record(stderr);
         return error.GitFailed;
     }
@@ -148,7 +134,7 @@ pub const Git = struct {
         const result = try self.run(args);
         defer self.allocator.free(result.stderr);
         errdefer self.allocator.free(result.stdout);
-        if ((try exitCode(result)) != 0) return self.fail(result.stderr);
+        if ((try exitCode(result)) != 0) return self.recordFailure(result.stderr);
         return result.stdout;
     }
 
@@ -158,7 +144,7 @@ pub const Git = struct {
         const result = try self.run(args);
         defer self.allocator.free(result.stderr);
         errdefer self.allocator.free(result.stdout);
-        if ((try exitCode(result)) != 0) return self.fail(result.stderr);
+        if ((try exitCode(result)) != 0) return self.recordFailure(result.stderr);
         if (result.stdout.len == 0 or result.stdout[result.stdout.len - 1] != '\n')
             return error.InvalidGitOutput;
         return self.allocator.realloc(result.stdout, result.stdout.len - 1);
@@ -168,7 +154,7 @@ pub const Git = struct {
     pub fn exec(self: *const Git, args: []const []const u8) !void {
         const result = try self.run(args);
         defer self.freeResult(result);
-        if ((try exitCode(result)) != 0) return self.fail(result.stderr);
+        if ((try exitCode(result)) != 0) return self.recordFailure(result.stderr);
     }
 
     /// For commands where exit status `absent` is an expected answer rather
@@ -183,7 +169,7 @@ pub const Git = struct {
             self.allocator.free(result.stdout);
             return null;
         }
-        if (code != 0) return self.fail(result.stderr);
+        if (code != 0) return self.recordFailure(result.stderr);
         return try self.allocator.realloc(result.stdout, std.mem.trimEnd(u8, result.stdout, "\r\n").len);
     }
 
@@ -193,7 +179,7 @@ pub const Git = struct {
         defer self.freeResult(result);
         const code = try exitCode(result);
         if (code == no) return false;
-        if (code != 0) return self.fail(result.stderr);
+        if (code != 0) return self.recordFailure(result.stderr);
         return true;
     }
 
@@ -212,26 +198,54 @@ pub const Git = struct {
 
     /// Managed refs are direct. HEAD and Git's operation pseudorefs retain
     /// their ordinary semantics; symbolic HEAD is used throughout the app.
-    pub fn requireDirectRef(self: *const Git, ref_name: []const u8) !void {
-        const target = (try self.query(&.{ "symbolic-ref", "--quiet", "--no-recurse", ref_name }, 1)) orelse return;
+    pub fn requireDirectRef(self: *const Git, ref_name: RefName) !void {
+        const target = (try self.query(&.{ "symbolic-ref", "--quiet", "--no-recurse", ref_name.bytes }, 1)) orelse return;
         defer self.allocator.free(target);
         if (self.diagnostics) |diag| {
             var buf: [1024]u8 = undefined;
-            diag.record(std.fmt.bufPrint(&buf, "symbolic ref {s} points to {s}; restore a direct ref before retrying", .{ ref_name, target }) catch "managed refs must be direct, not symbolic");
+            diag.record(std.fmt.bufPrint(&buf, "symbolic ref {s} points to {s}; restore a direct ref before retrying", .{ ref_name.bytes, target }) catch "managed refs must be direct, not symbolic");
         }
         return error.SymbolicRef;
     }
 
     /// Read a direct ref OID, distinguishing absence from a Git failure.
-    pub fn readRef(self: *const Git, ref_name: []const u8) !?[]u8 {
-        if (std.mem.startsWith(u8, ref_name, "refs/")) try self.requireDirectRef(ref_name);
-        return self.query(&.{
+    pub fn readDirectRef(self: *const Git, ref_name: RefName) !?Oid {
+        // symbolic-ref also distinguishes malformed loose refs from absence.
+        try self.requireDirectRef(ref_name);
+        const raw = (try self.query(&.{
             "rev-parse",
             "--verify",
             "--quiet",
             "--end-of-options",
-            ref_name,
-        }, 1);
+            ref_name.bytes,
+        }, 1)) orelse {
+            // Recheck a disappearance or corruption between the two reads.
+            try self.requireDirectRef(ref_name);
+            return null;
+        };
+        defer self.allocator.free(raw);
+        return self.parseOid(raw) catch |err| switch (err) {
+            error.InvalidOid => error.InvalidGitOutput,
+            else => err,
+        };
+    }
+
+    /// Owned hexadecimal bytes for the persisted snapshot/checkpoint codecs.
+    pub fn readDirectRefAlloc(self: *const Git, ref_name: RefName) !?[]u8 {
+        const value = (try self.readDirectRef(ref_name)) orelse return null;
+        return try value.dupeHex(self.allocator);
+    }
+
+    /// Git operation pseudorefs are distinct from names in the refs/ namespace.
+    pub fn cherryPickHead(self: *const Git) !?Oid {
+        const raw = (try self.query(&.{ "rev-parse", "--verify", "--quiet", "CHERRY_PICK_HEAD" }, 1)) orelse return null;
+        defer self.allocator.free(raw);
+        return try self.parseOid(raw);
+    }
+
+    pub fn cherryPickHeadAlloc(self: *const Git) !?[]u8 {
+        const value = (try self.cherryPickHead()) orelse return null;
+        return try value.dupeHex(self.allocator);
     }
 
     /// Commits in `older..newer`, oldest first. Oids borrow from `raw`.
@@ -296,18 +310,32 @@ pub const Git = struct {
         return self.query(&.{ "symbolic-ref", "--quiet", "--no-recurse", "HEAD" }, 1);
     }
 
-    /// Require an attached HEAD whose immediate target is a direct branch ref.
-    /// Reject detached HEADs and symbolic branch aliases.
-    pub fn currentBranch(self: *const Git) ![]u8 {
+    /// The name borrows raw; release the owned buffer with deinit.
+    pub const OwnedBranchRef = struct {
+        value: BranchRef,
+        raw: []u8,
+
+        pub fn deinit(self: *OwnedBranchRef, allocator: Allocator) void {
+            allocator.free(self.raw);
+            self.* = undefined;
+        }
+    };
+
+    /// Require attached HEAD targeting a direct local branch, possibly unborn.
+    pub fn currentBranch(self: *const Git) !OwnedBranchRef {
         const name = (try self.head()) orelse return error.DetachedHead;
         errdefer self.allocator.free(name);
-        try self.requireDirectRef(name);
-        return name;
+        const branch = try BranchRef.init(name);
+        try self.requireDirectRef(branch.name);
+        return .{ .value = branch, .raw = name };
+    }
+
+    pub fn currentBranchAlloc(self: *const Git) ![]u8 {
+        return (try self.currentBranch()).raw;
     }
 
     /// resolve a revision to an actual commit oid
-    pub fn resolveCommit(self: *const Git, revision: []const u8) ![]u8 {
-        if (std.mem.startsWith(u8, revision, "refs/")) try self.requireDirectRef(revision);
+    pub fn resolveCommit(self: *const Git, revision: []const u8) !Oid {
         const peeled = try std.fmt.allocPrint(
             self.allocator,
             "{s}^{{commit}}",
@@ -315,12 +343,31 @@ pub const Git = struct {
         );
         defer self.allocator.free(peeled);
 
-        return self.output(&.{
+        const raw = try self.output(&.{
             "rev-parse",
             "--verify",
             "--end-of-options",
             peeled,
         });
+        defer self.allocator.free(raw);
+        return self.parseOid(raw);
+    }
+
+    pub fn resolveCommitAlloc(self: *const Git, revision: []const u8) ![]u8 {
+        const value = try self.resolveCommit(revision);
+        return try value.dupeHex(self.allocator);
+    }
+
+    /// Resolve the observed direct branch tip, without interpreting its name as a revision.
+    pub fn branchCommit(self: *const Git, branch: BranchRef) !Oid {
+        const value = (try self.readDirectRef(branch.name)) orelse
+            return self.recordFailure("branch does not exist");
+        return self.resolveCommit(value.hex());
+    }
+
+    pub fn branchCommitAlloc(self: *const Git, branch: BranchRef) ![]u8 {
+        const value = try self.branchCommit(branch);
+        return try value.dupeHex(self.allocator);
     }
 
     /// check whether a is an ancestor of b
@@ -354,8 +401,7 @@ pub const Git = struct {
         return self.check(&.{ "config", "--local", "--unset-all", key }, 5);
     }
 
-    /// Refs under a prefix, in refname order. Names and oids borrow from
-    /// `raw`, which is kept for callers comparing whole listings.
+    /// Refs under a prefix, in refname order. Names borrow raw; OIDs are values.
     pub const RefList = struct {
         raw: []u8,
         refs: []ExpectedRef,
@@ -367,7 +413,8 @@ pub const Git = struct {
         }
     };
 
-    pub fn listRefs(self: *const Git, prefix: []const u8) !RefList {
+    pub fn listDirectRefs(self: *const Git, prefix: []const u8) !RefList {
+        if (!std.mem.startsWith(u8, prefix, "refs/")) return error.InvalidRefName;
         const storage = try self.configGet("extensions.refStorage");
         defer if (storage) |name| self.allocator.free(name);
         if (storage) |name| {
@@ -375,7 +422,8 @@ pub const Git = struct {
         }
         // Git omits dangling symbolic refs from for-each-ref. Inspect loose
         // names as well, letting Git interpret symbolic-ref candidates.
-        try self.requireDirectLooseRefs(prefix);
+        const format = try self.objectFormat();
+        try self.requireDirectLooseRefs(prefix, format);
         const raw = try self.output(&.{
             "for-each-ref",
             "--format=%(refname)%09%(objectname)%09%(symref)",
@@ -393,14 +441,19 @@ pub const Git = struct {
             if (last_tab == tab) return error.InvalidGitOutput;
             if (last_tab + 1 != line.len) return error.SymbolicRef;
             const oid = line[tab + 1 .. last_tab];
-            if (!isOid(oid)) return error.InvalidGitOutput;
-            try refs.append(self.allocator, .{ .name = line[0..tab], .oid = oid });
+            try refs.append(self.allocator, .{ .name = try RefName.init(line[0..tab]), .oid = Oid.init(format, oid) catch return error.InvalidGitOutput });
         }
         return .{ .raw = raw, .refs = try refs.toOwnedSlice(self.allocator) };
     }
 
-    fn requireDirectLooseRefs(self: *const Git, prefix: []const u8) !void {
-        const root = try self.path(&.{ "rev-parse", "--git-path", "refs" });
+    fn requireDirectLooseRefs(self: *const Git, prefix: []const u8, format: ObjectFormat) !void {
+        // Walk only the requested subtree (or its parent for a partial prefix).
+        const base = if (std.mem.endsWith(u8, prefix, "/"))
+            std.mem.trimEnd(u8, prefix, "/")
+        else
+            std.fs.path.dirname(prefix) orelse return error.InvalidRefName;
+        if (!std.mem.eql(u8, base, "refs")) _ = try RefName.init(base);
+        const root = try self.path(&.{ "rev-parse", "--git-path", base });
         defer self.allocator.free(root);
         const cwd = self.cwd orelse Io.Dir.cwd();
         var dir = cwd.openDir(self.io, root, .{ .iterate = true }) catch |err| switch (err) {
@@ -412,193 +465,71 @@ pub const Git = struct {
         defer walker.deinit();
         while (try walker.next(self.io)) |entry| {
             if (entry.kind == .directory) continue;
-            const name = try std.fmt.allocPrint(self.allocator, "refs/{s}", .{entry.path});
-            defer self.allocator.free(name);
-            if (!std.mem.startsWith(u8, name, prefix) or std.mem.endsWith(u8, name, ".lock")) continue;
-            if (entry.kind == .sym_link) {
-                try self.requireDirectRef(name);
-                continue;
-            }
+            const bytes = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ base, entry.path });
+            defer self.allocator.free(bytes);
+            if (!std.mem.startsWith(u8, bytes, prefix) or std.mem.endsWith(u8, bytes, ".lock")) continue;
+            const name = try RefName.init(bytes);
+            if (entry.kind == .sym_link) try self.requireDirectRef(name);
             const file = entry.dir.openFile(self.io, entry.basename, .{}) catch |err| switch (err) {
                 error.FileNotFound => continue, // a concurrent pack/prune removed the loose copy
                 else => return err,
             };
             defer file.close(self.io);
-            var header: [4]u8 = undefined;
-            const len = try file.readPositionalAll(self.io, &header, 0);
-            if (len == header.len and std.mem.eql(u8, &header, "ref:")) try self.requireDirectRef(name);
+            var contents: [128]u8 = undefined;
+            const len = try file.readPositionalAll(self.io, &contents, 0);
+            if (std.mem.startsWith(u8, contents[0..len], "ref:")) {
+                try self.requireDirectRef(name);
+                continue;
+            }
+            if (len == contents.len) return error.InvalidGitOutput;
+            _ = Oid.init(format, std.mem.trim(u8, contents[0..len], " \t\r\n")) catch
+                return error.InvalidGitOutput;
         }
     }
 
-    pub const ExpectedRef = struct {
-        name: []const u8,
-        oid: []const u8,
-    };
+    pub const ExpectedRef = types.ExpectedRef;
+    pub const RefUpdate = types.RefUpdate;
 
-    /// One line of an `update-ref --stdin` transaction.
-    pub const RefUpdate = union(enum) {
-        verify: ExpectedRef,
-        /// create `name` at `oid`; fails if it already exists
-        create: ExpectedRef,
-        /// compare-and-swap `name` from `old` to `new`
-        update: struct { name: []const u8, new: []const u8, old: []const u8 },
-        delete: ExpectedRef,
-    };
-
-    /// Publish with compare-and-swap and retain intent across partial Git writes.
-    pub fn transact(
-        self: *const Git,
-        message: []const u8,
-        updates: []const RefUpdate,
-    ) !void {
-        return @import("ref_transaction.zig").transact(self, message, updates);
+    pub fn beginStackMutation(self: *const Git) !@import("mutation.zig").Mutation {
+        return @import("mutation.zig").begin(self, .stack);
     }
 
-    pub fn recoverTransaction(self: *const Git) !bool {
-        return @import("ref_transaction.zig").recover(self);
+    pub fn beginEditMutation(self: *const Git) !@import("mutation.zig").Mutation {
+        return @import("mutation.zig").begin(self, .edit);
+    }
+
+    /// Object/ref plumbing also supports bare repositories.
+    pub fn beginRefMutation(self: *const Git) !@import("mutation.zig").Mutation {
+        return @import("mutation.zig").begin(self, .refs);
     }
 
     pub fn requireNoPendingTransaction(self: *const Git) !void {
         return @import("ref_transaction.zig").requirePublished(self);
     }
 
-    /// One Git transaction. Only individual ref writes are crash-atomic.
-    /// The journal uses this primitive to avoid recursively journaling itself.
-    pub fn transactRaw(
-        self: *const Git,
-        message: []const u8,
-        updates: []const RefUpdate,
-    ) !void {
-        var refused = false;
-        return self.transactRawWithRefusal(message, updates, &refused);
+    pub fn parseOid(self: *const Git, hex: []const u8) !Oid {
+        return Oid.init(try self.objectFormat(), hex);
     }
 
-    /// A normal failure before preparation or a type-check abort confirms no
-    /// requested refs changed. Interrupted commits and I/O errors are uncertain.
-    pub fn transactRawWithRefusal(
-        self: *const Git,
-        message: []const u8,
-        updates: []const RefUpdate,
-        refused: *bool,
-    ) !void {
-        refused.* = false;
-        var transaction: Io.Writer.Allocating = .init(self.allocator);
-        defer transaction.deinit();
-        const w = &transaction.writer;
-
-        try w.writeAll("start\n");
-        for (updates) |update| switch (update) {
-            .verify => |ref| {
-                try checkUpdate(ref.name, &.{ref.oid});
-                try w.print("verify {s} {s}\n", .{ ref.name, ref.oid });
-            },
-            .create => |ref| {
-                try checkUpdate(ref.name, &.{ref.oid});
-                try w.print("create {s} {s}\n", .{ ref.name, ref.oid });
-            },
-            .update => |ref| {
-                try checkUpdate(ref.name, &.{ ref.new, ref.old });
-                try w.print("update {s} {s} {s}\n", .{ ref.name, ref.new, ref.old });
-            },
-            .delete => |ref| {
-                try checkUpdate(ref.name, &.{ref.oid});
-                try w.print("delete {s} {s}\n", .{ ref.name, ref.oid });
-            },
-        };
-        try w.writeAll("prepare\n");
-
-        const publication = try self.inputRefTransaction(message, transaction.written(), updates);
-        const result = publication.result;
-        defer self.freeResult(result);
-        if (publication.rejected or !result.term.success()) {
-            // Git acknowledges prepare before it processes commit. An ordinary
-            // fatal exit with only the start acknowledgement is a refusal,
-            // rather than an interrupted commit that may have written refs.
-            refused.* = publication.rejected or (result.term == .exited and result.term.exited == 128 and
-                std.mem.eql(u8, result.stdout, "start: ok\n"));
-            return self.fail(result.stderr);
-        }
+    /// Constructors for byte-oriented checkpoint and snapshot data.
+    pub fn expectedRef(self: *const Git, name: []const u8, hex: []const u8) !types.ExpectedRef {
+        return .{ .name = try RefName.init(name), .oid = try self.parseOid(hex) };
     }
 
-    const Publication = struct { result: std.process.RunResult, rejected: bool };
-
-    /// --no-deref locks the requested names, including symbolic and absent
-    /// refs. Check their types only after prepare acknowledges those locks,
-    /// and keep stdin open so Git cannot publish before we choose commit.
-    fn inputRefTransaction(self: *const Git, message: []const u8, data: []const u8, updates: []const RefUpdate) !Publication {
-        const argv = try self.argvFor(&.{ "update-ref", "--no-deref", "--create-reflog", "-m", message, "--stdin" });
-        defer self.allocator.free(argv);
-        var child = try std.process.spawn(self.io, .{
-            .argv = argv,
-            .cwd = self.childCwd(),
-            .environ_map = self.environ_map,
-            .stdin = .pipe,
-            .stdout = .pipe,
-            .stderr = .pipe,
-        });
-        defer child.kill(self.io);
-
-        var input_task = try self.io.concurrent(writePreparedInput, .{ self.io, child.stdin.?, data });
-        defer input_task.cancel(self.io) catch {};
-        var buffer: Io.File.MultiReader.Buffer(2) = undefined;
-        var reader: Io.File.MultiReader = undefined;
-        reader.init(self.allocator, self.io, buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
-        defer reader.deinit();
-        var decided = false;
-        var rejection: ?[]u8 = null;
-        defer if (rejection) |reason| self.allocator.free(reason);
-        var validation_error: ?anyerror = null;
-        while (reader.fill(64, .none)) |_| {
-            try reader.checkAnyError();
-            const stdout = reader.reader(0).buffered();
-            if (stdout.len > stdout_limit or reader.reader(1).buffered().len > stderr_limit)
-                return error.StreamTooLong;
-            if (!decided and std.mem.endsWith(u8, stdout, "prepare: ok\n")) {
-                try input_task.await(self.io);
-                for (updates) |update| {
-                    const name = switch (update) {
-                        inline else => |ref| ref.name,
-                    };
-                    self.requireDirectRef(name) catch |err| {
-                        if (err == error.SymbolicRef) {
-                            rejection = try std.fmt.allocPrint(self.allocator, "cannot publish symbolic ref {s}; managed refs must be direct", .{name});
-                        } else validation_error = err;
-                        break;
-                    };
-                }
-                const command = if (rejection != null or validation_error != null) "abort\n" else "commit\n";
-                try child.stdin.?.writeStreamingAll(self.io, command);
-                child.stdin.?.close(self.io);
-                child.stdin = null;
-                decided = true;
-            }
-        } else |err| switch (err) {
-            error.EndOfStream => {},
-            else => return err,
-        }
-        try reader.checkAnyError();
-        const term = try child.wait(self.io);
-        if (term.success()) {
-            try input_task.await(self.io);
-            if (!decided) return error.InvalidGitOutput;
-            if (validation_error) |err| return err;
-        }
-        const stdout = try reader.toOwnedSlice(0);
-        errdefer self.allocator.free(stdout);
-        const stderr = if (rejection) |reason| try self.allocator.dupe(u8, reason) else try reader.toOwnedSlice(1);
-        return .{ .result = .{ .term = term, .stdout = stdout, .stderr = stderr }, .rejected = rejection != null };
+    pub fn verifyRef(self: *const Git, name: []const u8, expected: ?[]const u8) !types.RefUpdate {
+        return .{ .verify = .{ .name = try RefName.init(name), .expected = if (expected) |hex| try self.parseOid(hex) else null } };
     }
 
-    fn writePreparedInput(io: Io, pipe: Io.File, data: []const u8) !void {
-        try pipe.writeStreamingAll(io, data);
+    pub fn createRef(self: *const Git, name: []const u8, new: []const u8) !types.RefUpdate {
+        return .{ .create = .{ .name = try RefName.init(name), .new = try self.parseOid(new) } };
     }
 
-    pub fn checkUpdate(name: []const u8, oids: []const []const u8) Error!void {
-        if (!std.mem.startsWith(u8, name, "refs/") or !isProtocolSafe(name))
-            return error.InvalidRefName;
-        for (oids) |oid| {
-            if (!isOid(oid)) return error.InvalidOid;
-        }
+    pub fn updateRef(self: *const Git, name: []const u8, old: []const u8, new: []const u8) !types.RefUpdate {
+        return .{ .update = .{ .name = try RefName.init(name), .old = try self.parseOid(old), .new = try self.parseOid(new) } };
+    }
+
+    pub fn deleteRef(self: *const Git, name: []const u8, old: []const u8) !types.RefUpdate {
+        return .{ .delete = .{ .name = try RefName.init(name), .old = try self.parseOid(old) } };
     }
 
     /// Feed stdin while draining both output pipes. Git supplies object IDs.
@@ -606,7 +537,7 @@ pub const Git = struct {
         const result = try self.inputResult(args, data);
         defer self.allocator.free(result.stderr);
         errdefer self.allocator.free(result.stdout);
-        if (!result.term.success()) return self.fail(result.stderr);
+        if ((try exitCode(result)) != 0) return self.recordFailure(result.stderr);
         return self.allocator.realloc(result.stdout, std.mem.trimEnd(u8, result.stdout, "\r\n").len);
     }
 
@@ -658,9 +589,10 @@ pub const Git = struct {
         self.allocator.free(stdout);
     }
 
-    pub const ObjectFormat = enum { sha1, sha256 };
+    pub const ObjectFormat = types.ObjectFormat;
 
     pub fn objectFormat(self: *const Git) !ObjectFormat {
+        if (self.object_format) |format| return format;
         const format = try self.output(&.{ "rev-parse", "--show-object-format" });
         defer self.allocator.free(format);
         return std.meta.stringToEnum(ObjectFormat, format) orelse
@@ -673,10 +605,15 @@ pub const Git = struct {
     }
 
     fn writeObject(self: *const Git, kind: []const u8, data: []const u8) ![]u8 {
-        const oid = try self.inputOutput(&.{ "hash-object", "-w", "-t", kind, "--stdin" }, data);
-        errdefer self.allocator.free(oid);
-        if (!isOid(oid)) return error.InvalidGitOutput;
-        return oid;
+        const format = try self.objectFormat();
+        return self.validateOidOutput(format, try self.inputOutput(&.{ "hash-object", "-w", "-t", kind, "--stdin" }, data));
+    }
+
+    /// Takes ownership of Git's output and returns it only when it is a full OID.
+    fn validateOidOutput(self: *const Git, format: ObjectFormat, raw: []u8) ![]u8 {
+        errdefer self.allocator.free(raw);
+        _ = Oid.init(format, raw) catch return error.InvalidGitOutput;
+        return raw;
     }
 
     pub const TreeEntry = struct { name: []const u8, oid: []const u8, tree: bool = false };
@@ -692,8 +629,7 @@ pub const Git = struct {
             if (entry.name.len == 0 or std.mem.indexOfAny(u8, entry.name, "/\x00\n") != null)
                 return error.InvalidRefName;
             if ((try names.getOrPut(self.allocator, entry.name)).found_existing) return error.InvalidRefName;
-            if (!isOid(entry.oid) or entry.oid.len != (if (format == .sha1) @as(usize, 40) else 64))
-                return error.InvalidOid;
+            _ = try Oid.init(format, entry.oid);
             try data.writer.print("{s} {s} {s}\t{s}\x00", .{
                 if (entry.tree) "040000" else "100644",
                 if (entry.tree) "tree" else "blob",
@@ -701,43 +637,61 @@ pub const Git = struct {
                 entry.name,
             });
         }
-        return self.inputOutput(&.{ "mktree", "-z" }, data.written());
+        return self.validateOidOutput(format, try self.inputOutput(&.{ "mktree", "-z" }, data.written()));
     }
+
+    pub const CommitTreeOptions = struct {
+        identity: ?struct { name: []const u8, email: []const u8 } = null,
+    };
 
     /// Create a checkpoint commit, preserving parent order and bypassing hooks/signing.
     pub fn commitTree(self: *const Git, tree: []const u8, parents: []const []const u8, label: []const u8) ![]u8 {
-        if (!isOid(tree)) return error.InvalidOid;
+        return self.commitTreeWithOptions(tree, parents, label, .{});
+    }
+
+    /// Internal journals may supply an identity without changing repository config.
+    pub fn commitTreeWithOptions(self: *const Git, tree: []const u8, parents: []const []const u8, label: []const u8, options: CommitTreeOptions) ![]u8 {
+        const format = try self.objectFormat();
+        _ = try Oid.init(format, tree);
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(self.allocator);
+        const name = if (options.identity) |identity| try std.fmt.allocPrint(self.allocator, "user.name={s}", .{identity.name}) else null;
+        defer if (name) |value| self.allocator.free(value);
+        const email = if (options.identity) |identity| try std.fmt.allocPrint(self.allocator, "user.email={s}", .{identity.email}) else null;
+        defer if (email) |value| self.allocator.free(value);
+        if (name) |value| try args.appendSlice(self.allocator, &.{ "-c", value, "-c", email.? });
         try args.appendSlice(self.allocator, &.{ "-c", "commit.gpgsign=false", "commit-tree", tree, "-m", label });
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         defer seen.deinit(self.allocator);
         for (parents) |parent| {
-            if (!isOid(parent)) return error.InvalidOid;
+            _ = try Oid.init(format, parent);
             if ((try seen.getOrPut(self.allocator, parent)).found_existing) continue;
             try args.appendSlice(self.allocator, &.{ "-p", parent });
         }
-        return self.output(args.items);
+        return self.validateOidOutput(format, try self.output(args.items));
     }
 
     /// Three-way merge of two commits in memory; neither the index nor the
     /// worktree is touched. Returns the merged tree, or null when the merge
     /// conflicts. Needs Git 2.40 or newer for the explicit merge base.
     pub fn mergeTree(self: *const Git, base: []const u8, ours: []const u8, theirs: []const u8) !?[]u8 {
-        if (!isOid(base) or !isOid(ours) or !isOid(theirs)) return error.InvalidOid;
+        const format = try self.objectFormat();
+        for ([_][]const u8{ base, ours, theirs }) |oid| _ = try Oid.init(format, oid);
         const merge_base = try std.fmt.allocPrint(self.allocator, "--merge-base={s}", .{base});
         defer self.allocator.free(merge_base);
         const result = try self.run(&.{ "merge-tree", "--write-tree", "--no-messages", merge_base, ours, theirs });
         defer self.allocator.free(result.stderr);
-        errdefer self.allocator.free(result.stdout);
+        var owns_stdout = true;
+        defer if (owns_stdout) self.allocator.free(result.stdout);
         switch (try exitCode(result)) {
-            0 => return try self.allocator.realloc(result.stdout, std.mem.trimEnd(u8, result.stdout, "\r\n").len),
-            1 => {
-                self.allocator.free(result.stdout);
-                return null;
+            0 => {
+                const raw = try self.allocator.realloc(result.stdout, std.mem.trimEnd(u8, result.stdout, "\r\n").len);
+                owns_stdout = false;
+                return try self.validateOidOutput(format, raw);
             },
+            1 => return null,
             129 => return error.UnsupportedGitVersion,
-            else => return self.fail(result.stderr),
+            else => return self.recordFailure(result.stderr),
         }
     }
 
@@ -745,7 +699,8 @@ pub const Git = struct {
     /// committer and message are kept; signatures are dropped because they
     /// would no longer verify.
     pub fn rewriteCommit(self: *const Git, source: []const u8, tree: []const u8, parent: []const u8) ![]u8 {
-        if (!isOid(source) or !isOid(tree) or !isOid(parent)) return error.InvalidOid;
+        const format = try self.objectFormat();
+        for ([_][]const u8{ source, tree, parent }) |oid| _ = try Oid.init(format, oid);
         const raw = try self.outputRaw(&.{ "cat-file", "commit", source });
         defer self.allocator.free(raw);
         const split = std.mem.indexOf(u8, raw, "\n\n") orelse return error.InvalidGitOutput;
@@ -770,35 +725,9 @@ pub const Git = struct {
         try data.writer.writeAll(raw[split + 1 ..]);
         return self.writeObject("commit", data.written());
     }
-
-    pub fn switchBranch(self: *const Git, ref_name: []const u8) !void {
-        if (!isSafeBranchRef(ref_name)) return error.InvalidRefName;
-
-        const branch = ref_name[layout.branch_prefix.len..];
-
-        // Reject option-like names and Git's "-" previous-branch shorthand.
-        if (branch[0] == '-') return error.InvalidRefName;
-
-        try self.exec(&.{
-            "switch", "--quiet", "--no-guess", "--no-overwrite-ignore", "--", branch,
-        });
-    }
 };
 
 const testing = std.testing;
-
-test "isOid accepts only full lowercase sha1/sha256 ids" {
-    const sha1: [40]u8 = @splat('a');
-    const sha256: [64]u8 = @splat('f');
-    const upper: [40]u8 = @splat('A');
-    const option: [40]u8 = ("--output=x" ++ @as([30]u8, @splat('a'))).*;
-
-    try testing.expect(isOid(&sha1));
-    try testing.expect(isOid(&sha256));
-    try testing.expect(!isOid("abc"));
-    try testing.expect(!isOid(&upper));
-    try testing.expect(!isOid(&option));
-}
 
 test "isSafeBranchRef rejects options and protocol injection" {
     try testing.expect(isSafeBranchRef("refs/heads/main"));
@@ -811,21 +740,4 @@ test "isSafeBranchRef rejects options and protocol injection" {
     try testing.expect(!isSafeBranchRef("refs/heads/a\tb"));
     try testing.expect(!isSafeBranchRef("refs/heads/a\x00b"));
     try testing.expect(!isSafeBranchRef("refs/heads/a\x7fb"));
-}
-
-test "checkUpdate guards every name and oid written to update-ref" {
-    const oid: [40]u8 = @splat('a');
-    try Git.checkUpdate("refs/stakrr/tip", &.{&oid});
-    try Git.checkUpdate("refs/heads/main", &.{ &oid, &oid });
-    for ([_][]const u8{
-        "heads/main",
-        "-refs/heads/main",
-        "refs/heads/a b",
-        "refs/heads/a\nverify x",
-        "refs/heads/a\x00",
-        "refs/heads/a\x7f",
-    }) |name| {
-        try testing.expectError(error.InvalidRefName, Git.checkUpdate(name, &.{&oid}));
-    }
-    try testing.expectError(error.InvalidOid, Git.checkUpdate("refs/x", &.{ &oid, "HEAD" }));
 }

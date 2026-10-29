@@ -1,5 +1,6 @@
 //! Private edit model and checkpoint codec. All returned slices belong to
 //! the caller's command arena. No Git mutation occurs while loading state.
+const RefName = @import("git.zig").RefName;
 const std = @import("std");
 const git_mod = @import("git.zig");
 const Git = git_mod.Git;
@@ -131,7 +132,7 @@ pub const Loaded = struct {
 // Flatten the phase union so the on-disk representation is independent of
 // runtime phase invariants; `load` re-establishes them.
 const WireSession = struct {
-    version: u8 = 2,
+    version: u8 = layout.checkpoint_version,
     oplog_parent: ?[]const u8 = null,
     outcome: Outcome = .active,
     operation: Operation = .edit,
@@ -173,7 +174,7 @@ pub fn encode(allocator: std.mem.Allocator, s: *const Session) ![]u8 {
 }
 
 pub fn load(git: *const Git) !?Loaded {
-    const oid = (try git.readRef(layout.session_ref)) orelse return null;
+    const oid = (try git.readDirectRefAlloc(try RefName.init(layout.session_ref))) orelse return null;
     return try loadAt(git, oid);
 }
 
@@ -190,6 +191,8 @@ pub fn loadAt(git: *const Git, oid: []const u8) !Loaded {
 /// Decode and validate a checkpoint without reading its replay plan. For
 /// read-only callers; anything that resumes a session must use `loadAt`.
 pub fn loadMetadata(git: *const Git, oid: []const u8) !Loaded {
+    const format = try git.objectFormat();
+    if (!validOid(format, oid)) return error.InvalidEditSession;
     const kind = try git.output(&.{ "cat-file", "-t", oid });
     if (!std.mem.eql(u8, kind, "commit")) return error.InvalidEditSession;
     const path = try std.fmt.allocPrint(git.allocator, "{s}:session.json", .{oid});
@@ -208,16 +211,16 @@ pub fn loadMetadata(git: *const Git, oid: []const u8) !Loaded {
     };
 
     const wire = parsed.value;
-    if (wire.version != 2) return error.InvalidEditSession;
-    if (wire.oplog_parent) |parent| if (!validOid(parent, oid.len)) return error.InvalidEditSession;
+    if (wire.version != layout.checkpoint_version) return error.InvalidEditSession;
+    if (wire.oplog_parent) |parent| if (!validOid(format, parent)) return error.InvalidEditSession;
     if (wire.plan_oid != null) {
         const plan_path = try std.fmt.allocPrint(git.allocator, "{s}:plan", .{oid});
         const actual = git.output(&.{ "rev-parse", "--verify", plan_path }) catch return error.InvalidEditSession;
         if (!std.mem.eql(u8, actual, wire.plan_oid.?)) return error.InvalidEditSession;
     }
-    if (!validOid(wire.id, oid.len) or
-        !validOid(wire.anchor, oid.len) or
-        !validOid(wire.before, oid.len))
+    if (!validOid(format, wire.id) or
+        !validOid(format, wire.anchor) or
+        !validOid(format, wire.before))
         return error.InvalidEditSession;
     if (!git_mod.isSafeBranchRef(wire.origin) or wire.owner.len == 0)
         return error.InvalidEditSession;
@@ -230,11 +233,11 @@ pub fn loadMetadata(git: *const Git, oid: []const u8) !Loaded {
         if (rollback.expected.len != wire.nodes.len or rollback.target.len != wire.nodes.len)
             return error.InvalidEditSession;
         for (rollback.expected, rollback.target) |from, to|
-            if (!validOid(from, oid.len) or !validOid(to, oid.len)) return error.InvalidEditSession;
+            if (!validOid(format, from) or !validOid(format, to)) return error.InvalidEditSession;
     }
 
     const branches = stack.parseConfig(wire.config) catch return error.InvalidEditSession;
-    if (!std.mem.eql(u8, branches.work_ref, wire.nodes[wire.nodes.len - 1].ref_name))
+    if (!std.mem.eql(u8, branches.work_ref.name.bytes, wire.nodes[wire.nodes.len - 1].ref_name))
         return error.InvalidEditSession;
 
     const nodes = wire.nodes;
@@ -242,9 +245,9 @@ pub fn loadMetadata(git: *const Git, oid: []const u8) !Loaded {
     defer names.deinit(git.allocator);
     for (nodes, 0..) |node, i| {
         if (!git_mod.isSafeBranchRef(node.ref_name)) return error.InvalidEditSession;
-        if (!validOid(node.original_oid, oid.len) or
-            !validOid(node.published_oid, oid.len) or
-            !validOid(node.pending_oid, oid.len))
+        if (!validOid(format, node.original_oid) or
+            !validOid(format, node.published_oid) or
+            !validOid(format, node.pending_oid))
             return error.InvalidEditSession;
         if (i < nodes.len - 1) {
             const name = layout.layerName(node.ref_name) orelse
@@ -257,7 +260,7 @@ pub fn loadMetadata(git: *const Git, oid: []const u8) !Loaded {
 
     var progress: ?Replay = null;
     if (wire.plan_oid) |plan| {
-        if (!validOid(plan, oid.len)) return error.InvalidEditSession;
+        if (!validOid(format, plan)) return error.InvalidEditSession;
         progress = .{
             .plan_oid = plan,
             .plan_len = wire.plan_len,
@@ -314,11 +317,14 @@ pub fn previous(git: *const Git, oid: []const u8) !?[]const u8 {
         else => return err,
     };
     if (value.len == 0) return null;
-    if (!git_mod.isOid(value)) return error.InvalidEditSession;
+    _ = git.parseOid(value) catch |err| switch (err) {
+        error.InvalidOid => return error.InvalidEditSession,
+        else => return err,
+    };
     return value;
 }
 
-/// Write a v2 journal commit. Blobs live in its tree; commits to retain are
+/// Write a v1 journal commit. Blobs live in its tree; commits to retain are
 /// parents, so ordinary Git reachability protects everything from pruning.
 pub fn create(git: *const Git, s: *const Session, old: ?[]const u8, retain: []const []const u8, label: []const u8) ![]u8 {
     var entries: std.ArrayList(Git.TreeEntry) = .empty;
@@ -346,8 +352,9 @@ pub fn create(git: *const Git, s: *const Session, old: ?[]const u8, retain: []co
     return git.commitTree(try git.writeTree(entries.items), parents.items, label);
 }
 
-fn validOid(oid: []const u8, len: usize) bool {
-    return oid.len == len and git_mod.isOid(oid);
+fn validOid(format: Git.ObjectFormat, oid: []const u8) bool {
+    _ = git_mod.Oid.init(format, oid) catch return false;
+    return true;
 }
 
 fn loadReplayPlan(git: *const Git, s: *const Session) ![]const []const u8 {

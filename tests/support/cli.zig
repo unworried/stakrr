@@ -7,8 +7,16 @@ const Repo = @import("repo.zig").Repo;
 pub const Run = struct {
     /// null when the process did not exit normally (e.g. a fault kill)
     code: ?u8,
+    term: std.process.Child.Term,
     stdout: []u8,
     stderr: []u8,
+
+    /// A command refusal or panic must not masquerade as an injected crash.
+    pub fn expectKilled(self: Run) !void {
+        if (self.term != .signal or self.term.signal != .KILL)
+            std.debug.print("expected injected SIGKILL, got {f}: {s}\n", .{ self.term, self.stderr });
+        try testing.expectEqualDeep(std.process.Child.Term{ .signal = .KILL }, self.term);
+    }
 
     pub fn deinit(self: Run) void {
         testing.allocator.free(self.stdout);
@@ -22,9 +30,17 @@ pub fn run(repo: *const Repo, args: []const []const u8) !Run {
 }
 
 pub fn runAt(repo: *const Repo, args: []const []const u8, cwd: std.Io.Dir) !Run {
+    return runExecutable(repo, exe_path, args, cwd);
+}
+
+pub fn runRefDriver(repo: *const Repo, args: []const []const u8) !Run {
+    return runExecutable(repo, @import("cli_options").ref_driver_path, args, repo.git.cwd orelse repo.tmp.dir);
+}
+
+fn runExecutable(repo: *const Repo, path: []const u8, args: []const []const u8, cwd: std.Io.Dir) !Run {
     // the build passes a path relative to the build root; the child runs
     // inside the temp repository, so resolve it first
-    const exe = try std.Io.Dir.cwd().realPathFileAlloc(testing.io, exe_path, testing.allocator);
+    const exe = try std.Io.Dir.cwd().realPathFileAlloc(testing.io, path, testing.allocator);
     defer testing.allocator.free(exe);
 
     var argv: std.ArrayList([]const u8) = .empty;
@@ -43,6 +59,7 @@ pub fn runAt(repo: *const Repo, args: []const []const u8, cwd: std.Io.Dir) !Run 
             .exited => |code| code,
             else => null,
         },
+        .term = result.term,
         .stdout = result.stdout,
         .stderr = result.stderr,
     };

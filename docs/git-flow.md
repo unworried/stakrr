@@ -10,13 +10,19 @@ Remote publication is outside these flows; `submit` remains unimplemented.
 - Hold `<git-common-dir>/stakrr.lock` for the entire mutation, across all
   worktrees. Release the lock without unlinking its inode. After acquiring it,
   recover any pending ref transaction before inspecting stack or session state.
+  Workflows acquire a `Mutation` context and publish, check out branches, detach
+  and replay through it; publication never starts recovery after a workflow has
+  observed its snapshot. See
+  [the Git API](git-api.md) for the ownership and publication interfaces.
 - `init`, `cut`, `reset`, `go`, `up`, `down`, `fix` and `undo` must refuse while
   `refs/stakrr/edit` exists. Use `continue`, `abort` or `quit` for a pending edit.
 - Base/work branches, layer branches and internal refs must be direct refs.
   Reject symbolic refs even when they resolve to the expected OID or their
   targets are absent. HEAD itself remains symbolic.
 - Prefix discovery includes loose names, because `for-each-ref` omits dangling
-  symbolic refs. It currently requires Git's files ref storage (loose and packed
+  symbolic refs and malformed loose refs. Reject either within the requested
+  prefix before treating its listing as complete. Discovery currently requires
+  Git's files ref storage (loose and packed
   refs); report unsupported storage rather than accepting an incomplete listing.
   Git's portable CLI does not enumerate dangling symbolic refs in reftable
   storage. Explicit ref publication and transaction recovery remain independent
@@ -29,6 +35,10 @@ Remote publication is outside these flows; `submit` remains unimplemented.
   check alone nor `--no-deref` alone enforces the direct-ref requirement.
   Every updated/deleted ref must match its expected old OID; every
   created ref must be absent. A compare-and-swap refusal publishes no changes.
+  Derive branch availability checks from the actual writes. By default refuse
+  writes to branches checked out in any worktree; an explicit policy may allow
+  updates to one named branch in the caller's worktree. Duplicate checkouts in
+  other worktrees and deletion of any checked-out branch remain refusals.
   Git's files backend can publish only some refs if Git itself is interrupted;
   the intent protocol below covers that case.
 - Never insert an implicit stash, `reset --hard`, forced checkout or discarded
@@ -72,6 +82,12 @@ availability before moving branches. Compare-and-swap remaining old refs to thei
 new values, verify already published refs, then remove the intent. Keep all
 candidate objects reachable through pruning, including archived annotated tags.
 Refuse branch deletions when checked out in any worktree, including the caller's.
+Publication intents use version 1 and record any current-branch exception
+with the originating worktree's absolute Git directory. Recovery applies that
+exception only in its originating worktree and uses the same publication
+validator. Missing ref values are null in the intent; only the Git protocol
+backend emits zero-OID absence sentinels. Stack config, edit checkpoints and
+publication intents all use v1, with no legacy format migration.
 `continue` can complete this publication even when no edit session remains.
 `status` and `log` report pending publication without recovering it.
 When all final ref values already match, they may read the completed operation
@@ -88,6 +104,10 @@ filesystem durability policy.
 boundary `refs/stakrr/layers/<name>`. A branch differing from its record is
 **stale**. `refs/stakrr/anchor` fixes the base OID at initialization;
 `refs/stakrr/tip` guards the highest recorded boundary.
+
+Checkpoint object IDs and history links must be nonzero full IDs of the
+repository's object format. Reject zero IDs and IDs from another format as
+invalid edit sessions; `quit` can archive a corrupt checkpoint without resuming it.
 
 **Inspect the stack** means: read config, anchor, base/work tips, layer branches
 and records; require anchor ancestry; read
@@ -120,8 +140,10 @@ select version.
 1. Lock and refuse an active edit, existing config, layer branches, records,
    anchor or tip. Old operation-log history may remain.
 2. Read symbolic HEAD. Require a valid, distinct local base branch and both
-   branch names outside the layer namespace. Resolve both tips, require base
-   ancestry, and reject merges in `base..work`.
+   branch names outside the layer namespace. Validate names with the same
+   branch-name rules used when reading config, including refusing a base whose
+   short name starts with `-`. Resolve both tips, require base ancestry, and
+   reject merges in `base..work`.
 3. Create the anchor at the observed base OID in a ref transaction.
 4. Write `git config --local stakrr.state 'v1 <base-ref> <work-ref>'`.
    On failure, attempt to delete the just-created anchor with its expected OID.
@@ -178,8 +200,7 @@ metadata. Unrelated ignored files are allowed.
 
 1. Lock, refuse an active edit, inspect the stack, and require HEAD on work with
    no Git operation. Require layers and no stale layer. Select the named layer,
-   defaulting to the highest; require it and all higher layers to be free in
-   other worktrees. Then require a staged diff with
+   defaulting to the highest. Then require a staged diff with
    `git diff --no-relative --cached --quiet`.
 2. Capture the index with `git write-tree`; create a temporary commit with that
    tree and old work as parent. Merge it into the target layer using
@@ -196,7 +217,9 @@ metadata. Unrelated ignored files are allowed.
 5. Build a completed checkpoint retaining original/replacement boundaries and
    old work. In one transaction update the target/higher layer branches and
    records, work, tip guard and operation log; verify the anchor. Compare every
-   changed ref with its observed old OID.
+   changed ref with its observed old OID. Publication checks the target/higher
+   layer branches and work for other checkouts, explicitly allowing the caller's
+   current work branch.
 
 Keep HEAD, the staged tree and working files in place. The staged diff becomes
 empty against new work; unstaged edits remain. Refusal publishes no refs and
@@ -335,7 +358,7 @@ layer branches block initialization until removed or deleted by another reset.
 | --- | --- | --- |
 | Init, inspect, cut, navigation, reset | [stack.zig](../src/stack.zig) | [stack](../tests/stack_test.zig), [cut](../tests/cut_test.zig), [reset](../tests/reset_test.zig) |
 | Fix | [fix.zig](../src/fix.zig) | [fix](../tests/fix_test.zig) |
-| Interrupted ref publication | [ref_transaction.zig](../src/ref_transaction.zig) | [transactions](../tests/transaction_test.zig), [Git](../tests/git_test.zig) |
+| Mutation ownership and interrupted ref publication | [mutation.zig](../src/mutation.zig), [ref_transaction.zig](../src/ref_transaction.zig), [protocol backend](../src/ref_backend.zig) | [transactions](../tests/transaction_test.zig), [Git](../tests/git_test.zig) |
 | Restack and recovery, undo, log | [edit.zig](../src/edit.zig), [checkpoint codec](../src/edit_session.zig) | [edit](../tests/edit_test.zig), [recovery](../tests/edit_recovery_test.zig), [undo](../tests/undo_test.zig) |
 | Arguments, output and exits | [cli.zig](../src/cli.zig), [main.zig](../src/main.zig) | [CLI](../tests/cli_test.zig) |
 

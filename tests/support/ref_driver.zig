@@ -14,20 +14,17 @@ pub fn main(init: std.process.Init) !void {
 
 fn run(git: *const stakrr.git.Git, args: []const []const u8) !void {
     if (std.mem.eql(u8, args[0], "recover") or std.mem.eql(u8, args[0], "retain")) {
-        // Journal APIs require the common mutation lock, including in a child.
-        const common = try git.path(&.{ "rev-parse", "--path-format=absolute", "--git-common-dir" });
-        const path = try std.fs.path.join(git.allocator, &.{ common, "stakrr.lock" });
-        const guard = try std.Io.Dir.cwd().createFile(git.io, path, .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true });
-        defer guard.close(git.io);
+        var mutation = try git.beginRefMutation();
+        defer mutation.deinit();
         if (std.mem.eql(u8, args[0], "recover")) {
-            if (!try git.recoverTransaction()) return error.ExpectedPendingTransaction;
+            if (!mutation.recovered) return error.ExpectedPendingTransaction;
         } else {
-            try git.transact("test retained objects", &.{
-                .{ .update = .{ .name = "refs/stakrr/commit", .old = args[1], .new = args[2] } },
-                .{ .create = .{ .name = "refs/stakrr/blob", .oid = args[3] } },
-                .{ .create = .{ .name = "refs/stakrr/tree", .oid = args[4] } },
-                .{ .create = .{ .name = "refs/tags/retained", .oid = args[5] } },
-            });
+            try mutation.publish(.{ .message = "test retained objects", .updates = &.{
+                try git.updateRef("refs/stakrr/commit", args[1], args[2]),
+                try git.createRef("refs/stakrr/blob", args[3]),
+                try git.createRef("refs/stakrr/tree", args[4]),
+                try git.createRef("refs/tags/retained", args[5]),
+            } });
         }
         return;
     }
@@ -40,21 +37,25 @@ fn run(git: *const stakrr.git.Git, args: []const []const u8) !void {
         defer result.deinit(git.allocator);
         return;
     }
+    var mutation = try git.beginRefMutation();
+    defer mutation.deinit();
     const name = "refs/stakrr/publication-test";
     const old = args[1];
     const new = args[2];
-    const update: stakrr.git.Git.RefUpdate = if (std.mem.eql(u8, args[0], "verify") or std.mem.eql(u8, args[0], "verify_absent"))
-        .{ .verify = .{ .name = name, .oid = old } }
+    const update = if (std.mem.eql(u8, args[0], "verify"))
+        try git.verifyRef(name, old)
+    else if (std.mem.eql(u8, args[0], "verify_absent"))
+        try git.verifyRef(name, null)
     else if (std.mem.eql(u8, args[0], "create"))
-        .{ .create = .{ .name = name, .oid = new } }
+        try git.createRef(name, new)
     else if (std.mem.eql(u8, args[0], "update"))
-        .{ .update = .{ .name = name, .old = old, .new = new } }
+        try git.updateRef(name, old, new)
     else if (std.mem.eql(u8, args[0], "delete"))
-        .{ .delete = .{ .name = name, .oid = old } }
+        try git.deleteRef(name, old)
     else
         return error.InvalidTestOperation;
-    try git.transactRaw("test symbolic publication", &.{
+    try mutation.publish(.{ .message = "test symbolic publication", .updates = &.{
         update,
-        .{ .create = .{ .name = "refs/stakrr/unrelated", .oid = new } },
-    });
+        try git.createRef("refs/stakrr/unrelated", new),
+    } });
 }
