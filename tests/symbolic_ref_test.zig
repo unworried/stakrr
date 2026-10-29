@@ -271,11 +271,7 @@ test "reset refuses symbolic layer branches including dangling refs and kept lay
 }
 
 test "reset refuses a symbolic tip including a dangling ref" {
-    try resetRef(layout.tip_ref);
-}
-
-test "reset refuses a symbolic anchor including a dangling ref" {
-    try resetRef(layout.anchor_ref);
+    try resetRef(layout.state_ref);
 }
 
 test "init refuses a symbolic work branch without adopting its target" {
@@ -338,7 +334,7 @@ test "reftable prefix discovery refuses safely while explicit ref transactions r
     }
     try repo.exec(&.{ "symbolic-ref", "refs/heads/stakrr/orphan", "refs/heads/missing" });
     try testing.expectError(error.UnsupportedRefStorage, repo.git.listDirectRefs(layout.layer_prefix));
-    var mutation = try repo.git.beginRefMutation();
+    var mutation = try @import("stakrr").mutation.begin(&repo.git, .refs);
     defer mutation.deinit();
     try mutation.publish(.{ .message = "reftable direct publication", .updates = &.{try repo.git.createRef("refs/stakrr/direct", old)} });
     try expectDirect(&repo, "refs/stakrr/direct", old);
@@ -437,18 +433,17 @@ test "CLI reports the symbolic ref and target while preserving user work" {
     var repo = try Repo.init();
     defer repo.deinit();
     try setup(&repo);
-    try alias(&repo, layout.tip_ref, null);
+    try alias(&repo, layout.state_ref, null);
     try dirty(&repo);
     var before = try Snapshot.capture(&repo);
     defer before.deinit();
     const result = try cli.run(&repo, &.{"status"});
     defer result.deinit();
-    try testing.expectEqual(@as(?u8, 1), result.code);
-    try testing.expect(std.mem.indexOf(u8, result.stderr, "managed branches and internal refs must be direct refs") != null);
-    try testing.expect(std.mem.indexOf(u8, result.stderr, layout.tip_ref) != null);
-    try testing.expect(std.mem.indexOf(u8, result.stderr, victim) != null);
+    try testing.expectEqual(@as(?u8, 0), result.code);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "symbolic ref; direct ref required") != null);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, layout.state_ref) != null);
     try before.expectUnchanged(&repo);
-    try expectSymbolic(&repo, layout.tip_ref);
+    try expectSymbolic(&repo, layout.state_ref);
 }
 
 test "reset refuses to delete the checked-out layer through branch aliases" {
@@ -742,16 +737,8 @@ test "fix refuses symbolic layer branches" {
     try fixRef(subject);
 }
 
-test "fix refuses symbolic layer records" {
-    try fixRef(layout.record_prefix ++ "models");
-}
-
 test "fix refuses a symbolic tip" {
-    try fixRef(layout.tip_ref);
-}
-
-test "fix refuses a symbolic anchor guard" {
-    try fixRef(layout.anchor_ref);
+    try fixRef(layout.state_ref);
 }
 
 test "fix refuses a symbolic rolling branch" {
@@ -807,19 +794,15 @@ test "fix refuses symbolic substitution after discovery before intent creation" 
 }
 
 test "fix refuses symbolic substitution after intent creation before publication" {
-    try commandRace(true, subject, "stakrr: fix models");
+    try commandRace(true, subject, "stakrr: fix");
 }
 
 test "fix refuses a guard becoming symbolic immediately before publication" {
-    try commandRace(true, layout.anchor_ref, "stakrr: fix models");
+    try commandRace(true, layout.state_ref, "stakrr: fix");
 }
 
 fn dirtyFix(repo: *const Repo) !void {
     try repo.write("model", "staged fix\n");
     try repo.exec(&.{ "add", "model" });
     try repo.write("tail", "unstaged work\n");
-}
-
-test "reset refuses symbolic layer records including dangling refs" {
-    try resetRef(layout.record_prefix ++ "models");
 }

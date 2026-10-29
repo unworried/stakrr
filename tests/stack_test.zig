@@ -8,16 +8,6 @@ const support = @import("support/repo.zig");
 const Repo = support.Repo;
 const Snapshot = @import("support/snapshot.zig").Snapshot;
 
-fn setState(repo: *const Repo, state: []const u8) !void {
-    try repo.exec(&.{
-        "config",
-        "--local",
-        "--replace-all",
-        "stakrr.state",
-        state,
-    });
-}
-
 fn addMerge(repo: *const Repo) !void {
     try repo.exec(&.{ "switch", "-q", "-c", "side", "main" });
 
@@ -37,14 +27,10 @@ fn addMerge(repo: *const Repo) !void {
 }
 
 fn expectNoState(repo: *const Repo) !void {
-    const state = try repo.git.configGet("stakrr.state");
-    defer if (state) |value| testing.allocator.free(value);
-    try testing.expect(state == null);
-
-    try repo.expectNoRef(layout.anchor_ref);
+    try repo.expectNoRef(layout.state_ref);
 }
 
-test "inspect: config rejects missing state" {
+test "inspect: rejects missing manifest" {
     var repo = try Repo.init();
     defer repo.deinit();
 
@@ -54,7 +40,7 @@ test "inspect: config rejects missing state" {
     );
 }
 
-test "inspect: config parses initialized state" {
+test "inspect: loads initialized manifest" {
     var repo = try Repo.init();
     defer repo.deinit();
 
@@ -77,89 +63,6 @@ test "inspect: config parses initialized state" {
         base,
         config.anchor_oid,
     );
-}
-
-test "inspect: config rejects malformed state" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-
-    const base = try repo.initStack();
-    defer testing.allocator.free(base);
-
-    const cases = [_]struct {
-        value: []const u8,
-        expected: anyerror,
-    }{
-        .{
-            .value = "v2 refs/heads/main refs/heads/work",
-            .expected = error.UnsupportedConfigVersion,
-        },
-        .{
-            .value = "v1 refs/heads/main",
-            .expected = error.InvalidConfig,
-        },
-        // pre-release state stored the anchor inline as a fourth token
-        .{
-            .value = "v1 refs/heads/main refs/heads/work abc",
-            .expected = error.InvalidConfig,
-        },
-        .{
-            .value = "v1 main refs/heads/work",
-            .expected = error.InvalidConfig,
-        },
-        .{
-            .value = "v1 --output=x refs/heads/work",
-            .expected = error.InvalidConfig,
-        },
-        .{
-            .value = "v1 refs/heads/main refs/heads/main",
-            .expected = error.InvalidConfig,
-        },
-        .{
-            .value = "v1 refs/heads/main refs/heads/stakrr/work",
-            .expected = error.InvalidConfig,
-        },
-        .{
-            .value = "v1 refs/heads/stakrr/base refs/heads/work",
-            .expected = error.InvalidConfig,
-        },
-    };
-
-    for (cases) |case| {
-        try setState(&repo, case.value);
-        try testing.expectError(
-            case.expected,
-            stack.inspect(&repo.git),
-        );
-    }
-}
-
-test "inspect: config reports a missing anchor ref as an inconsistent stack" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-
-    const base = try repo.initStack();
-    defer testing.allocator.free(base);
-
-    try repo.exec(&.{ "update-ref", "-d", layout.anchor_ref });
-
-    try testing.expectError(
-        error.InvalidStack,
-        stack.inspect(&repo.git),
-    );
-}
-
-test "initStack records the anchor as a ref" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-
-    const base = try repo.initStack();
-    defer testing.allocator.free(base);
-
-    const anchor = (try repo.readRef(layout.anchor_ref)).?;
-    defer testing.allocator.free(anchor);
-
-    try testing.expectEqualStrings(base, anchor);
 }
 
 test "initStack accepts a full base ref" {
@@ -239,21 +142,6 @@ test "initStack refuses repeated initialization" {
     try testing.expectEqualStrings(
         base,
         config.anchor_oid,
-    );
-}
-
-test "initStack refuses a leftover anchor ref" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-
-    const base = try repo.initStack();
-    defer testing.allocator.free(base);
-
-    try repo.exec(&.{ "config", "--local", "--unset-all", "stakrr.state" });
-
-    try testing.expectError(
-        error.ExistingStackRefs,
-        stack.initStack(&repo.git, "main"),
     );
 }
 
@@ -355,21 +243,6 @@ test "inspect rejects a merge committed after init" {
     );
 }
 
-test "inspect rejects a tip guard without layers" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-
-    const base = try repo.initStack();
-    defer testing.allocator.free(base);
-
-    try repo.exec(&.{ "update-ref", layout.tip_ref, base });
-
-    try testing.expectError(
-        error.InvalidStack,
-        stack.inspect(&repo.git),
-    );
-}
-
 test "inspect rejects a deleted layer (tip mismatch)" {
     var repo = try Repo.init();
     defer repo.deinit();
@@ -408,25 +281,6 @@ test "inspect rejects a foreign stakrr branch outside the rolling history" {
 
     try testing.expectError(
         error.InvalidStack,
-        stack.inspect(&repo.git),
-    );
-}
-
-test "inspect rejects two layers on the same commit" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-
-    const base = try repo.initStack();
-    defer testing.allocator.free(base);
-
-    const b = try repo.commit("B");
-    defer testing.allocator.free(b);
-    try stack.cut(&repo.git, "p1", null);
-    try repo.exec(&.{ "branch", "stakrr/dup", b });
-    try repo.exec(&.{ "update-ref", layout.record_prefix ++ "dup", b });
-
-    try testing.expectError(
-        error.InvalidLayerBoundary,
         stack.inspect(&repo.git),
     );
 }
@@ -472,7 +326,7 @@ test "stacks work in SHA-256 repositories" {
     try testing.expectEqualStrings(b, snapshot.layers[0].oid);
 }
 
-test "navigate traverses layers by history and stops at the stack boundaries" {
+test "navigate traverses layers in declared order and stops at the stack boundaries" {
     var repo = try Repo.init();
     defer repo.deinit();
     const base = try repo.initStack();
@@ -542,20 +396,6 @@ test "inspect reports a layer committed on past its recorded boundary as stale" 
     try testing.expectEqualStrings(extra, snapshot.layers[0].branch_oid);
     try testing.expectEqual(@as(usize, 1), snapshot.unstacked_commits);
     try testing.expectError(error.StaleLayers, stack.cut(&repo.git, "p2", null));
-}
-
-test "inspect rejects a layer without a recorded boundary" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-
-    const base = try repo.initStack();
-    defer testing.allocator.free(base);
-    const b = try repo.commit("B");
-    defer testing.allocator.free(b);
-    try stack.cut(&repo.git, "p1", null);
-    try repo.exec(&.{ "update-ref", "-d", layout.record_prefix ++ "p1" });
-
-    try testing.expectError(error.InvalidStack, stack.inspect(&repo.git));
 }
 
 test "go switches to a layer by its short name" {

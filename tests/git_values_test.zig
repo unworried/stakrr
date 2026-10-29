@@ -11,7 +11,7 @@ test "validated ref names agree with Git for valid names and protocol injection"
     defer repo.deinit();
     for ([_]struct { name: []const u8, valid: bool }{
         .{ .name = "refs/heads/main", .valid = true },
-        .{ .name = "refs/stakrr/layers/nested/name", .valid = true },
+        .{ .name = "refs/heads/stakrr/nested/name", .valid = true },
         .{ .name = "refs/tags/release-1.0", .valid = true },
         .{ .name = "refs/heads/", .valid = false },
         .{ .name = "refs/heads/.hidden", .valid = false },

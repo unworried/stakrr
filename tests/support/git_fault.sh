@@ -27,12 +27,14 @@ partial=false
 race=false
 for arg do
     [ "$arg" != update-ref ] || update=true
-    [ "$arg" != 'stakrr: edit checkpoint' ] || checkpoint=true
+    case "$arg" in
+        'stakrr: checkpoint '*) checkpoint=true; boundary=${arg#stakrr: checkpoint } ;;
+    esac
     [ "$arg" != 'cherry-pick' ] || pick=true
     [ "$arg" != "${STAKRR_TEST_PARTIAL_LABEL:-}" ] || partial=true
     [ "$arg" != "${STAKRR_TEST_RACE_LABEL:-}" ] || race=true
     case "$arg" in
-        'stakrr: restack'|'stakrr: abort restack'|'stakrr: quit edit'|'stakrr: undo edit') archive=true ;;
+        'stakrr: restack'|'stakrr: abort restack'|'stakrr: quit edit') archive=true ;;
     esac
 done
 # Read the full request before injecting a transport failure, so cleanup tests
@@ -113,29 +115,41 @@ EOF
     { printf '%s' "$payload"; cat; } | "$STAKRR_TEST_GIT" "$@"
     exit $?
 fi
-[ "$update" = true ] || archive=false
+if [ "$update" != true ]; then archive=false; checkpoint=false; boundary=; fi
+# Named boundaries are counted independently, so unrelated checkpoints do not
+# change recovery coverage. Tests assert the fired marker as well as SIGKILL.
 fault=${STAKRR_TEST_FAULT:-}
-if [ "$checkpoint" = true ] && [ -n "$fault" ]; then
+if [ "$checkpoint" = true ]; then :
+elif [ "$archive" = true ]; then boundary=archive
+elif [ "$pick" = true ]; then boundary=pick
+else
+    previous=
+    for arg do
+        if [ "$previous" = worktree ]; then
+            case "$arg" in add) boundary=workspace-create ;; remove) boundary=workspace-remove ;; unlock) boundary=workspace-unlock ;; esac
+        fi
+        if [ "$arg" = switch ]; then boundary=checkout; fi
+        if [ "$arg" = --detach ] && [ "${boundary:-}" = checkout ]; then boundary=checkout-detach; fi
+        previous=$arg
+    done
+fi
+if [ -n "${boundary:-}" ] && [ -n "$fault" ]; then
     count=0
-    [ ! -f "$STAKRR_TEST_COUNTER" ] || read -r count < "$STAKRR_TEST_COUNTER"
+    count_path="$STAKRR_TEST_COUNTER.$boundary"
+    [ ! -f "$count_path" ] || read -r count < "$count_path"
     count=$((count + 1))
-    printf '%s\n' "$count" > "$STAKRR_TEST_COUNTER"
-    if [ "$fault" = "before:$count" ]; then
+    printf '%s\n' "$count" > "$count_path"
+    if [ "$fault" = "before:$boundary:$count" ]; then
+        printf '%s' "$fault" > "$STAKRR_TEST_COUNTER.fired"
         kill -KILL "$PPID"
         exit 1
     fi
 fi
-if [ "$archive" = true ] && [ "$fault" = before:archive ]; then
-    kill -KILL "$PPID"
-    exit 1
-fi
 "$STAKRR_TEST_GIT" "$@"
 result=$?
-if [ "$result" = 0 ]; then
-    if { [ "$checkpoint" = true ] && [ "$fault" = "after:$count" ]; } ||
-       { [ "$pick" = true ] && [ "$fault" = pick ]; } ||
-       { [ "$archive" = true ] && [ "$fault" = after:archive ]; }; then
-        kill -KILL "$PPID"
-    fi
+if [ "$result" = 0 ] && [ -n "${boundary:-}" ] && [ -n "$fault" ] &&
+   [ "$fault" = "after:$boundary:$count" ]; then
+    printf '%s' "$fault" > "$STAKRR_TEST_COUNTER.fired"
+    kill -KILL "$PPID"
 fi
 exit "$result"

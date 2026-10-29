@@ -14,7 +14,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn run(git: *const stakrr.git.Git, args: []const []const u8) !void {
     if (std.mem.eql(u8, args[0], "recover") or std.mem.eql(u8, args[0], "retain")) {
-        var mutation = try git.beginRefMutation();
+        var mutation = try @import("stakrr").mutation.begin(git, .refs);
         defer mutation.deinit();
         if (std.mem.eql(u8, args[0], "recover")) {
             if (!mutation.recovered) return error.ExpectedPendingTransaction;
@@ -37,7 +37,7 @@ fn run(git: *const stakrr.git.Git, args: []const []const u8) !void {
         defer result.deinit(git.allocator);
         return;
     }
-    var mutation = try git.beginRefMutation();
+    var mutation = try @import("stakrr").mutation.begin(git, .refs);
     defer mutation.deinit();
     const name = "refs/stakrr/publication-test";
     const old = args[1];

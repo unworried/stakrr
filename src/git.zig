@@ -9,7 +9,6 @@ pub const Oid = types.Oid;
 pub const RefUpdate = types.RefUpdate;
 pub const CurrentBranchPolicy = types.CurrentBranchPolicy;
 pub const PublishOptions = types.PublishOptions;
-pub const Mutation = @import("mutation.zig").Mutation;
 
 /// Domain errors raised by the Git wrapper. Allocation and process
 /// spawning errors are propagated separately.
@@ -62,6 +61,8 @@ pub const Git = struct {
     environ_map: ?*const std.process.Environ.Map = null,
     diagnostics: ?*Diagnostics = null,
     object_format: ?types.ObjectFormat = null,
+    /// Dedicated replay workspace: isolate checkout behavior from repository preferences.
+    isolated_workspace: bool = false,
 
     const stdout_limit = 16 * 1024 * 1024;
     const stderr_limit = 64 * 1024;
@@ -72,9 +73,15 @@ pub const Git = struct {
 
     /// `git` followed by `args`; the caller frees the slice, not its items
     fn argvFor(self: *const Git, args: []const []const u8) ![]const []const u8 {
-        const argv = try self.allocator.alloc([]const u8, args.len + 1);
+        const config: []const []const u8 = if (self.isolated_workspace) &.{
+            "-c", "core.hooksPath=/dev/null",      "-c", "core.sparseCheckout=false",
+            "-c", "core.sparseCheckoutCone=false", "-c", "submodule.recurse=false",
+            "-c", "core.bare=false",
+        } else &.{};
+        const argv = try self.allocator.alloc([]const u8, args.len + config.len + 1);
         argv[0] = "git";
-        @memcpy(argv[1..], args);
+        @memcpy(argv[1..][0..config.len], config);
+        @memcpy(argv[1 + config.len ..], args);
         return argv;
     }
 
@@ -388,17 +395,12 @@ pub const Git = struct {
         errdefer self.allocator.free(value);
 
         // Preserve value boundaries: trimming newlines could hide a trailing
-        // empty value or a newline embedded in the persisted state.
+        // empty value or a newline embedded in a config value.
         if (value.len <= 1 or value[value.len - 1] != 0 or
             std.mem.indexOfAny(u8, value[0 .. value.len - 1], "\x00\r\n") != null)
             return error.InvalidGitConfig;
 
         return try self.allocator.realloc(value, value.len - 1);
-    }
-
-    /// remove every value of a local config key; returns false if unset
-    pub fn configUnset(self: *const Git, key: []const u8) !bool {
-        return self.check(&.{ "config", "--local", "--unset-all", key }, 5);
     }
 
     /// Refs under a prefix, in refname order. Names borrow raw; OIDs are values.
@@ -457,7 +459,7 @@ pub const Git = struct {
         defer self.allocator.free(root);
         const cwd = self.cwd orelse Io.Dir.cwd();
         var dir = cwd.openDir(self.io, root, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return,
+            error.FileNotFound, error.NotDir => return,
             else => return err,
         };
         defer dir.close(self.io);
@@ -489,19 +491,6 @@ pub const Git = struct {
 
     pub const ExpectedRef = types.ExpectedRef;
     pub const RefUpdate = types.RefUpdate;
-
-    pub fn beginStackMutation(self: *const Git) !@import("mutation.zig").Mutation {
-        return @import("mutation.zig").begin(self, .stack);
-    }
-
-    pub fn beginEditMutation(self: *const Git) !@import("mutation.zig").Mutation {
-        return @import("mutation.zig").begin(self, .edit);
-    }
-
-    /// Object/ref plumbing also supports bare repositories.
-    pub fn beginRefMutation(self: *const Git) !@import("mutation.zig").Mutation {
-        return @import("mutation.zig").begin(self, .refs);
-    }
 
     pub fn requireNoPendingTransaction(self: *const Git) !void {
         return @import("ref_transaction.zig").requirePublished(self);

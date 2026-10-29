@@ -97,23 +97,25 @@ test "abort restores the initial stack and retains the edited commit" {
     try conflictSetup(&repo);
     const edited = try repo.git.resolveCommitAlloc("HEAD");
     defer testing.allocator.free(edited);
-    const recorded = try repo.git.resolveCommitAlloc(layout.record_prefix ++ "models");
+    const recorded = try fixture.boundary(&repo, "models");
     defer testing.allocator.free(recorded);
     const work = try repo.git.resolveCommitAlloc("work");
     defer testing.allocator.free(work);
-    var layers = try repo.git.listDirectRefs("refs/stakrr/layers/");
-    defer layers.deinit(testing.allocator);
+    const layers = try repo.git.outputRaw(&.{ "show", layout.state_ref ++ ":stack.json" });
+    defer testing.allocator.free(layers);
     try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .restack));
-    try repo.exec(&.{ "checkout", "--ours", "shared" });
-    try repo.exec(&.{ "add", "shared" });
+    var workspace = try fixture.workspace(&repo);
+    defer workspace.tmp.dir.close(testing.io);
+    try workspace.exec(&.{ "checkout", "--ours", "shared" });
+    try workspace.exec(&.{ "add", "shared" });
     try edit.run(&repo.git, .abort);
     // the stack is back at its recorded positions; the layer's new commit stays
     // reachable through the operation log
     try repo.expectRef("refs/heads/stakrr/models", recorded);
     try repo.expectRef("refs/heads/work", work);
-    var after = try repo.git.listDirectRefs("refs/stakrr/layers/");
-    defer after.deinit(testing.allocator);
-    try testing.expectEqualStrings(layers.raw, after.raw);
+    const after = try repo.git.outputRaw(&.{ "show", layout.state_ref ++ ":stack.json" });
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(layers, after);
     try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
     try expectRecoverable(&repo, edited);
     try noSession(&repo);
@@ -143,6 +145,8 @@ test "a conflicted replay waits for a staged resolution and continues it" {
     const old_work = try repo.git.resolveCommitAlloc("work");
     defer testing.allocator.free(old_work);
     try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .restack));
+    var workspace = try fixture.workspace(&repo);
+    defer workspace.tmp.dir.close(testing.io);
     try repo.expectRef("refs/heads/work", old_work); // no partial publication
     try testing.expectError(error.EditInProgress, edit.run(&repo.git, .restack));
     try testing.expectError(error.DirtyWorkTree, edit.run(&repo.git, .abort));
@@ -154,8 +158,8 @@ test "a conflicted replay waits for a staged resolution and continues it" {
         session_status.branches[session_status.active],
     );
     try testing.expectEqualStrings("refs/heads/stakrr/models", session_status.destination);
-    try repo.write("shared", "resolved\n");
-    try repo.exec(&.{ "add", "shared" });
+    try workspace.write("shared", "resolved\n");
+    try workspace.exec(&.{ "add", "shared" });
     try edit.run(&repo.git, .continue_edit);
     try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
     try repo.expectOutput(&.{ "show", "work:shared" }, "resolved");
@@ -168,10 +172,12 @@ test "abort after a conflict preserves committed resolutions" {
     defer repo.deinit();
     try conflictSetup(&repo);
     try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .restack));
-    try repo.write("shared", "resolved\n");
-    try repo.exec(&.{ "add", "shared" });
-    try repo.exec(&.{ "commit", "-q", "--no-edit" });
-    const resolution = try repo.git.resolveCommitAlloc("HEAD");
+    var workspace = try fixture.workspace(&repo);
+    defer workspace.tmp.dir.close(testing.io);
+    try workspace.write("shared", "resolved\n");
+    try workspace.exec(&.{ "add", "shared" });
+    try workspace.exec(&.{ "commit", "-q", "--no-edit" });
+    const resolution = try workspace.git.resolveCommitAlloc("HEAD");
     defer testing.allocator.free(resolution);
     try edit.run(&repo.git, .abort);
     try expectRecoverable(&repo, resolution);
@@ -184,8 +190,10 @@ test "empty conflict resolutions are retained as commits" {
     defer repo.deinit();
     try conflictSetup(&repo);
     try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .restack));
-    try repo.exec(&.{ "checkout", "--ours", "shared" });
-    try repo.exec(&.{ "add", "shared" });
+    var workspace = try fixture.workspace(&repo);
+    defer workspace.tmp.dir.close(testing.io);
+    try workspace.exec(&.{ "checkout", "--ours", "shared" });
+    try workspace.exec(&.{ "add", "shared" });
     try edit.run(&repo.git, .continue_edit);
     try repo.expectOutput(&.{ "show", "work:shared" }, "edited");
     try noSession(&repo);
@@ -196,14 +204,15 @@ test "a pending restack rejects every competing stakrr mutation" {
     defer repo.deinit();
     try conflictSetup(&repo);
     try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .restack));
+    var workspace = try fixture.workspace(&repo);
+    defer workspace.tmp.dir.close(testing.io);
     try testing.expectError(error.EditInProgress, stack.cut(&repo.git, "new", null));
     try testing.expectError(error.EditInProgress, stack.reset(&repo.git, .{ .delete_layers = true }));
     try testing.expectError(error.EditInProgress, stack.initStack(&repo.git, "main"));
     try testing.expectError(error.EditInProgress, stack.go(&repo.git, "api"));
     try testing.expectError(error.EditInProgress, stack.navigate(&repo.git, .up));
-    try testing.expectError(error.EditInProgress, edit.undo(&repo.git));
-    try repo.exec(&.{ "checkout", "--ours", "shared" });
-    try repo.exec(&.{ "add", "shared" });
+    try workspace.exec(&.{ "checkout", "--ours", "shared" });
+    try workspace.exec(&.{ "add", "shared" });
     try edit.run(&repo.git, .abort);
 }
 
@@ -237,6 +246,8 @@ test "refs changed during a conflict are rejected and named" {
     defer repo.deinit();
     try conflictSetup(&repo);
     try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .restack));
+    var workspace = try fixture.workspace(&repo);
+    defer workspace.tmp.dir.close(testing.io);
     try testing.expect(try edit.findDrift(&repo.git) == null);
     const api = try repo.git.resolveCommitAlloc("stakrr/api");
     defer testing.allocator.free(api);
@@ -265,16 +276,18 @@ test "refs changed during a conflict are rejected and named" {
     try repo.exec(&.{ "update-ref", "refs/heads/stakrr/api", api });
 
     // a recorded boundary that moved is drift too
-    const record = layout.record_prefix ++ "api";
-    try repo.exec(&.{ "update-ref", record, base, api });
+    const record = layout.state_ref;
+    const manifest = (try repo.readRef(record)).?;
+    defer testing.allocator.free(manifest);
+    try repo.exec(&.{ "update-ref", record, base, manifest });
     var recorded = (try edit.findDrift(&repo.git)).?;
     defer recorded.deinit();
     try testing.expectEqualStrings(record, recorded.name);
-    try testing.expectEqualStrings(api, recorded.expected.?);
-    try repo.exec(&.{ "update-ref", record, api, base });
+    try testing.expectEqualStrings(manifest, recorded.expected.?);
+    try repo.exec(&.{ "update-ref", record, manifest, base });
 
-    try repo.exec(&.{ "checkout", "--ours", "shared" });
-    try repo.exec(&.{ "add", "shared" });
+    try workspace.exec(&.{ "checkout", "--ours", "shared" });
+    try workspace.exec(&.{ "add", "shared" });
     try edit.run(&repo.git, .abort);
     try fixture.validConflict(&repo);
 }
@@ -304,13 +317,15 @@ test "sessions belong to one worktree and share the mutation guard" {
     const other = try linked(&repo, "linked", "main");
     defer other.cwd.?.close(testing.io);
     try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .restack));
+    var workspace = try fixture.workspace(&repo);
+    defer workspace.tmp.dir.close(testing.io);
     try testing.expectError(error.WrongEditWorktree, edit.run(&other, .abort));
     try testing.expectError(error.WrongEditWorktree, edit.run(&other, .continue_edit));
     try testing.expectError(error.WrongEditWorktree, edit.run(&other, .quit));
     try testing.expectError(error.EditInProgress, stack.navigate(&other, .up));
     try testing.expectError(error.EditInProgress, stack.reset(&other, .{}));
-    try repo.exec(&.{ "checkout", "--ours", "shared" });
-    try repo.exec(&.{ "add", "shared" });
+    try workspace.exec(&.{ "checkout", "--ours", "shared" });
+    try workspace.exec(&.{ "add", "shared" });
     try edit.run(&repo.git, .abort);
 }
 
@@ -351,7 +366,7 @@ test "restacking a top cut also moves coincident rolling work and returns to its
     try on(&repo, "models");
     try edit.run(&repo.git, .restack);
     try repo.expectRef("refs/heads/work", amended);
-    try repo.expectRef(layout.tip_ref, amended);
+    try fixture.expectBoundary(&repo, "tail", amended);
     try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
     var snapshot = try stack.inspect(&repo.git);
     defer snapshot.deinit();
@@ -373,7 +388,7 @@ test "navigation refuses to overwrite ignored files" {
     try repo.expectFile("tail", "precious ignored work\n");
 }
 
-test "replay preserves ignored files and directory contents before writing incoming paths" {
+test "isolated replay preserves invoking ignored files and directory contents" {
     for ([_]bool{ false, true }) |directory| {
         var repo = try Repo.init();
         defer repo.deinit();
@@ -394,21 +409,10 @@ test "replay preserves ignored files and directory contents before writing incom
         const root = repo.git.cwd;
         repo.git.cwd = subdir;
         defer repo.git.cwd = root;
-        const work = try repo.git.resolveCommitAlloc("work");
-        defer testing.allocator.free(work);
-        try testing.expectError(error.IgnoredFilesPresent, edit.run(&repo.git, .restack));
-        try repo.expectRef("refs/heads/work", work);
-        try noSession(&repo);
-        const contents = try repo.tmp.dir.readFileAlloc(testing.io, path, testing.allocator, .limited(1024));
-        defer testing.allocator.free(contents);
-        try testing.expectEqualStrings("precious ignored work\n", contents);
-        try repo.tmp.dir.deleteFile(testing.io, path);
-        if (directory) try repo.tmp.dir.deleteDir(testing.io, "tail");
-        try testing.expectError(error.IgnoredFilesPresent, edit.run(&repo.git, .restack));
-        try repo.tmp.dir.deleteFile(testing.io, "unrelated");
         try edit.run(&repo.git, .restack);
+        try repo.expectFile(path, "precious ignored work\n");
+        try repo.expectFile("unrelated", "unrelated ignored work\n");
         try repo.expectOutput(&.{ "show", "work:tail" }, "rolling");
-
         try valid(&repo);
         try noSession(&repo);
     }
@@ -419,24 +423,26 @@ test "conflict continuation rejects untracked files outside the current director
     defer repo.deinit();
     try conflictSetup(&repo);
     try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .restack));
-    try repo.write("shared", "resolved\n");
-    try repo.exec(&.{ "add", "shared" });
-    try repo.write("precious", "untracked work\n");
-    try repo.tmp.dir.createDir(testing.io, "subdir", .default_dir);
-    const subdir = try repo.tmp.dir.openDir(testing.io, "subdir", .{});
+    var workspace = try fixture.workspace(&repo);
+    defer workspace.tmp.dir.close(testing.io);
+    try workspace.write("shared", "resolved\n");
+    try workspace.exec(&.{ "add", "shared" });
+    try workspace.write("precious", "untracked work\n");
+    try workspace.tmp.dir.createDir(testing.io, "subdir", .default_dir);
+    const subdir = try workspace.tmp.dir.openDir(testing.io, "subdir", .{});
     defer subdir.close(testing.io);
-    const root = repo.git.cwd;
-    repo.git.cwd = subdir;
-    defer repo.git.cwd = root;
-    const head = try repo.git.resolveCommitAlloc("HEAD");
+    const root = workspace.git.cwd;
+    workspace.git.cwd = subdir;
+    defer workspace.git.cwd = root;
+    const head = try workspace.git.resolveCommitAlloc("HEAD");
     defer testing.allocator.free(head);
-    const picking = try repo.git.resolveCommitAlloc("CHERRY_PICK_HEAD");
+    const picking = try workspace.git.resolveCommitAlloc("CHERRY_PICK_HEAD");
     defer testing.allocator.free(picking);
-    try testing.expectError(error.DirtyWorkTree, edit.run(&repo.git, .continue_edit));
-    try repo.expectOutput(&.{ "rev-parse", "--verify", "HEAD" }, head);
-    try repo.expectOutput(&.{ "rev-parse", "--verify", "CHERRY_PICK_HEAD" }, picking);
-    try repo.tmp.dir.deleteFile(testing.io, "precious");
-    try edit.run(&repo.git, .continue_edit);
+    try testing.expectError(error.DirtyWorkTree, edit.run(&workspace.git, .continue_edit));
+    try workspace.expectOutput(&.{ "rev-parse", "--verify", "HEAD" }, head);
+    try workspace.expectOutput(&.{ "rev-parse", "--verify", "CHERRY_PICK_HEAD" }, picking);
+    try workspace.tmp.dir.deleteFile(testing.io, "precious");
+    try edit.run(&workspace.git, .continue_edit);
     try noSession(&repo);
 }
 
@@ -445,32 +451,34 @@ test "conflict continuation checks all tracked files with diff.relative enabled"
     defer repo.deinit();
     try conflictSetup(&repo);
     try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .restack));
-    try repo.write("shared", "resolved\n");
-    try repo.exec(&.{ "add", "shared" });
-    try repo.write("model", "unstaged work\n");
+    var workspace = try fixture.workspace(&repo);
+    defer workspace.tmp.dir.close(testing.io);
+    try workspace.write("shared", "resolved\n");
+    try workspace.exec(&.{ "add", "shared" });
+    try workspace.write("model", "unstaged work\n");
     try repo.exec(&.{ "config", "diff.relative", "true" });
-    try repo.tmp.dir.createDir(testing.io, "subdir", .default_dir);
-    const subdir = try repo.tmp.dir.openDir(testing.io, "subdir", .{});
+    try workspace.tmp.dir.createDir(testing.io, "subdir", .default_dir);
+    const subdir = try workspace.tmp.dir.openDir(testing.io, "subdir", .{});
     defer subdir.close(testing.io);
-    var git = repo.git;
+    var git = workspace.git;
     git.cwd = subdir;
-    const head = try repo.git.resolveCommitAlloc("HEAD");
+    const head = try workspace.git.resolveCommitAlloc("HEAD");
     defer testing.allocator.free(head);
-    const picking = try repo.git.resolveCommitAlloc("CHERRY_PICK_HEAD");
+    const picking = try workspace.git.resolveCommitAlloc("CHERRY_PICK_HEAD");
     defer testing.allocator.free(picking);
     const session = try repo.git.resolveCommitAlloc(layout.session_ref);
     defer testing.allocator.free(session);
 
     try testing.expectError(error.DirtyWorkTree, edit.run(&git, .continue_edit));
-    try repo.expectOutput(&.{ "rev-parse", "--verify", "HEAD" }, head);
-    try repo.expectOutput(&.{ "rev-parse", "--verify", "CHERRY_PICK_HEAD" }, picking);
+    try workspace.expectOutput(&.{ "rev-parse", "--verify", "HEAD" }, head);
+    try workspace.expectOutput(&.{ "rev-parse", "--verify", "CHERRY_PICK_HEAD" }, picking);
     try repo.expectRef(layout.session_ref, session);
-    try repo.exec(&.{ "restore", "model" });
+    try workspace.exec(&.{ "restore", "model" });
     try edit.run(&git, .continue_edit);
     try noSession(&repo);
 }
 
-test "directory rename replay refuses ignored merge destinations before detaching" {
+test "final checkout preserves ignored directory rename destinations" {
     var repo = try Repo.init();
     defer repo.deinit();
     try repo.exec(&.{ "config", "merge.directoryRenames", "true" });
@@ -490,15 +498,11 @@ test "directory rename replay refuses ignored merge destinations before detachin
     try repo.exec(&.{ "switch", "-q", "work" });
     try repo.tmp.dir.createDir(testing.io, "new", .default_dir);
     try repo.write("new/b", "precious ignored data\n");
-    const refs = try repo.git.output(&.{"show-ref"});
-    defer testing.allocator.free(refs);
-    try testing.expectError(error.IgnoredFilesPresent, edit.run(&repo.git, .restack));
-    try repo.expectOutput(&.{"show-ref"}, refs);
-    try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/work");
-    try repo.expectOutput(&.{ "status", "--porcelain=v1" }, "");
+    // Replay finishes in isolation; final checkout refuses the ignored collision.
+    try testing.expectError(error.GitFailed, edit.run(&repo.git, .restack));
     try repo.expectFile("new/b", "precious ignored data\n");
     try repo.tmp.dir.deleteFile(testing.io, "new/b");
-    try edit.run(&repo.git, .restack);
+    try edit.run(&repo.git, .continue_edit);
     try repo.expectOutput(&.{ "show", "work:new/b" }, "incoming");
     try noSession(&repo);
 }
@@ -521,8 +525,10 @@ test "a clean empty conflict resolution can abort without discarding work" {
     defer repo.deinit();
     try conflictSetup(&repo);
     try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .restack));
-    try repo.exec(&.{ "checkout", "--ours", "shared" });
-    try repo.exec(&.{ "add", "shared" });
+    var workspace = try fixture.workspace(&repo);
+    defer workspace.tmp.dir.close(testing.io);
+    try workspace.exec(&.{ "checkout", "--ours", "shared" });
+    try workspace.exec(&.{ "add", "shared" });
     try edit.run(&repo.git, .abort);
     try noSession(&repo);
 }
@@ -558,7 +564,9 @@ test "modify delete conflict can resolve to a deletion without resurrecting the 
     try repo.write("obsolete", "corrected then deleted\n");
     try repo.commitAll("correct obsolete");
     try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .restack));
-    try repo.exec(&.{ "rm", "obsolete" });
+    var workspace = try fixture.workspace(&repo);
+    defer workspace.tmp.dir.close(testing.io);
+    try workspace.exec(&.{ "rm", "obsolete" });
     try edit.run(&repo.git, .continue_edit);
     const result = try repo.git.run(&.{ "cat-file", "-e", "work:obsolete" });
     defer repo.git.freeResult(result);
