@@ -1,4 +1,3 @@
-const Mutation = @import("mutation.zig").Mutation;
 const BranchRef = @import("git.zig").BranchRef;
 const RefName = @import("git.zig").RefName;
 const std = @import("std");
@@ -18,8 +17,8 @@ pub const Error = git_mod.Error || coordination.Error || error{
     BaseNotFound,
     BaseNotAncestor,
     MergeCommitsUnsupported,
-    InvalidConfig,
-    UnsupportedConfigVersion,
+    InvalidManifest,
+    UnsupportedManifestVersion,
     InvalidStack,
     InvalidLayerBoundary,
     NotOnWorkBranch,
@@ -34,291 +33,252 @@ pub const Error = git_mod.Error || coordination.Error || error{
     StaleLayers,
 };
 
-/// Validated branch pair from the persisted state, borrowing from it.
-/// Shared by stack loading and edit checkpoint validation.
-pub const Branches = struct {
-    base_ref: BranchRef,
-    work_ref: BranchRef,
-};
-
-pub const Config = struct {
-    base_ref: BranchRef,
-    work_ref: BranchRef,
-    anchor_oid: []const u8,
-};
-
+const model = @import("stack_state.zig");
+const store = @import("state_store.zig");
+const operations = @import("operation.zig");
+pub const StackState = model.StackState;
+pub const Config = struct { base_ref: BranchRef, work_ref: BranchRef, anchor_oid: []const u8 };
 pub const Layer = struct {
     ref_name: []const u8,
-    /// the recorded boundary: where the stack last published this layer
     oid: []const u8,
-    /// the branch tip; it differs from `oid` once commits were made on the layer
     branch_oid: []const u8,
-
-    // commits since the previous layer boundary
     commits: usize,
-
     pub fn stale(self: Layer) bool {
         return !std.mem.eql(u8, self.oid, self.branch_oid);
     }
 };
-
-/// Owned view of the stack. Every slice stays valid until deinit.
+/// Strict mutation view. Values belong to this arena until deinit.
 pub const Snapshot = struct {
+    state: StackState,
+    manifest_oid: []const u8,
     config: Config,
     layers: []const Layer,
-
     work_oid: []const u8,
     unstacked_commits: usize,
     base_moved: bool,
-
     _arena: std.heap.ArenaAllocator,
-
     pub fn deinit(self: *Snapshot) void {
         self._arena.deinit();
         self.* = undefined;
     }
 };
 
-pub fn initStack(
-    original_git: *const Git,
-    base_name: []const u8,
-) !void {
-    var mutation = try original_git.beginStackMutation();
+pub const Issue = struct {
+    kind: Kind,
+    ref_name: []const u8,
+    pub const Kind = enum {
+        missing_branch,
+        symbolic_ref,
+        invalid_ancestry,
+        merge_history,
+        invalid_boundary,
+        unexpected_layer,
+        pending_publication,
+        invalid_manifest,
+        unsupported_manifest,
+    };
+};
+/// Read-only evidence. Null means unavailable, never an inferred zero/false.
+pub const StackObservation = struct {
+    manifest_oid: ?[]const u8 = null,
+    state: ?StackState = null,
+    base_oid: ?[]const u8 = null,
+    work_oid: ?[]const u8 = null,
+    base_moved: ?bool = null,
+    unstacked_commits: ?usize = null,
+    layers: []const ObservedLayer = &.{},
+    worktrees: ?[]const u8 = null,
+    issues: []const Issue = &.{},
+    _arena: std.heap.ArenaAllocator,
+    pub const ObservedLayer = struct {
+        branch: []const u8,
+        recorded_boundary_oid: []const u8,
+        branch_oid: ?[]const u8 = null,
+        commits: ?usize = null,
+        stale: ?bool = null,
+    };
+    pub fn deinit(self: *StackObservation) void {
+        self._arena.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn observe(parent: *const Git) !StackObservation {
+    try parent.ensureWorkTree();
+    var arena: std.heap.ArenaAllocator = .init(parent.allocator);
+    errdefer arena.deinit();
+    const git = parent.withAllocator(arena.allocator());
+    const a = git.allocator;
+    var result: StackObservation = .{ ._arena = undefined };
+    var issues: std.ArrayList(Issue) = .empty;
+    git.requireNoPendingTransaction() catch |err| switch (err) {
+        error.RefTransactionPending => try issues.append(a, .{ .kind = .pending_publication, .ref_name = layout.transaction_ref }),
+        else => return err,
+    };
+    const loaded = loadObserved(&git, &result) catch |err| switch (err) {
+        error.NotInitialized => {
+            if (issues.items.len == 0) return err;
+            result.issues = issues.items;
+            result._arena = arena;
+            return result;
+        },
+        error.InvalidManifest, error.UnsupportedManifestVersion, error.SymbolicRef => {
+            try issues.append(a, .{ .kind = switch (err) {
+                error.UnsupportedManifestVersion => .unsupported_manifest,
+                error.SymbolicRef => .symbolic_ref,
+                else => .invalid_manifest,
+            }, .ref_name = layout.state_ref });
+            result.issues = issues.items;
+            result._arena = arena;
+            return result;
+        },
+        else => return err,
+    };
+    // Transfer decoded state into the observation arena.
+    const state = loaded.state.value;
+    // Nested arena allocations are owned by the outer arena as well.
+    result.state = state;
+    result.manifest_oid = loaded.oid;
+    result.base_oid = try observedBranch(&git, state.base_branch.name.bytes, &issues);
+    result.work_oid = try observedBranch(&git, state.work_branch.name.bytes, &issues);
+    if (result.base_oid) |oid| result.base_moved = !std.mem.eql(u8, oid, state.anchor_oid.hex());
+    const layers = try a.alloc(StackObservation.ObservedLayer, state.layers.len);
+    for (state.layers, layers) |*layer, *out| {
+        out.* = .{ .branch = layer.branch.name.bytes, .recorded_boundary_oid = layer.recorded_boundary_oid.hex() };
+        out.branch_oid = try observedBranch(&git, out.branch, &issues);
+        if (out.branch_oid) |oid| out.stale = !std.mem.eql(u8, oid, out.recorded_boundary_oid);
+    }
+    result.layers = layers;
+    const namespace_root = "refs/heads/stakrr";
+    const root = git.readDirectRefAlloc(try RefName.init(namespace_root)) catch |err| switch (err) {
+        error.SymbolicRef => blk: {
+            try issues.append(a, .{ .kind = .symbolic_ref, .ref_name = namespace_root });
+            break :blk null;
+        },
+        else => return err,
+    };
+    if (root != null) try issues.append(a, .{ .kind = .unexpected_layer, .ref_name = namespace_root });
+    const listed = git.listDirectRefs(layout.layer_prefix) catch |err| switch (err) {
+        error.SymbolicRef => blk: {
+            try issues.append(a, .{ .kind = .symbolic_ref, .ref_name = layout.layer_prefix });
+            break :blk null;
+        },
+        else => return err,
+    };
+    if (listed) |refs| for (refs.refs) |ref| {
+        var declared = false;
+        for (layers) |layer| if (std.mem.eql(u8, layer.branch, ref.name.bytes)) {
+            declared = true;
+            break;
+        };
+        if (!declared) try issues.append(a, .{ .kind = .unexpected_layer, .ref_name = ref.name.bytes });
+    };
+    if (result.work_oid) |work| {
+        const ancestor = git.isAncestor(state.anchor_oid.hex(), work) catch |err| switch (err) {
+            error.GitFailed => false,
+            else => return err,
+        };
+        if (!ancestor) {
+            try issues.append(a, .{ .kind = .invalid_ancestry, .ref_name = state.work_branch.name.bytes });
+        } else {
+            const history = try git.history(state.anchor_oid.hex(), work);
+            if (!history.linear) {
+                try issues.append(a, .{ .kind = .merge_history, .ref_name = state.work_branch.name.bytes });
+            } else {
+                var depths: std.StringHashMapUnmanaged(usize) = .empty;
+                for (history.commits, 1..) |oid, depth| try depths.put(a, oid, depth);
+                var previous: usize = 0;
+                var valid = true;
+                for (layers) |*layer| {
+                    const depth = depths.get(layer.recorded_boundary_oid);
+                    if (depth == null or depth.? <= previous) {
+                        try issues.append(a, .{ .kind = .invalid_boundary, .ref_name = layer.branch });
+                        valid = false;
+                    } else {
+                        if (valid) layer.commits = depth.? - previous;
+                        previous = depth.?;
+                    }
+                }
+                if (valid) result.unstacked_commits = history.commits.len - previous;
+            }
+        }
+    }
+    result.worktrees = try git.outputRaw(&.{ "worktree", "list", "--porcelain", "-z" });
+    result.issues = issues.items;
+    result._arena = arena;
+    return result;
+}
+fn loadObserved(git: *const Git, result: *StackObservation) !store.Loaded {
+    const oid = try store.identity(git);
+    result.manifest_oid = oid;
+    return .{ .oid = oid, .state = try store.loadAt(git, oid) };
+}
+fn observedBranch(git: *const Git, name: []const u8, issues: *std.ArrayList(Issue)) !?[]const u8 {
+    const oid = git.branchCommitAlloc(try BranchRef.init(name)) catch |err| switch (err) {
+        error.SymbolicRef => {
+            try issues.append(git.allocator, .{ .kind = .symbolic_ref, .ref_name = name });
+            return null;
+        },
+        error.GitFailed => {
+            try issues.append(git.allocator, .{ .kind = .missing_branch, .ref_name = name });
+            return null;
+        },
+        else => return err,
+    };
+    return oid;
+}
+pub fn inspect(parent: *const Git) !Snapshot {
+    var view = try observe(parent);
+    errdefer view.deinit();
+    for (view.issues) |issue| switch (issue.kind) {
+        .pending_publication => return error.RefTransactionPending,
+        .invalid_manifest => return error.InvalidManifest,
+        .unsupported_manifest => return error.UnsupportedManifestVersion,
+        .symbolic_ref => return error.SymbolicRef,
+        .merge_history => return error.MergeCommitsUnsupported,
+        .invalid_boundary => return error.InvalidLayerBoundary,
+        else => return error.InvalidStack,
+    };
+    const a = view._arena.allocator();
+    const state = view.state.?;
+    const layers = try a.alloc(Layer, view.layers.len);
+    for (view.layers, layers) |layer, *out| out.* = .{ .ref_name = layer.branch, .oid = layer.recorded_boundary_oid, .branch_oid = layer.branch_oid.?, .commits = layer.commits.? };
+    return .{ .state = state, .manifest_oid = view.manifest_oid.?, .config = .{ .base_ref = state.base_branch, .work_ref = state.work_branch, .anchor_oid = try a.dupe(u8, state.anchor_oid.hex()) }, .layers = layers, .work_oid = view.work_oid.?, .unstacked_commits = view.unstacked_commits.?, .base_moved = view.base_moved.?, ._arena = view._arena };
+}
+
+pub fn initStack(original: *const Git, base_name: []const u8) !void {
+    var mutation = try @import("mutation.zig").begin(original, .stack);
     defer mutation.deinit();
     const git = mutation.repo();
-    const allocator = git.allocator;
-    // The mutation context also validates the working tree.
-
-    // refuse existing initialisation
-    if (try git.configGet(layout.state_key)) |existing| {
-        allocator.free(existing);
-        return error.AlreadyInitialized;
-    }
-
-    // reserve stakrr's branch namespace and internal refs for managed layers
-    var existing_layers = try git.listDirectRefs(layout.layer_prefix);
-    defer existing_layers.deinit(allocator);
-    if (existing_layers.refs.len != 0) return error.ExistingStackRefs;
-    var existing_records = try git.listDirectRefs(layout.record_prefix);
-    defer existing_records.deinit(allocator);
-    if (existing_records.refs.len != 0) return error.ExistingStackRefs;
-    for ([_][]const u8{ layout.tip_ref, layout.anchor_ref }) |ref_name| {
-        const existing = try git.readDirectRefAlloc(try RefName.init(ref_name));
-        defer if (existing) |oid| allocator.free(oid);
-        if (existing != null) return error.ExistingStackRefs;
-    }
-
-    // identify rolling branch and base
-    const work_ref = try git.currentBranchAlloc();
-    defer allocator.free(work_ref);
-
-    // accept either a branch name or its full refs/heads/ ref
-    const base_ref = if (std.mem.startsWith(u8, base_name, layout.branch_prefix))
-        try allocator.dupe(u8, base_name)
-    else
-        try std.fmt.allocPrint(allocator, layout.branch_prefix ++ "{s}", .{base_name});
-    defer allocator.free(base_ref);
-
-    // layer names live exclusively under refs/heads/stakrr/
-    if (std.mem.startsWith(u8, work_ref, layout.layer_prefix) or
-        std.mem.startsWith(u8, base_ref, layout.layer_prefix))
-        return error.ReservedBranchNamespace;
-
-    const base_branch = try BranchRef.init(base_ref);
-
-    if (std.mem.eql(u8, work_ref, base_ref))
-        return error.BaseEqualsWork;
-
-    // resolve both branch tips
-    const base_oid = (try git.readDirectRefAlloc(base_branch.name)) orelse
-        return error.BaseNotFound;
-    defer allocator.free(base_oid);
-    const work_oid = try git.branchCommitAlloc(try BranchRef.init(work_ref));
-    defer allocator.free(work_oid);
-
-    // check ancestry
-    if (!try git.isAncestor(base_oid, work_oid))
-        return error.BaseNotAncestor;
-
-    // reject merge commits
+    const a = git.allocator;
+    const existing = try git.readDirectRefAlloc(try RefName.init(layout.state_ref));
+    defer if (existing) |oid| a.free(oid);
+    if (existing != null) return error.AlreadyInitialized;
+    const root = try git.readDirectRefAlloc(try RefName.init("refs/heads/stakrr"));
+    defer if (root) |oid| a.free(oid);
+    if (root != null) return error.ExistingStackRefs;
+    var listed = try git.listDirectRefs(layout.layer_prefix);
+    defer listed.deinit(a);
+    if (listed.refs.len != 0) return error.ExistingStackRefs;
+    const work = try git.currentBranchAlloc();
+    defer a.free(work);
+    const base = if (std.mem.startsWith(u8, base_name, layout.branch_prefix)) try a.dupe(u8, base_name) else try std.fmt.allocPrint(a, layout.branch_prefix ++ "{s}", .{base_name});
+    defer a.free(base);
+    if (std.mem.eql(u8, base, work)) return error.BaseEqualsWork;
+    if (model.conflict(base, "refs/heads/stakrr") or model.conflict(work, "refs/heads/stakrr")) return error.ReservedBranchNamespace;
+    const base_ref = try BranchRef.init(base);
+    const work_ref = try BranchRef.init(work);
+    const base_oid = (try git.readDirectRefAlloc(base_ref.name)) orelse return error.BaseNotFound;
+    defer a.free(base_oid);
+    const work_oid = try git.branchCommitAlloc(work_ref);
+    defer a.free(work_oid);
+    if (!try git.isAncestor(base_oid, work_oid)) return error.BaseNotAncestor;
     var history = try git.history(base_oid, work_oid);
-    defer history.deinit(allocator);
+    defer history.deinit(a);
     if (!history.linear) return error.MergeCommitsUnsupported;
-
-    // claim the anchor; `create` fails if a concurrent init won the race
-    const anchor = try git.expectedRef(layout.anchor_ref, base_oid);
-    try mutation.publish(.{ .message = "stakrr: init", .updates = &.{anchor.create()} });
-    errdefer mutation.publish(.{ .message = "stakrr: init rollback", .updates = &.{anchor.delete()} }) catch {};
-
-    // persist the branch pair
-    const state = try std.fmt.allocPrint(
-        allocator,
-        layout.state_version ++ " {s} {s}",
-        .{ base_ref, work_ref },
-    );
-    defer allocator.free(state);
-
-    try git.exec(&.{ "config", "--local", layout.state_key, state });
-}
-
-pub fn parseConfig(raw: []const u8) Error!Branches {
-    var tokens = std.mem.tokenizeScalar(u8, raw, ' ');
-
-    const version = tokens.next() orelse
-        return error.InvalidConfig;
-
-    if (!std.mem.eql(u8, version, layout.state_version))
-        return error.UnsupportedConfigVersion;
-
-    const base = tokens.next() orelse
-        return error.InvalidConfig;
-
-    const work = tokens.next() orelse
-        return error.InvalidConfig;
-
-    if (tokens.next() != null)
-        return error.InvalidConfig;
-
-    // config is user-editable: validate before refs reach argv or update-ref
-    const base_ref = BranchRef.init(base) catch return error.InvalidConfig;
-    const work_ref = BranchRef.init(work) catch return error.InvalidConfig;
-
-    if (std.mem.eql(u8, base, work) or
-        std.mem.startsWith(u8, base, layout.layer_prefix) or
-        std.mem.startsWith(u8, work, layout.layer_prefix))
-        return error.InvalidConfig;
-
-    return .{ .base_ref = base_ref, .work_ref = work_ref };
-}
-
-/// Slices are allocated from `git.allocator` and never freed individually;
-/// callers pass an arena-backed Git.
-fn loadConfig(git: *const Git) !Config {
-    const raw = (try git.configGet(layout.state_key)) orelse
-        return error.NotInitialized;
-    const branches = try parseConfig(raw);
-
-    const anchor = (try git.readDirectRefAlloc(try RefName.init(layout.anchor_ref))) orelse
-        return error.InvalidStack;
-    return .{
-        .base_ref = branches.base_ref,
-        .work_ref = branches.work_ref,
-        .anchor_oid = anchor,
-    };
-}
-
-pub fn inspect(parent_git: *const Git) !Snapshot {
-    try parent_git.ensureWorkTree();
-
-    // The snapshot owns everything inspection allocates.
-    var arena: std.heap.ArenaAllocator = .init(parent_git.allocator);
-    errdefer arena.deinit();
-    var scoped = parent_git.withAllocator(arena.allocator());
-    scoped.object_format = try parent_git.objectFormat();
-    const git = &scoped;
-    const allocator = git.allocator;
-    try git.requireNoPendingTransaction();
-
-    const config = try loadConfig(git);
-    const base_oid = try git.branchCommitAlloc(config.base_ref);
-    const work_oid = try git.branchCommitAlloc(config.work_ref);
-
-    // anchor must be reachable from the rolling branch
-    if (!try git.isAncestor(config.anchor_oid, work_oid))
-        return error.InvalidStack;
-
-    // With no merges, anchor..work is a single chain. Index it once so
-    // every layer resolves to a depth without spawning more git processes.
-    const history = try git.history(config.anchor_oid, work_oid);
-
-    // only supports linear history
-    if (!history.linear) return error.MergeCommitsUnsupported;
-
-    var depths: std.StringHashMapUnmanaged(usize) = .empty;
-    for (history.commits, 1..) |oid, depth| try depths.put(allocator, oid, depth);
-    const chain_len = history.commits.len;
-
-    // discover branches owned by stakrr, and where each was last published
-    const listed = try git.listDirectRefs(layout.layer_prefix);
-    const records = try git.listDirectRefs(layout.record_prefix);
-    if (records.refs.len != listed.refs.len) return error.InvalidStack;
-
-    // Both listings have the same suffix order. Match them in one pass,
-    // keeping cumulative depths in `commits` until the layers are sorted.
-    const layers = try allocator.alloc(Layer, listed.refs.len);
-    for (listed.refs, records.refs, layers) |ref, record, *layer| {
-        if (!std.mem.eql(u8, layout.layerName(ref.name.bytes).?, record.name.bytes[layout.record_prefix.len..]))
-            return error.InvalidStack;
-        const recorded = try record.oid.dupeHex(allocator);
-
-        // every recorded boundary must sit on the chain between the anchor and
-        // work; the branch itself may have moved on since
-        const depth = depths.get(recorded) orelse
-            return error.InvalidStack;
-
-        layer.* = .{
-            .ref_name = ref.name.bytes,
-            .oid = recorded,
-            .branch_oid = try ref.oid.dupeHex(allocator),
-            .commits = depth,
-        };
-    }
-
-    // order by distance from anchor, not branch name
-    std.mem.sort(Layer, layers, {}, struct {
-        fn lessThan(_: void, a: Layer, b: Layer) bool {
-            return a.commits < b.commits;
-        }
-    }.lessThan);
-
-    // on a single chain, depth order is ancestry order
-    var previous_oid = config.anchor_oid;
-    var previous_depth: usize = 0;
-
-    for (layers) |*layer| {
-        const depth = layer.commits;
-        // each layer must introduce at least one commit
-        if (depth <= previous_depth)
-            return error.InvalidLayerBoundary;
-
-        layer.commits = depth - previous_depth;
-        previous_oid = layer.oid;
-        previous_depth = depth;
-    }
-
-    // the private tip guard must match the highest committed layer
-    const tip = try git.readDirectRefAlloc(try RefName.init(layout.tip_ref));
-    if (layers.len == 0) {
-        if (tip != null) return error.InvalidStack;
-    } else {
-        const tip_oid = tip orelse return error.InvalidStack;
-        if (!std.mem.eql(u8, tip_oid, previous_oid)) return error.InvalidStack;
-    }
-
-    return .{
-        .config = config,
-        .layers = layers,
-        .work_oid = work_oid,
-        .unstacked_commits = chain_len - previous_depth,
-        .base_moved = !std.mem.eql(
-            u8,
-            base_oid,
-            config.anchor_oid,
-        ),
-        ._arena = arena,
-    };
-}
-
-/// True if two refs are equal or one is a directory of the other
-/// (e.g. stakrr/p1 and stakrr/p1/x), which Git cannot store together.
-fn refsConflict(a: []const u8, b: []const u8) bool {
-    return std.mem.eql(u8, a, b) or isPathPrefix(a, b) or isPathPrefix(b, a);
-}
-
-fn isPathPrefix(prefix: []const u8, full: []const u8) bool {
-    return full.len > prefix.len and
-        std.mem.startsWith(u8, full, prefix) and
-        full[prefix.len] == '/';
+    const oid = try store.create(git, .{ .base_branch = base_ref, .work_branch = work_ref, .anchor_oid = try git.parseOid(base_oid), .layers = &.{} });
+    defer a.free(oid);
+    try mutation.publish(.{ .message = "stakrr: init", .updates = &.{ try git.verifyRef(base, base_oid), try git.verifyRef(work, work_oid), try git.createRef(layout.state_ref, oid) } });
 }
 
 /// carve the next stack layer out of the linear rolling branch
@@ -328,7 +288,7 @@ pub fn cut(
     name: []const u8,
     revision: ?[]const u8,
 ) !void {
-    var mutation = try original_git.beginStackMutation();
+    var mutation = try @import("mutation.zig").begin(original_git, .stack);
     defer mutation.deinit();
     const git = mutation.repo();
     const allocator = git.allocator;
@@ -361,7 +321,7 @@ pub fn cut(
 
     for (snapshot.layers) |layer| {
         if (layer.stale()) return error.StaleLayers;
-        if (refsConflict(layer.ref_name, new_ref))
+        if (model.conflict(layer.ref_name, new_ref))
             return error.LayerExists;
     }
 
@@ -390,110 +350,56 @@ pub fn cut(
     if (!try git.isAncestor(target, snapshot.work_oid))
         return error.CutOutsideWork;
 
-    // The base may have moved since init; layers are carved relative to
-    // the anchor, which the transaction pins instead of the base branch.
-    try createLayerRef(&mutation, .{
-        .layer = try git.expectedRef(new_ref, target),
-        .anchor = try git.expectedRef(layout.anchor_ref, snapshot.config.anchor_oid),
-        .work = try git.expectedRef(snapshot.config.work_ref.name.bytes, snapshot.work_oid),
-        .previous = if (last_layer) |layer|
-            try git.expectedRef(layer.ref_name, layer.oid)
-        else
-            null,
-    });
-}
-
-pub const LayerCreation = struct {
-    layer: Git.ExpectedRef,
-    anchor: Git.ExpectedRef,
-    work: Git.ExpectedRef,
-    previous: ?Git.ExpectedRef = null,
-};
-
-/// Create a boundary and advance the stack guard in one compare-and-swap.
-pub fn createLayerRef(mutation: *const Mutation, expected: LayerCreation) !void {
-    const git = mutation.repo();
-    const record = try layout.recordRef(git.allocator, expected.layer.name.bytes);
-    defer git.allocator.free(record);
-
-    var updates: [6]Git.RefUpdate = undefined;
-    updates[0] = expected.anchor.verify();
-    updates[1] = expected.work.verify();
-    var count: usize = 2;
-    if (expected.previous) |previous| {
-        updates[count] = previous.verify();
-        count += 1;
-    }
-    updates[count] = expected.layer.create();
-    count += 1;
-    updates[count] = try git.createRef(record, expected.layer.oid.hex());
-    count += 1;
-    updates[count] = if (expected.previous) |previous|
-        try git.updateRef(layout.tip_ref, previous.oid.hex(), expected.layer.oid.hex())
-    else
-        try git.createRef(layout.tip_ref, expected.layer.oid.hex());
-    count += 1;
-    try mutation.publish(.{ .message = "stakrr: cut", .updates = updates[0..count] });
-}
-
-pub const ResetResult = struct {
-    deleted_layers: usize,
-    kept_layers: usize,
-};
-
-pub const ResetOptions = struct { delete_layers: bool = false };
-
-/// Remove stakrr's state and internal refs so the stack can be
-/// re-initialised. Layer branches are kept unless `delete_layers` is set.
-/// Works on corrupt or outdated state, so it never parses the config.
-pub fn reset(original_git: *const Git, options: ResetOptions) !ResetResult {
-    const delete_layers = options.delete_layers;
-    var mutation = try original_git.beginStackMutation();
-    defer mutation.deinit();
-    const git = mutation.repo();
-    const allocator = git.allocator;
-
-    var layers = try git.listDirectRefs(layout.layer_prefix);
-    defer layers.deinit(allocator);
-
+    const appended = try allocator.alloc(model.Layer, snapshot.state.layers.len + 1);
+    defer allocator.free(appended);
+    @memcpy(appended[0..snapshot.state.layers.len], snapshot.state.layers);
+    appended[appended.len - 1] = .{ .branch = try BranchRef.init(new_ref), .recorded_boundary_oid = try git.parseOid(target) };
+    var next_state = snapshot.state;
+    next_state.layers = appended;
+    const oid = try store.create(git, next_state);
+    defer allocator.free(oid);
     var updates: std.ArrayList(Git.RefUpdate) = .empty;
     defer updates.deinit(allocator);
+    try updates.appendSlice(allocator, &.{ try git.updateRef(layout.state_ref, snapshot.manifest_oid, oid), try git.verifyRef(snapshot.config.work_ref.name.bytes, snapshot.work_oid), try git.createRef(new_ref, target) });
+    for (snapshot.layers) |layer| try updates.append(allocator, try git.verifyRef(layer.ref_name, layer.branch_oid));
+    try mutation.publish(.{ .message = "stakrr: cut", .updates = updates.items });
+}
 
-    const internal = [_][]const u8{ layout.tip_ref, layout.anchor_ref };
-    var internal_oids: [internal.len]?[]u8 = @splat(null);
-    defer for (internal_oids) |maybe| if (maybe) |oid| allocator.free(oid);
-
-    for (internal, &internal_oids) |ref_name, *slot| {
-        slot.* = try git.readDirectRefAlloc(try RefName.init(ref_name));
-        if (slot.*) |oid|
-            try updates.append(
-                allocator,
-                try git.deleteRef(ref_name, oid),
-            );
-    }
-
-    var records = try git.listDirectRefs(layout.record_prefix);
-    defer records.deinit(allocator);
-    for (records.refs) |ref| try updates.append(allocator, ref.delete());
-
-    const layer_count = layers.refs.len;
-    if (delete_layers) for (layers.refs) |ref| {
-        try updates.append(allocator, ref.delete());
-    };
-
-    // refs first: if unsetting config fails, reset can simply be re-run
-    if (updates.items.len != 0)
-        try mutation.publish(.{ .message = "stakrr: reset", .updates = updates.items });
-
-    const had_state = try git.configUnset(layout.state_key);
-
-    if (!had_state and updates.items.len == 0 and layer_count == 0)
+pub const ResetResult = struct { deleted_layers: usize, kept_layers: usize };
+pub const ResetOptions = struct { delete_layers: bool = false };
+/// Archive all roots before deleting state.
+pub fn reset(original: *const Git, options: ResetOptions) !ResetResult {
+    var arena: std.heap.ArenaAllocator = .init(original.allocator);
+    defer arena.deinit();
+    const scoped = original.withAllocator(arena.allocator());
+    var mutation = try @import("mutation.zig").begin(&scoped, .stack);
+    defer mutation.deinit();
+    const git = mutation.repo();
+    const state = try git.readDirectRefAlloc(try RefName.init(layout.state_ref));
+    const layers = try git.listDirectRefs(layout.layer_prefix);
+    if (state == null and layers.refs.len == 0) {
+        if (mutation.recovered) return .{ .deleted_layers = 0, .kept_layers = 0 };
         return error.NotInitialized;
-
-    return .{
-        .deleted_layers = if (delete_layers) layer_count else 0,
-        .kept_layers = if (delete_layers) 0 else layer_count,
-    };
+    }
+    var updates: std.ArrayList(Git.RefUpdate) = .empty;
+    var rescue: std.ArrayList([]const u8) = .empty;
+    var moves: std.ArrayList(operations.Move) = .empty;
+    if (state) |oid| {
+        try updates.append(git.allocator, try git.deleteRef(layout.state_ref, oid));
+        try rescue.append(git.allocator, oid);
+    }
+    for (layers.refs) |ref| {
+        try rescue.append(git.allocator, try ref.oid.dupeHex(git.allocator));
+        if (options.delete_layers) {
+            try updates.append(git.allocator, ref.delete());
+            try moves.append(git.allocator, .{ .name = ref.name.bytes, .before = try ref.oid.dupeHex(git.allocator), .after = null });
+        }
+    }
+    const old = try git.readDirectRefAlloc(try RefName.init(layout.oplog_ref));
+    const archive = try operations.create(git, .{ .kind = .reset, .before_manifest = state, .after_manifest = null, .moves = moves.items, .rescue = rescue.items, .previous = old }, null);
+    try updates.append(git.allocator, try operations.update(git, old, archive));
+    try mutation.publish(.{ .message = "stakrr: reset", .updates = updates.items });
+    return .{ .deleted_layers = if (options.delete_layers) layers.refs.len else 0, .kept_layers = if (options.delete_layers) 0 else layers.refs.len };
 }
 
 pub const Direction = enum { up, down };
@@ -508,7 +414,7 @@ fn navigationRef(snapshot: *const Snapshot, index: usize) []const u8 {
 
 /// Returns false when already at the requested end of the stack.
 pub fn navigate(original_git: *const Git, direction: Direction) !bool {
-    var mutation = try original_git.beginStackMutation();
+    var mutation = try @import("mutation.zig").begin(original_git, .stack);
     defer mutation.deinit();
     const git = mutation.repo();
     var snapshot = try inspect(git);
@@ -536,7 +442,7 @@ pub fn navigate(original_git: *const Git, direction: Direction) !bool {
 /// Switch to a layer's branch by its short name. Commits made there are picked
 /// up by the next restack.
 pub fn go(original_git: *const Git, name: []const u8) !void {
-    var mutation = try original_git.beginStackMutation();
+    var mutation = try @import("mutation.zig").begin(original_git, .stack);
     defer mutation.deinit();
     const git = mutation.repo();
     var snapshot = try inspect(git);

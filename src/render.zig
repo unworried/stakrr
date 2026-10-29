@@ -16,7 +16,6 @@ pub fn plural(n: usize, one: []const u8, many: []const u8) []const u8 {
 const help_commands = [_]struct { name: []const u8, args: []const u8, about: []const u8 }{
     .{ .name = "init", .args = "--base <branch>", .about = "adopt current branch as rolling work" },
     .{ .name = "status", .args = "", .about = "display layers and unstacked commits" },
-    .{ .name = "undo", .args = "", .about = "reverse the last restack, fix or undo" },
     .{ .name = "log", .args = "", .about = "show edit history and rescue commits" },
     .{ .name = "cut", .args = "<name> [--at <rev>]", .about = "create the next layer" },
     .{ .name = "fix", .args = "[<cut>] -m <msg>|--amend", .about = "fold staged changes into a cut, replaying descendants" },
@@ -56,61 +55,6 @@ pub fn printHelp(out: Terminal) !void {
     }
 }
 
-/// Draw the stack top-down, marking the checked-out branch with ▸.
-pub fn printStatus(
-    out: Terminal,
-    snapshot: stack.Snapshot,
-    current: ?[]const u8,
-) !void {
-    const w = out.writer;
-    const config = snapshot.config;
-
-    var width = columnWidth(config.base_ref.name.bytes, config.work_ref.name.bytes);
-    for (snapshot.layers) |layer| width = @max(width, columnWidth(config.base_ref.name.bytes, layer.ref_name));
-
-    try printStackHeader(out, config.base_ref.name.bytes, config.work_ref.name.bytes);
-    try w.writeByte('\n');
-
-    if (snapshot.base_moved) {
-        try w.writeAll("  ");
-        try term.styled(
-            out,
-            .warn,
-            "warning: base moved since initialization; layers stay cut from the original base",
-            .{},
-        );
-        try w.writeAll("\n\n");
-    }
-
-    try printStackRow(out, config.work_ref.name.bytes, isCurrent(current, config.work_ref.name.bytes), false, width);
-    try term.styled(out, .dim, "{d} unstacked", .{snapshot.unstacked_commits});
-    try w.writeByte('\n');
-
-    var i = snapshot.layers.len;
-    while (i > 0) {
-        i -= 1;
-        const layer = snapshot.layers[i];
-        try printStackRow(out, layer.ref_name, isCurrent(current, layer.ref_name), false, width);
-        try term.styled(out, .dim, "{d} {s}", .{
-            layer.commits,
-            plural(layer.commits, "commit", "commits"),
-        });
-        if (layer.stale()) {
-            try w.writeAll("  ");
-            try term.styled(out, .warn, "stale", .{});
-        }
-        try w.writeByte('\n');
-    }
-
-    try printFooter(out, config.base_ref.name.bytes, current, width, snapshot.layers.len);
-    for (snapshot.layers) |layer| {
-        if (!layer.stale()) continue;
-        try w.writeAll("\n  stale layers have commits above their recorded boundary;\n" ++
-            "  stakrr restack replays what sits above them\n");
-        break;
-    }
-}
-
 /// The stack as an active edit session sees it, with the pending transition.
 pub fn printEditStatus(out: Terminal, status: edit.Status, current: ?[]const u8) !void {
     const w = out.writer;
@@ -119,7 +63,7 @@ pub fn printEditStatus(out: Terminal, status: edit.Status, current: ?[]const u8)
     try w.writeAll("   ");
     try term.styled(out, .accent, "{s}", .{shortRef(status.branches[status.active])});
     try w.print(" ({s}) → {s}", .{ @tagName(status.phase), shortRef(status.destination) });
-    try w.writeByte('\n');
+    try w.print("\nworkspace: {s}\n", .{status.workspace});
     if (status.progress) |progress| {
         try term.styled(out, .dim, "replay", .{});
         if (status.stopped) |stop| {
@@ -163,9 +107,6 @@ pub fn printDriftHints(out: Terminal, drift: edit.Drift) !void {
         if (std.mem.startsWith(u8, expected, stakrr.layout.branch_prefix)) {
             try hint(out, "restore it: git switch {s}", .{shortRef(expected)});
         } else try hint(out, "restore it: git switch --detach {s}", .{expected});
-    } else if (std.mem.eql(u8, name, stakrr.layout.state_key)) {
-        try hint(out, "{s} is '{s}', expected '{s}'", .{ name, drift.actual orelse "", drift.expected.? });
-        try hint(out, "restore it: git config {s} '{s}'", .{ name, drift.expected.? });
     } else if (drift.expected) |expected| {
         if (drift.actual) |actual| {
             try hint(out, "{s} is at {s}, expected {s}", .{ name, actual, expected });
@@ -232,7 +173,48 @@ pub fn printLog(out: Terminal, log: edit.Log) !void {
     if (log.steps.len == 0) return out.writer.writeAll("no edit history\n");
     for (log.steps) |step| {
         try out.writer.print("{s} {s}", .{ step.time, step.label });
-        for (step.moves) |move| try out.writer.print("; {s} {s} → {s}", .{ shortRef(move.name), move.before, move.after });
+        for (step.moves) |move| try out.writer.print("; {s} {s} → {s}", .{ shortRef(move.name), move.before, move.after orelse "absent" });
         try out.writer.print("; rescue {s}\n", .{step.rescue});
     }
+}
+
+/// Render available evidence without pretending unknown observations are zero.
+pub fn printStatus(out: Terminal, view: stack.StackObservation, current: ?[]const u8) !void {
+    const w = out.writer;
+    if (view.state) |state| {
+        var width = columnWidth(state.base_branch.name.bytes, state.work_branch.name.bytes);
+        for (view.layers) |layer| width = @max(width, columnWidth(state.base_branch.name.bytes, layer.branch));
+        try printStackHeader(out, state.base_branch.name.bytes, state.work_branch.name.bytes);
+        try w.writeByte('\n');
+        if (view.base_moved orelse false) try w.writeAll("  warning: base moved since initialization; layers stay cut from the original base\n");
+        try printStackRow(out, state.work_branch.name.bytes, isCurrent(current, state.work_branch.name.bytes), false, width);
+        if (view.unstacked_commits) |count| try w.print("{d} unstacked\n", .{count}) else try w.writeAll("  unstacked unavailable\n");
+        var i = view.layers.len;
+        while (i > 0) {
+            i -= 1;
+            const layer = view.layers[i];
+            try printStackRow(out, layer.branch, isCurrent(current, layer.branch), false, width);
+            if (layer.commits) |count| try w.print("{d} {s}", .{ count, plural(count, "commit", "commits") }) else try w.writeAll("  count unavailable");
+            if (layer.stale) |stale| {
+                if (stale) try w.writeAll("  stale");
+            } else try w.writeAll("  tip unavailable");
+            try w.writeByte('\n');
+        }
+        try printFooter(out, state.base_branch.name.bytes, current, width, view.layers.len);
+        for (view.layers) |layer| if (layer.stale orelse false) {
+            try w.writeAll("\n  stale layers have commits above their recorded boundary;\n  stakrr restack replays what sits above them\n");
+            break;
+        };
+    }
+    for (view.issues) |issue| try w.print("issue: {s}: {s}\n", .{ issue.ref_name, switch (issue.kind) {
+        .missing_branch => "branch missing; tip unavailable",
+        .symbolic_ref => "symbolic ref; direct ref required",
+        .invalid_ancestry => "anchor is not an ancestor of work",
+        .merge_history => "merge commits in stack history",
+        .invalid_boundary => "recorded boundary is outside declared linear order",
+        .unexpected_layer => "unexpected branch in reserved namespace",
+        .pending_publication => "ref publication pending; run stakrr continue",
+        .invalid_manifest => "invalid manifest; inspect before resetting",
+        .unsupported_manifest => "unsupported manifest version",
+    } });
 }

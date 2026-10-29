@@ -138,18 +138,6 @@ test "check distinguishes negative answers from fatal Git errors" {
     try testing.expect(diagnostics.stderr().len > 0);
 }
 
-test "configUnset reports absence and removes every configured value" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-
-    try testing.expect(!try repo.git.configUnset("stakrr.state"));
-    try repo.exec(&.{ "config", "--local", "--add", "stakrr.state", "first" });
-    try repo.exec(&.{ "config", "--local", "--add", "stakrr.state", "second" });
-    try testing.expect(try repo.git.configUnset("stakrr.state"));
-    try testing.expect((try repo.git.configGet("stakrr.state")) == null);
-    try testing.expect(!try repo.git.configUnset("stakrr.state"));
-}
-
 test "resolveCommit resolves a branch to its commit" {
     var repo = try Repo.init();
     defer repo.deinit();
@@ -247,7 +235,7 @@ test "failed commands record git's stderr in diagnostics" {
 test "ref constructors reject malformed names and OIDs without creating refs" {
     var repo = try Repo.init();
     defer repo.deinit();
-    try testing.expectError(error.InvalidOid, repo.git.createRef("refs/stakrr/tip", "HEAD"));
+    try testing.expectError(error.InvalidOid, repo.git.createRef("refs/stakrr/state", "HEAD"));
     try testing.expectError(error.InvalidRefName, repo.git.createRef(
         "refs/heads/x\ndelete refs/heads/main",
         &@as([40]u8, @splat('a')),
@@ -260,7 +248,7 @@ test "configGet returns null when key is missing" {
     var repo = try Repo.init();
     defer repo.deinit();
 
-    const value = try repo.git.configGet("stakrr.state");
+    const value = try repo.git.configGet("test.value");
     try testing.expect(value == null);
 }
 
@@ -269,14 +257,14 @@ test "configGet returns a single config value" {
     defer repo.deinit();
 
     try repo.exec(&.{
-        "config",       "--local", "--add",
-        "stakrr.state", "v1 test",
+        "config",     "--local",    "--add",
+        "test.value", "test value",
     });
 
-    const value = (try repo.git.configGet("stakrr.state")).?;
+    const value = (try repo.git.configGet("test.value")).?;
     defer testing.allocator.free(value);
 
-    try testing.expectEqualStrings("v1 test", value);
+    try testing.expectEqualStrings("test value", value);
 }
 
 test "configGet rejects duplicate values" {
@@ -284,18 +272,18 @@ test "configGet rejects duplicate values" {
     defer repo.deinit();
 
     try repo.exec(&.{
-        "config",       "--local", "--add",
-        "stakrr.state", "first",
+        "config",     "--local", "--add",
+        "test.value", "first",
     });
 
     try repo.exec(&.{
-        "config",       "--local", "--add",
-        "stakrr.state", "second",
+        "config",     "--local", "--add",
+        "test.value", "second",
     });
 
     try testing.expectError(
         error.InvalidGitConfig,
-        repo.git.configGet("stakrr.state"),
+        repo.git.configGet("test.value"),
     );
 }
 
@@ -304,13 +292,13 @@ test "configGet rejects empty values" {
     defer repo.deinit();
 
     try repo.exec(&.{
-        "config",       "--local", "--add",
-        "stakrr.state", "",
+        "config",     "--local", "--add",
+        "test.value", "",
     });
 
     try testing.expectError(
         error.InvalidGitConfig,
-        repo.git.configGet("stakrr.state"),
+        repo.git.configGet("test.value"),
     );
 }
 
@@ -531,7 +519,7 @@ test "object plumbing works in bare repositories in both object formats" {
         defer testing.allocator.free(tree);
         const commit = try git.commitTree(tree, &.{}, "bare checkpoint");
         defer testing.allocator.free(commit);
-        var mutation = try git.beginRefMutation();
+        var mutation = try @import("stakrr").mutation.begin(&git, .refs);
         defer mutation.deinit();
         try mutation.publish(.{ .message = "bare refs", .updates = &.{
             try git.createRef("refs/heads/main", commit),
@@ -845,12 +833,12 @@ test "configGet rejects trailing empty values and embedded newlines" {
     defer repo.deinit();
 
     for ([_][]const u8{ "", "\n", "\r\n" }) |suffix| {
-        try repo.exec(&.{ "config", "--local", "--replace-all", layout.state_key, "v1 refs/heads/main refs/heads/work" });
-        try repo.exec(&.{ "config", "--local", "--add", layout.state_key, suffix });
-        try testing.expectError(error.InvalidGitConfig, repo.git.configGet(layout.state_key));
+        try repo.exec(&.{ "config", "--local", "--replace-all", "test.value", "configured value" });
+        try repo.exec(&.{ "config", "--local", "--add", "test.value", suffix });
+        try testing.expectError(error.InvalidGitConfig, repo.git.configGet("test.value"));
     }
-    try repo.exec(&.{ "config", "--local", "--replace-all", layout.state_key, "v1 refs/heads/main refs/heads/work\n" });
-    try testing.expectError(error.InvalidGitConfig, repo.git.configGet(layout.state_key));
+    try repo.exec(&.{ "config", "--local", "--replace-all", "test.value", "configured value\n" });
+    try testing.expectError(error.InvalidGitConfig, repo.git.configGet("test.value"));
 }
 
 test "publication intent retains annotated tags through pruning" {
@@ -874,7 +862,7 @@ test "publication intent retains annotated tags through pruning" {
     });
     try repo.exec(&.{ "config", "core.hooksPath", ".git/ref-hooks" });
     {
-        var mutation = try repo.git.beginRefMutation();
+        var mutation = try @import("stakrr").mutation.begin(&repo.git, .refs);
         defer mutation.deinit();
         try testing.expectError(error.GitFailed, mutation.publish(.{ .message = "tag copies", .updates = &.{
             try repo.git.createRef("refs/stakrr/copy-a", tag),
@@ -887,7 +875,7 @@ test "publication intent retains annotated tags through pruning" {
     try repo.exec(&.{ "reflog", "expire", "--expire=now", "--all" });
     try repo.exec(&.{ "gc", "--prune=now" });
     try testing.expectError(error.GitFailed, repo.git.output(&.{ "cat-file", "-t", tag }));
-    var recovered = try repo.git.beginRefMutation();
+    var recovered = try @import("stakrr").mutation.begin(&repo.git, .refs);
     defer recovered.deinit();
     try testing.expect(recovered.recovered);
     try repo.expectRef("refs/stakrr/copy-a", tag);
@@ -902,7 +890,7 @@ test "journaled transactions encode explicit absence and deletion in both object
         defer repo.deinit();
         const blob = try repo.git.writeBlob("ref contents");
         defer testing.allocator.free(blob);
-        var mutation = try repo.git.beginRefMutation();
+        var mutation = try @import("stakrr").mutation.begin(&repo.git, .refs);
         defer mutation.deinit();
         try mutation.publish(.{ .message = "verify absence and create", .updates = &.{
             try repo.git.verifyRef("refs/stakrr/absent", null),

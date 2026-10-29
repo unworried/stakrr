@@ -41,6 +41,16 @@ pub fn main(init: std.process.Init) !void {
     runCommand(&git, out, command) catch |err| {
         stdout.flush() catch {};
         // best effort: a failed diagnosis still reports the original error
+        if (err == error.ReplayConflict or err == error.WorkspaceCleanupPending or err == error.WorkspaceChanged or err == error.IgnoredFilesPresent) {
+            if (edit.readStatus(&git) catch null) |view| {
+                var status = view;
+                defer status.deinit();
+                var buf: [2048]u8 = undefined;
+                var writer = std.Io.File.stderr().writer(init.io, &buf);
+                writer.interface.print("workspace: {s}\n", .{status.workspace}) catch {};
+                writer.interface.flush() catch {};
+            }
+        }
         const drift = if (err == error.EditStateChanged) edit.findDrift(&git) catch null else null;
         fail(init.io, env, err, &diagnostics, drift);
     };
@@ -64,23 +74,27 @@ fn runCommand(
         },
         .status => {
             // both views validate the repository before HEAD is read
-            if (try edit.readStatus(git)) |view| {
+            if (edit.readStatus(git) catch |err| switch (err) {
+                error.RefTransactionPending => null,
+                error.InvalidEditSession => blk: {
+                    try stdout.writeAll("issue: refs/stakrr/edit: invalid progress; preserve workspace files before stakrr quit\n");
+                    break :blk null;
+                },
+                else => return err,
+            }) |view| {
                 var status = view;
                 defer status.deinit();
                 const current = try git.head();
                 defer if (current) |ref| git.allocator.free(ref);
                 return render.printEditStatus(out, status, current);
             }
-            var snapshot = try stack.inspect(git);
+            var snapshot = try stack.observe(git);
             defer snapshot.deinit();
             const current = try git.head();
             defer if (current) |ref| git.allocator.free(ref);
             try render.printStatus(out, snapshot, current);
         },
-        .undo => {
-            try edit.undo(git);
-            try stdout.writeAll("undone; use 'stakrr undo' to undo this undo\n");
-        },
+        .undo => return error.Unimplemented,
         .go => |name| {
             try stack.go(git, name);
             try stdout.writeAll("switched to ");
@@ -93,21 +107,25 @@ fn runCommand(
             try render.printLog(out, log);
         },
         .edit => |request| {
+            const previous_status = edit.readStatus(git) catch null;
+            var saved_status = previous_status;
+            defer if (saved_status) |*status| status.deinit();
+            const destination = if (previous_status) |status| try git.allocator.dupe(u8, status.destination) else try git.head();
+            defer if (destination) |name| git.allocator.free(name);
             const recovered = edit.runWithRecovery(git, request) catch |err| switch (err) {
                 error.NothingToRestack => return stdout.writeAll("nothing to restack\n"),
                 else => return err,
             };
             if (recovered) return stdout.writeAll("interrupted operation completed\n");
             if (request == .quit) {
+                if (previous_status) |status| try stdout.print("preserved workspace: {s}\n", .{status.workspace});
                 try stdout.writeAll("restack dropped; HEAD and branches left as they are\n" ++
                     "check the stack with 'stakrr status' (it may need 'stakrr reset')\n" ++
                     "retained: stakrr log (" ++ stakrr.layout.oplog_ref ++ ")\n");
                 return;
             }
-            var branch = try git.currentBranch();
-            defer branch.deinit(git.allocator);
             try stdout.print("restack {s}; returned to ", .{if (request == .abort) "aborted" else "completed"});
-            try term.styled(out, .accent, "{s}", .{branch.value.short()});
+            try term.styled(out, .accent, "{s}", .{shortRef(destination orelse "original branch")});
             try stdout.writeByte('\n');
             if (request == .abort)
                 try stdout.writeAll("retained edits: stakrr log (" ++ stakrr.layout.oplog_ref ++ ")\n");
@@ -213,7 +231,7 @@ fn userError(err: anyerror) ?[]const u8 {
         error.BranchOccupied => "a required branch is checked out in another worktree",
         error.BranchCheckedOut => "a required branch is checked out in this worktree",
         error.DirtyWorkTree => "preserve uncommitted changes before proceeding",
-        error.IgnoredFilesPresent => "preserve and remove ignored files before replaying descendants",
+        error.IgnoredFilesPresent => "preserve and remove ignored files from the replay workspace before continuing",
         error.GitOperationInProgress => "finish the active Git operation before proceeding",
         error.NoEditSession => "no restack is pending",
         error.UnknownCut => "cut not found (use its short name)",
@@ -228,7 +246,7 @@ fn userError(err: anyerror) ?[]const u8 {
             "restore them, or keep them and leave with 'stakrr quit'",
         error.ReplayConflict => "replay conflict: resolve files, git add them, then run 'stakrr continue'; " ++
             "preserve uncommitted work before 'stakrr abort'",
-        error.NoUndo => "nothing to undo",
+        error.Unimplemented => "unimplemented",
         error.NoLayers => "no layers yet (run 'stakrr cut <name>')",
         error.NothingStaged => "nothing staged (stage changes with 'git add' first)",
         error.FixConflict => "the staged changes conflict with the layer or a later commit; " ++
@@ -246,9 +264,8 @@ fn userError(err: anyerror) ?[]const u8 {
         error.BaseNotFound => "base branch not found (it must be a local branch)",
         error.BaseNotAncestor => "base is not an ancestor of work",
         error.MergeCommitsUnsupported => "merge commits in the stack are unsupported",
-        error.InvalidConfig => "stakrr state in git config is invalid (run 'stakrr reset')",
-        error.UnsupportedConfigVersion => "stack was created by an incompatible stakrr version " ++
-            "(run 'stakrr reset')",
+        error.InvalidManifest => "invalid stack manifest at refs/stakrr/state; inspect it before resetting",
+        error.UnsupportedManifestVersion => "unsupported stack manifest version",
         error.InvalidStack, error.InvalidLayerBoundary => "stack refs are inconsistent with the rolling branch " ++
             "(run 'stakrr reset' to start over)",
         error.NotOnWorkBranch => "this command must run on the rolling work branch",
@@ -265,7 +282,9 @@ fn userError(err: anyerror) ?[]const u8 {
         error.NotGitRepository => "not inside a Git repository",
         error.NotWorkingTree => "not inside a Git working tree",
         error.DetachedHead => "detached HEAD is unsupported",
-        error.InvalidGitConfig => "stakrr.state has multiple or empty values (run 'stakrr reset')",
+        error.WorkspaceChanged => "replay workspace ownership or checkout changed; inspect the workspace shown by stakrr status",
+        error.WorkspaceCleanupPending => "replay is retained; preserve unexpected workspace files shown by stakrr status, then continue for cleanup",
+        error.InvalidGitConfig => "Git configuration requires a single nonempty value without line breaks",
         error.InvalidGitOutput => "unexpected output from git",
         error.UnsupportedGitVersion => "fix requires Git 2.40 or newer (merge-tree --merge-base)",
         error.UnsupportedRefStorage => "stack ref discovery requires Git's files ref storage (loose or packed refs)",

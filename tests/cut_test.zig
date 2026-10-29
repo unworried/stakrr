@@ -19,7 +19,7 @@ test "cut at HEAD creates the first layer without moving work" {
     try repo.expectRef("refs/heads/main", base);
     try repo.expectRef("refs/heads/work", b);
     try repo.expectRef("refs/heads/stakrr/p1", b);
-    try repo.expectRef(layout.tip_ref, b);
+    try @import("support/edit_fixture.zig").expectBoundary(&repo, "p1", b);
 
     const head = try repo.git.currentBranchAlloc();
     defer testing.allocator.free(head);
@@ -79,7 +79,7 @@ test "two sequential cuts create ordered boundaries" {
 
     try repo.expectRef("refs/heads/stakrr/p1", c);
     try repo.expectRef("refs/heads/stakrr/p2", d);
-    try repo.expectRef(layout.tip_ref, d);
+    try @import("support/edit_fixture.zig").expectBoundary(&repo, "p2", d);
     try repo.expectRef("refs/heads/main", base);
     try repo.expectRef("refs/heads/work", d);
 
@@ -191,7 +191,7 @@ test "cut rejects duplicate or invalid layer names" {
     );
 
     try repo.expectRef("refs/heads/stakrr/p1", b);
-    try repo.expectRef(layout.tip_ref, b);
+    try @import("support/edit_fixture.zig").expectBoundary(&repo, "p1", b);
 
     try testing.expectError(
         error.InvalidLayerName,
@@ -286,99 +286,6 @@ test "cut allows staged changes without changing the index" {
     try testing.expectEqualStrings(before, after);
 }
 
-test "ref transaction aborts if work changes after inspection" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-
-    const base = try repo.initStack();
-    defer testing.allocator.free(base);
-
-    const b = try repo.commit("B");
-    defer testing.allocator.free(b);
-
-    const c = try repo.commit("C");
-    defer testing.allocator.free(c);
-
-    var mutation = try repo.git.beginStackMutation();
-    defer mutation.deinit();
-    try testing.expectError(
-        error.GitFailed,
-        stack.createLayerRef(&mutation, .{
-            .layer = try repo.git.expectedRef("refs/heads/stakrr/race", b),
-            .anchor = try repo.git.expectedRef(layout.anchor_ref, base),
-            .work = try repo.git.expectedRef("refs/heads/work", b),
-        }),
-    );
-
-    try repo.expectNoRef("refs/heads/stakrr/race");
-    try repo.expectNoRef(layout.tip_ref);
-}
-
-test "ref transaction aborts if the stack is reset after inspection" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-
-    const base = try repo.initStack();
-    defer testing.allocator.free(base);
-
-    const b = try repo.commit("B");
-    defer testing.allocator.free(b);
-
-    _ = try stack.reset(&repo.git, .{});
-
-    var mutation = try repo.git.beginStackMutation();
-    defer mutation.deinit();
-    try testing.expectError(
-        error.GitFailed,
-        stack.createLayerRef(&mutation, .{
-            .layer = try repo.git.expectedRef("refs/heads/stakrr/race", b),
-            .anchor = try repo.git.expectedRef(layout.anchor_ref, base),
-            .work = try repo.git.expectedRef("refs/heads/work", b),
-        }),
-    );
-
-    try repo.expectNoRef("refs/heads/stakrr/race");
-}
-
-test "ref transaction rejects two cuts from the same old tip" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-
-    const base = try repo.initStack();
-    defer testing.allocator.free(base);
-
-    const b = try repo.commit("B");
-    defer testing.allocator.free(b);
-
-    const c = try repo.commit("C");
-    defer testing.allocator.free(c);
-
-    var mutation = try repo.git.beginStackMutation();
-    defer mutation.deinit();
-    const expected_base = try repo.git.expectedRef(layout.anchor_ref, base);
-
-    const expected_work = try repo.git.expectedRef("refs/heads/work", c);
-
-    try stack.createLayerRef(&mutation, .{
-        .layer = try repo.git.expectedRef("refs/heads/stakrr/first", b),
-        .anchor = expected_base,
-        .work = expected_work,
-    });
-
-    try testing.expectError(
-        error.GitFailed,
-        stack.createLayerRef(&mutation, .{
-            .layer = try repo.git.expectedRef("refs/heads/stakrr/second", c),
-            .anchor = expected_base,
-            .work = expected_work,
-        }),
-    );
-
-    try repo.expectNoRef("refs/heads/stakrr/second");
-    try repo.expectRef("refs/heads/stakrr/first", b);
-    try repo.expectRef(layout.tip_ref, b);
-}
-
 test "cut rejects a side branch outside the rolling history" {
     var repo = try Repo.init();
     defer repo.deinit();
@@ -402,5 +309,4 @@ test "cut rejects a side branch outside the rolling history" {
     );
 
     try repo.expectNoRef("refs/heads/stakrr/outside");
-    try repo.expectNoRef(layout.tip_ref);
 }

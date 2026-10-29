@@ -35,11 +35,6 @@ pub const Mutation = struct {
         });
     }
 
-    pub fn detach(self: *const Mutation, commit: types.Oid) !void {
-        _ = try self.git.parseOid(commit.hex());
-        try self.git.exec(&.{ "switch", "--quiet", "--no-overwrite-ignore", "--detach", commit.hex() });
-    }
-
     /// Replay one commit. The workflow validates HEAD, ignored files and pick state.
     pub fn cherryPick(self: *const Mutation, commit: types.Oid) !void {
         _ = try self.git.parseOid(commit.hex());
@@ -71,11 +66,6 @@ pub const Mutation = struct {
             "--allow-empty-message",
             "--no-edit",
         });
-    }
-
-    /// Drop Git's pick metadata, preserving the index and working files.
-    pub fn quitCherryPick(self: *const Mutation) !void {
-        try self.git.exec(&.{ "cherry-pick", "--quit" });
     }
 };
 

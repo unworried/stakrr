@@ -22,13 +22,17 @@ pub const Error = stack.Error || error{
     InvalidEditedHistory,
     NothingToRestack,
     MultipleStaleLayers,
-    NoUndo,
+    WorkspaceChanged,
+    WorkspaceCleanupPending,
 };
 pub const Request = enum { restack, continue_edit, abort, quit };
 const checkpoint = @import("edit_session.zig");
 const Node = checkpoint.Node;
 const Session = checkpoint.Session;
 const Loaded = checkpoint.Loaded;
+const replay_mod = @import("replay.zig");
+const operations = @import("operation.zig");
+const store = @import("state_store.zig");
 
 /// A command owns all temporary session data. Never expose arena-backed slices
 /// through the public API; status transfers ownership of its arena explicitly.
@@ -54,6 +58,7 @@ pub const Status = struct {
     origin: []const u8,
     base: []const u8,
     owner: []const u8,
+    workspace: []const u8,
     destination: []const u8,
     branches: []const []const u8,
     session_id: []const u8,
@@ -83,7 +88,7 @@ pub fn runWithRecovery(original_git: *const Git, request: Request) !bool {
     var context: Context = undefined;
     context.init(original_git);
     defer context.deinit();
-    var mutation = try context.git.beginEditMutation();
+    var mutation = try @import("mutation.zig").begin(&context.git, .edit);
     defer mutation.deinit();
     const git = mutation.repo();
     if (mutation.recovered and request != .restack and
@@ -92,7 +97,7 @@ pub fn runWithRecovery(original_git: *const Git, request: Request) !bool {
     return false;
 }
 
-fn runLocked(mutation: *const Mutation, request: Request) !void {
+fn runLocked(mutation: *Mutation, request: Request) !void {
     const git = mutation.repo();
     if (request == .quit) return quitSession(mutation);
     var loaded = (try checkpoint.load(git)) orelse {
@@ -102,8 +107,10 @@ fn runLocked(mutation: *const Mutation, request: Request) !void {
     };
     const s = &loaded.session;
     try checkOwner(git, s);
-    try checkRefs(git, s);
-    try available(git, s);
+    var origin_repo = try openOrigin(git, s);
+    defer origin_repo.close();
+    mutation.git = origin_repo.git;
+    try checkRefs(mutation.repo(), s);
     switch (request) {
         // a pending session must be finished or abandoned first
         .restack => return error.EditInProgress,
@@ -141,8 +148,9 @@ pub fn readStatus(original_git: *const Git) !?Status {
         .active = s.active,
         .phase = std.meta.activeTag(s.phase),
         .origin = s.origin,
-        .base = s.branches.base_ref.name.bytes,
+        .base = s.state.base_branch.name.bytes,
         .owner = s.owner,
+        .workspace = s.workspace,
         .destination = s.origin,
         .branches = branches,
         .session_id = s.id,
@@ -156,7 +164,7 @@ pub const Log = struct {
     steps: []const Step,
     _arena: std.heap.ArenaAllocator,
 
-    pub const Move = struct { name: []const u8, before: []const u8, after: []const u8 };
+    pub const Move = operations.Move;
     pub const Step = struct { oid: []const u8, time: []const u8, label: []const u8, moves: []const Move, rescue: []const u8 };
 
     pub fn deinit(self: *Log) void {
@@ -188,6 +196,16 @@ pub fn readLog(original_git: *const Git) !Log {
     while (cursor) |oid| {
         const kind = try git.output(&.{ "cat-file", "-t", oid });
         if (!eql(kind, "commit")) break; // not a checkpoint
+        if (try operations.read(git, oid)) |record| {
+            const metadata = try git.output(&.{ "show", "--no-patch", "--format=%cI%x09%s", oid });
+            const separator = std.mem.indexOfScalar(u8, metadata, '\t') orelse return error.InvalidEditSession;
+            try steps.append(git.allocator, .{ .oid = oid, .time = metadata[0..separator], .label = metadata[separator + 1 ..], .moves = record.moves, .rescue = if (record.rescue.len != 0) record.rescue[0] else record.before_manifest orelse "" });
+            // Checkpoints remain inspectable through the completed record's explicit link.
+            cursor = try checkpoint.previous(git, oid);
+            carried = null;
+            continue;
+        }
+        if (try decodeCheckpoint(git, oid) == null) break;
         const rescue_path = try std.fmt.allocPrint(git.allocator, "{s}:rescue", .{oid});
         const rescue = git.output(&.{ "show", rescue_path }) catch |err| switch (err) {
             error.GitFailed => break, // not a journal commit
@@ -270,141 +288,166 @@ fn drift(git: *const Git) !?Mismatch {
     return (try refDrift(git, &loaded.session)) orelse try headDrift(git, &loaded.session);
 }
 
-/// Start a restack: the one layer whose branch moved past its recorded boundary
-/// becomes the new boundary, and everything above it is queued for replay.
+/// Persist workspace intent and immutable observations before creating anything.
 fn begin(mutation: *const Mutation) !Loaded {
     const git = mutation.repo();
+    const a = git.allocator;
     try coordination.requireQuiescent(git);
     var snapshot = try stack.inspect(git);
     defer snapshot.deinit();
     var stale: ?usize = null;
-    for (snapshot.layers, 0..) |layer, i| {
-        if (!layer.stale()) continue;
+    for (snapshot.layers, 0..) |layer, i| if (layer.stale()) {
         if (stale != null) return error.MultipleStaleLayers;
         stale = i;
-    }
+    };
     const active = stale orelse return error.NothingToRestack;
     const origin = try git.currentBranchAlloc();
-    const nodes = try git.allocator.alloc(Node, snapshot.layers.len + 1);
-    for (snapshot.layers, 0..) |layer, i|
-        nodes[i] = try Node.init(git.allocator, layer.ref_name, layer.oid);
-    nodes[snapshot.layers.len] =
-        try Node.init(git.allocator, snapshot.config.work_ref.name.bytes, snapshot.work_oid);
-    const config = (try git.configGet(layout.state_key)) orelse
-        return error.EditStateChanged;
+    const origin_oid = try git.resolveCommitAlloc("HEAD");
+    const state = (try store.loadAt(git, snapshot.manifest_oid)).value;
+    const plan = try replay_mod.plan(git, state, try a.dupe(u8, snapshot.work_oid), active);
+    const edited = try a.dupe(u8, snapshot.layers[active].branch_oid);
+    const lower = if (active == 0) state.anchor_oid.hex() else plan.boundaries[active - 1];
+    if (eql(lower, edited) or !try git.isAncestor(lower, edited) or !(try git.history(lower, edited)).linear) return error.InvalidEditedHistory;
+    const nodes = try a.alloc(Node, plan.boundaries.len);
+    for (nodes, plan.boundaries, 0..) |*node, oid, i| node.* = .{
+        .ref_name = if (i < state.layers.len) state.layers[i].branch.name.bytes else state.work_branch.name.bytes,
+        .original_oid = oid,
+        .published_oid = oid,
+        .pending_oid = oid,
+    };
+    nodes[active].pending_oid = edited;
+    const moved = try a.dupe([]const u8, plan.boundaries);
+    moved[active] = edited;
+    plan.map(moved, plan.boundaries[active], edited);
+    for (nodes, moved) |*node, oid| node.pending_oid = oid;
+    const old = try git.readDirectRefAlloc(try RefName.init(layout.oplog_ref));
+    const id = try git.writeBlob(try std.fmt.allocPrint(a, "{s}\n{s}\n{s}\n{s}", .{ snapshot.manifest_oid, edited, origin_oid, old orelse "" }));
+    const common = try git.path(&.{ "rev-parse", "--path-format=absolute", "--git-common-dir" });
     var s: Session = .{
-        .oplog_parent = try git.readDirectRefAlloc(try RefName.init(layout.oplog_ref)),
-        .id = "",
+        .id = id,
+        .oplog_parent = old,
         .owner = try owner(git),
         .origin = origin,
-        .config = config,
-        .branches = try stack.parseConfig(config),
-        .anchor = try git.allocator.dupe(u8, snapshot.config.anchor_oid),
+        .origin_oid = origin_oid,
+        .origin_path = try git.path(&.{ "rev-parse", "--show-toplevel" }),
+        .workspace = try std.fs.path.join(a, &.{ common, "stakrr-workspaces", id }),
+        .before_manifest = try a.dupe(u8, snapshot.manifest_oid),
+        .manifest = try a.dupe(u8, snapshot.manifest_oid),
+        .edited_oid = edited,
+        .state = state,
         .nodes = nodes,
         .active = active,
-        .phase = .switching,
+        .phase = .{ .detaching = .{ .plan_oid = try git.writeBlob(try std.mem.join(a, "\n", plan.commits)), .plan_len = plan.commits.len, .before = edited } },
     };
-    s.id = try git.writeBlob(try checkpoint.encode(git.allocator, &s));
     try available(git, &s);
-
-    const edited = snapshot.layers[active].branch_oid;
-    const lower = if (active == 0) s.anchor else nodes[active - 1].published_oid;
-    if (eql(lower, edited) or !try git.isAncestor(lower, edited))
-        return error.InvalidEditedHistory;
-    if (!(try git.history(lower, edited)).linear)
-        return error.InvalidEditedHistory;
-
-    const commits = (try git.history(
-        nodes[active].published_oid,
-        s.workNode().published_oid,
-    )).commits;
-    if (commits.len != 0) try requireNoIgnored(git);
-    const plan = try git.writeBlob(try std.mem.join(git.allocator, "\n", commits));
-    for (nodes[active..]) |*node| {
-        node.pending_oid = if (eql(node.published_oid, nodes[active].published_oid))
-            edited
-        else
-            node.published_oid;
-    }
-    s.phase = .{ .detaching = .{
-        .plan_oid = plan,
-        .plan_len = commits.len,
-        .before = edited,
-    } };
-
-    var checks: std.ArrayList(Git.RefUpdate) = .empty;
-    try checks.append(git.allocator, try git.verifyRef(layout.tip_ref, s.topCut().published_oid));
-    for (nodes, 0..) |node, i| {
-        try checks.append(git.allocator, try git.verifyRef(node.ref_name, s.expectedOid(i)));
-        if (i == nodes.len - 1) break;
-        try checks.append(git.allocator, try git.verifyRef(try layout.recordRef(git.allocator, node.ref_name), node.published_oid));
-    }
-    return .{
-        .oid = try save(mutation, &s, null, checks.items, &.{ edited, plan }),
-        .session = s,
-        .plan = commits,
-        .ignored_checked = true,
-    };
+    const checks = try expectedChecks(git, &s);
+    return .{ .oid = try save(mutation, &s, null, checks, &.{}), .session = s, .plan = plan.commits };
 }
-
-// Each handler advances and checkpoints one phase. Keep the fallthrough order
-// explicit: one command can replay, publish, then switch to its destination.
 fn advance(mutation: *const Mutation, loaded: *Loaded) !void {
     const s = &loaded.session;
     if (s.phase == .aborting or s.phase == .aborted) return abortSession(mutation, loaded);
-    if (s.phase == .detaching) try detachForReplay(mutation, loaded);
+    if (s.phase == .detaching) try createWorkspace(mutation, loaded);
     if (s.phase == .replay or s.phase == .conflict) try replayDescendants(mutation, loaded);
     if (s.phase == .publishing) try publishResults(mutation, loaded);
     if (s.phase == .switching) try switchDestination(mutation, loaded);
 }
 
-fn detachForReplay(mutation: *const Mutation, loaded: *Loaded) !void {
+const OpenRepo = struct {
+    git: Git,
+    fn open(git: *const Git, path: []const u8) !OpenRepo {
+        var copy = git.*;
+        copy.cwd = try std.Io.Dir.cwd().openDir(git.io, path, .{});
+        return .{ .git = copy };
+    }
+    fn close(self: *OpenRepo) void {
+        self.git.cwd.?.close(self.git.io);
+    }
+};
+fn workspaceReason(git: *const Git, s: *const Session) ![]const u8 {
+    return std.fmt.allocPrint(git.allocator, "stakrr {s}", .{s.id});
+}
+/// Verify both private Git directory and the unique lock marker before touching files.
+fn openWorkspace(git: *const Git, s: *const Session) !OpenRepo {
+    var repo = OpenRepo.open(git, s.workspace) catch return error.WorkspaceChanged;
+    errdefer repo.close();
+    repo.git.isolated_workspace = true;
+    const w = &repo.git;
+    const private = try owner(w);
+    if (s.workspace_owner) |expected| if (!eql(expected, private)) return error.WorkspaceChanged;
+    const common = try git.path(&.{ "rev-parse", "--path-format=absolute", "--git-common-dir" });
+    const actual_common = try w.path(&.{ "rev-parse", "--path-format=absolute", "--git-common-dir" });
+    const expected_parent = try std.fs.path.join(git.allocator, &.{ common, "worktrees" });
+    if (!eql(common, actual_common) or !eql(std.fs.path.dirname(private) orelse "", expected_parent) or !eql(try w.path(&.{ "rev-parse", "--show-toplevel" }), s.workspace)) return error.WorkspaceChanged;
+    const locked_path = try std.fs.path.join(git.allocator, &.{ private, "locked" });
+    const marker = std.Io.Dir.cwd().readFileAlloc(git.io, locked_path, git.allocator, .limited(1024)) catch |err| blk: {
+        if (err != error.FileNotFound or !s.cleanup_intent or s.workspace_owner == null) return error.WorkspaceChanged;
+        try git.exec(&.{ "worktree", "lock", "--reason", try workspaceReason(git, s), s.workspace });
+        break :blk try git.allocator.dupe(u8, try workspaceReason(git, s));
+    };
+    if (!eql(std.mem.trimEnd(u8, marker, "\r\n"), try workspaceReason(git, s))) return error.WorkspaceChanged;
+    if (try w.head() != null) return error.WorkspaceChanged;
+    return repo;
+}
+fn openOrigin(git: *const Git, s: *const Session) !OpenRepo {
+    var repo = OpenRepo.open(git, s.origin_path) catch return error.WrongEditWorktree;
+    errdefer repo.close();
+    if (!eql(try owner(&repo.git), s.owner)) return error.WrongEditWorktree;
+    const common = try git.path(&.{ "rev-parse", "--path-format=absolute", "--git-common-dir" });
+    const origin_common = try repo.git.path(&.{ "rev-parse", "--path-format=absolute", "--git-common-dir" });
+    if (!eql(common, origin_common) or !eql(try repo.git.path(&.{ "rev-parse", "--show-toplevel" }), s.origin_path)) return error.WrongEditWorktree;
+    return repo;
+}
+fn createWorkspace(mutation: *const Mutation, loaded: *Loaded) !void {
     const git = mutation.repo();
     const s = &loaded.session;
-    const progress = s.phase.detaching;
-    const queue = loaded.plan orelse return error.InvalidEditSession;
-    try coordination.requireQuiescent(git);
-    if (queue.len != 0 and !loaded.ignored_checked) {
-        try requireNoIgnored(git);
-        loaded.ignored_checked = true;
+    const exists = blk: {
+        std.Io.Dir.cwd().access(git.io, s.workspace, .{}) catch |err| switch (err) {
+            error.FileNotFound => break :blk false,
+            else => return err,
+        };
+        break :blk true;
+    };
+    if (!exists) {
+        try git.exec(&.{ "-c", "core.hooksPath=/dev/null", "-c", "core.sparseCheckout=false", "-c", "core.sparseCheckoutCone=false", "-c", "submodule.recurse=false", "worktree", "add", "--quiet", "--detach", "--lock", "--reason", try workspaceReason(git, s), s.workspace, s.edited_oid });
     }
-    try mutation.detach(try git.parseOid(progress.before));
-    // Checkout hooks can create ignored files. Recheck before the first pick.
-    loaded.ignored_checked = false;
+    var workspace = try openWorkspace(git, s);
+    defer workspace.close();
+    try coordination.requireQuiescent(&workspace.git);
+    try requireNoIgnored(&workspace.git);
+    if (!eql(try workspace.git.resolveCommitAlloc("HEAD"), s.edited_oid)) return error.WorkspaceChanged;
+    s.workspace_owner = try owner(&workspace.git);
+    const progress = s.phase.detaching;
     s.phase = .{ .replay = progress };
     loaded.oid = try save(mutation, s, loaded.oid, &.{}, &.{});
 }
-
-// Checkpoints bracket each cherry-pick. If a process exits after Git commits
-// but before the checkpoint, HEAD's single parent identifies the completed step.
 fn replayDescendants(mutation: *const Mutation, loaded: *Loaded) !void {
-    const git = mutation.repo();
     const s = &loaded.session;
-    try requireDetached(git);
+    var workspace = try openWorkspace(mutation.repo(), s);
+    defer workspace.close();
+    const git = &workspace.git;
+    var workspace_mutation = mutation.*;
+    workspace_mutation.git = git.*;
     var progress = s.replay().?;
     const queue = loaded.plan orelse return error.InvalidEditSession;
+    const plan = try s.plan(queue, git.allocator);
+    const moved = try git.allocator.alloc([]const u8, s.nodes.len);
+    for (s.nodes, moved) |node, *oid| oid.* = node.pending_oid;
     var head = try git.resolveCommitAlloc("HEAD");
     var picking = try git.cherryPickHeadAlloc();
-    if (picking == null) {
-        try coordination.requireQuiescent(git);
-    }
-    // Skip boundaries incorporated before this command was interrupted.
-    var boundary = s.boundaryAfter(queue[0..progress.next]);
+    try coordination.requireNoGitOperation(git, .{ .allow_cherry_pick = picking != null });
+    if (picking == null) try coordination.requireQuiescent(git);
     while (progress.next < queue.len) {
         const commit = queue[progress.next];
         if (picking) |oid| {
             if (!eql(oid, commit) or !eql(head, progress.before)) return error.EditStateChanged;
             try requireResolution(git);
-            // One commit per pick: commit clears CHERRY_PICK_HEAD and also
-            // preserves a resolution that makes the patch empty.
-            try mutation.commitResolution();
+            try workspace_mutation.commitResolution();
             head = try git.resolveCommitAlloc("HEAD");
             picking = null;
         } else if (eql(head, progress.before)) {
-            if (!loaded.ignored_checked) try requireNoIgnored(git);
-            loaded.ignored_checked = false;
-            mutation.cherryPick(try git.parseOid(commit)) catch |err| {
-                if (try git.cherryPickHeadAlloc()) |_| {
+            try requireNoIgnored(git);
+            workspace_mutation.cherryPick(try git.parseOid(commit)) catch |err| {
+                if (try git.cherryPickHeadAlloc() != null) {
                     s.phase = .{ .conflict = progress };
                     loaded.oid = try save(mutation, s, loaded.oid, &.{}, &.{});
                     return error.ReplayConflict;
@@ -413,18 +456,11 @@ fn replayDescendants(mutation: *const Mutation, loaded: *Loaded) !void {
             };
             head = try git.resolveCommitAlloc("HEAD");
         } else {
-            // Only the first step after a restart may already be committed.
             const parent = try git.output(&.{ "rev-list", "--parents", "-n", "1", head });
-            const expected = try std.fmt.allocPrint(
-                git.allocator,
-                "{s} {s}",
-                .{ head, progress.before },
-            );
-            if (!eql(parent, expected)) return error.EditStateChanged;
+            if (!eql(parent, try std.fmt.allocPrint(git.allocator, "{s} {s}", .{ head, progress.before }))) return error.EditStateChanged;
         }
-        while (boundary < s.nodes.len and eql(s.nodes[boundary].published_oid, commit)) : (boundary += 1) {
-            s.nodes[boundary].pending_oid = head;
-        }
+        plan.map(moved, commit, head);
+        for (s.nodes, moved) |*node, oid| node.pending_oid = oid;
         progress.before = head;
         progress.next += 1;
         s.phase = .{ .replay = progress };
@@ -433,389 +469,301 @@ fn replayDescendants(mutation: *const Mutation, loaded: *Loaded) !void {
     s.phase = .{ .publishing = progress };
     loaded.oid = try save(mutation, s, loaded.oid, &.{}, &.{});
 }
-
+/// Validate the original checkout, checkpoint detach intent, then detach briefly.
+fn prepareCheckout(mutation: *const Mutation, loaded: *Loaded) !void {
+    const s = &loaded.session;
+    var origin = try openOrigin(mutation.repo(), s);
+    defer origin.close();
+    const git = &origin.git;
+    try coordination.requireQuiescent(git);
+    const branch = try git.head();
+    const head = try git.resolveCommitAlloc("HEAD");
+    const expected = try destinationOid(git, s);
+    if (branch) |ref| {
+        if (!eql(ref, s.origin) or !eql(head, expected)) return error.EditStateChanged;
+    } else if (!s.final_detach or !eql(head, s.detached_oid orelse return error.InvalidEditSession)) return error.EditStateChanged;
+    try available(mutation.repo(), s);
+    if (!s.final_detach or (branch != null and !eql(s.detached_oid.?, head))) {
+        s.final_detach = true;
+        s.detached_oid = head;
+        loaded.oid = try save(mutation, s, loaded.oid, &.{}, &.{});
+    }
+    if (branch != null) {
+        try git.exec(&.{ "-c", "core.hooksPath=/dev/null", "-c", "submodule.recurse=false", "switch", "--quiet", "--no-overwrite-ignore", "--detach", head });
+    }
+}
+fn destinationOid(git: *const Git, s: *const Session) ![]const u8 {
+    for (s.nodes, 0..) |node, i| if (eql(node.ref_name, s.origin)) return s.expectedOid(i);
+    // Destinations outside the rewritten stack must remain exactly where observed.
+    _ = git;
+    return s.origin_oid;
+}
 fn publishResults(mutation: *const Mutation, loaded: *Loaded) !void {
     const git = mutation.repo();
     const s = &loaded.session;
-    try requireDetached(git);
-    try coordination.requireQuiescent(git);
-    if (!eql(try git.resolveCommitAlloc("HEAD"), s.phase.publishing.before)) return error.EditStateChanged;
+    var workspace = try openWorkspace(git, s);
+    defer workspace.close();
+    try coordination.requireQuiescent(&workspace.git);
+    if (!eql(try workspace.git.resolveCommitAlloc("HEAD"), s.phase.publishing.before)) return error.EditStateChanged;
     try checkRefs(git, s);
-    try available(git, s);
-    const changes = try moveBoundaries(git, s, .pending);
-    s.phase = .switching;
-    loaded.oid = try save(mutation, s, loaded.oid, changes, &.{});
-}
-
-/// Compare-and-swap every boundary and the tip guard to the replay result
-/// or back to the original stack, recording the target as published.
-fn moveBoundaries(
-    git: *const Git,
-    s: *Session,
-    comptime target: enum { pending, original },
-) ![]const Git.RefUpdate {
-    const layers = s.nodes.len - 1;
-    const changes = try git.allocator.alloc(Git.RefUpdate, s.nodes.len + 1 + layers);
-    // the tip guard tracks the published top cut, never a pending edit
-    const old_tip = s.topCut().published_oid;
-    for (s.nodes, 0..) |*node, i| {
-        const new = switch (target) {
-            .pending => node.pending_oid,
-            .original => if (s.rollback) |rollback| rollback.target[i] else node.original_oid,
-        };
-        changes[i] = try git.updateRef(node.ref_name, s.expectedOid(i), new);
-        // each layer's recorded boundary moves with its branch
-        if (i < layers) changes[s.nodes.len + 1 + i] = try git.updateRef(try layout.recordRef(git.allocator, node.ref_name), node.published_oid, new);
-        node.published_oid = new;
-        node.pending_oid = new;
+    try prepareCheckout(mutation, loaded);
+    const expected = try git.allocator.alloc([]const u8, s.nodes.len);
+    const moved = try git.allocator.alloc([]const u8, s.nodes.len);
+    for (s.nodes, expected, moved, 0..) |node, *from, *to, i| {
+        from.* = s.expectedOid(i);
+        to.* = node.pending_oid;
     }
-    changes[s.nodes.len] = try git.updateRef(layout.tip_ref, old_tip, s.topCut().published_oid);
-    return changes;
+    const publication = try replay_mod.publication(git, s.state, s.manifest, expected, moved);
+    s.manifest = publication.manifest;
+    for (s.nodes) |*node| node.published_oid = node.pending_oid;
+    s.phase = .switching;
+    loaded.oid = try save(mutation, s, loaded.oid, publication.updates, &.{});
 }
-
-/// Archive the terminal checkpoint and remove the active session in one transaction.
-fn finish(mutation: *const Mutation, loaded: *Loaded, comptime message: []const u8) !void {
-    const git = mutation.repo();
-    const s = &loaded.session;
-    s.outcome = if (s.operation == .undo) .undone else if (s.phase == .aborted) .aborted else .finished;
-    const label = if (s.operation == .undo) "stakrr: undo edit" else message;
-    const oid = try checkpoint.create(git, s, loaded.oid, &.{}, label);
-    var updates: std.ArrayList(Git.RefUpdate) = .empty;
-    try updates.appendSlice(git.allocator, &.{
-        try git.deleteRef(layout.session_ref, loaded.oid),
-        try oplogUpdate(git, s.oplog_parent, oid),
-        try git.verifyRef(layout.anchor_ref, s.anchor),
-        try git.verifyRef(layout.tip_ref, s.topCut().published_oid),
-    });
-    for (s.nodes, 0..) |node, i| try updates.append(git.allocator, try git.verifyRef(node.ref_name, s.expectedOid(i)));
-    for (s.nodes[0 .. s.nodes.len - 1]) |node| try updates.append(git.allocator, try git.verifyRef(try layout.recordRef(git.allocator, node.ref_name), node.published_oid));
-    try mutation.publish(.{ .message = label, .updates = updates.items });
-}
-
-fn oplogUpdate(git: *const Git, old: ?[]const u8, oid: []const u8) !Git.RefUpdate {
-    return if (old) |previous|
-        try git.updateRef(layout.oplog_ref, previous, oid)
-    else
-        try git.createRef(layout.oplog_ref, oid);
-}
-
 fn switchDestination(mutation: *const Mutation, loaded: *Loaded) !void {
     const git = mutation.repo();
     const s = &loaded.session;
-    try coordination.requireQuiescent(git);
+    var origin = try openOrigin(git, s);
+    defer origin.close();
+    try coordination.requireQuiescent(&origin.git);
     try checkRefs(git, s);
     try available(git, s);
-    try mutation.switchBranch(try BranchRef.init(s.origin));
-    try finish(mutation, loaded, "stakrr: restack");
+    const branch = try origin.git.head();
+    if (branch) |ref| {
+        if (!eql(ref, s.origin) or !eql(try origin.git.resolveCommitAlloc("HEAD"), try destinationOid(git, s))) return error.EditStateChanged;
+    } else {
+        // After publication detached HEAD must still be the pre-publication destination.
+        if (!eql(try origin.git.resolveCommitAlloc("HEAD"), s.detached_oid orelse return error.InvalidEditSession)) return error.EditStateChanged;
+        try origin.git.exec(&.{ "-c", "core.hooksPath=/dev/null", "-c", "submodule.recurse=false", "switch", "--quiet", "--no-guess", "--no-overwrite-ignore", "--", (try BranchRef.init(s.origin)).short() });
+    }
+    if (!s.cleanup_intent) {
+        s.cleanup_intent = true;
+        loaded.oid = try save(mutation, s, loaded.oid, &.{}, &.{});
+    }
+    try cleanupWorkspace(git, s);
+    try finish(mutation, loaded, if (s.phase == .aborted) .abort else .restack);
 }
-
+/// Remove only an owned, clean workspace, with no ignored files or Git operation.
+fn cleanupWorkspace(git: *const Git, s: *const Session) !void {
+    if (try workspaceRemoved(git, s)) return;
+    var workspace = try openWorkspace(git, s);
+    defer workspace.close();
+    coordination.requireQuiescent(&workspace.git) catch return error.WorkspaceCleanupPending;
+    requireNoIgnored(&workspace.git) catch return error.WorkspaceCleanupPending;
+    try git.exec(&.{ "worktree", "unlock", s.workspace });
+    git.exec(&.{ "-c", "core.hooksPath=/dev/null", "worktree", "remove", s.workspace }) catch {
+        git.exec(&.{ "worktree", "lock", "--reason", try workspaceReason(git, s), s.workspace }) catch {};
+        return error.WorkspaceCleanupPending;
+    };
+}
+/// Missing workspace and private registration together prove a journaled removal.
+fn workspaceRemoved(git: *const Git, s: *const Session) !bool {
+    std.Io.Dir.cwd().access(git.io, s.workspace, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (!s.cleanup_intent) return error.WorkspaceChanged;
+            const path = s.workspace_owner orelse return error.WorkspaceChanged;
+            std.Io.Dir.cwd().access(git.io, path, .{}) catch |missing| switch (missing) {
+                error.FileNotFound => return true,
+                else => return missing,
+            };
+            return error.WorkspaceChanged;
+        },
+        else => return err,
+    };
+    return false;
+}
 fn abortSession(mutation: *const Mutation, loaded: *Loaded) !void {
     const git = mutation.repo();
     const s = &loaded.session;
-    // Never use reset --hard: even conflict resolutions belong to the user.
-    try coordination.requireClean(git);
-    const picking = try validatePick(git, loaded);
-    if (s.phase != .aborting and s.phase != .aborted) {
-        const target = try git.allocator.alloc([]const u8, s.nodes.len);
-        for (s.nodes, target) |node, *oid| oid.* = node.original_oid;
-        try startRestore(mutation, loaded, target, loaded.oid);
-    }
-    if (picking != null) try mutation.quitCherryPick();
-    if (s.phase == .aborting) {
-        try checkRefs(git, s);
-        try available(git, s);
-        const head = try git.resolveCommitAlloc("HEAD");
-        try mutation.detach(try git.parseOid(head));
-        const changes = try moveBoundaries(git, s, .original);
-        s.phase = .aborted;
-        loaded.oid = try save(mutation, s, loaded.oid, changes, &.{head});
-    }
-    try available(git, s);
-    try mutation.switchBranch(try BranchRef.init(s.origin));
-    try finish(mutation, loaded, "stakrr: abort restack");
-}
-
-fn validatePick(git: *const Git, loaded: *const Loaded) !?[]const u8 {
-    const s = &loaded.session;
-    const picking = try git.cherryPickHeadAlloc();
-    if (picking) |oid| {
-        if (s.phase != .replay and s.phase != .conflict and s.phase != .aborting)
-            return error.GitOperationInProgress;
-        const progress = s.replay() orelse return error.InvalidEditSession;
-        const queue = loaded.plan orelse return error.InvalidEditSession;
-        if (progress.next >= queue.len) return error.InvalidEditSession;
-        if (!eql(oid, queue[progress.next]) or
-            !eql(try git.resolveCommitAlloc("HEAD"), progress.before))
-            return error.EditStateChanged;
-    }
-    try coordination.requireNoGitOperation(git, .{ .allow_cherry_pick = picking != null });
-    return picking;
-}
-
-/// Checkpoint before moving any branch; a restart resumes the same restoration.
-fn startRestore(mutation: *const Mutation, loaded: *Loaded, target: []const []const u8, old: ?[]const u8) !void {
-    const git = mutation.repo();
-    const s = &loaded.session;
-    const expected = try git.allocator.alloc([]const u8, s.nodes.len);
-    var checks: std.ArrayList(Git.RefUpdate) = .empty;
-    for (s.nodes, expected, 0..) |node, *oid, i| {
-        oid.* = s.expectedOid(i);
-        try checks.append(git.allocator, try git.verifyRef(node.ref_name, oid.*));
-        if (i == s.nodes.len - 1) break;
-        try checks.append(git.allocator, try git.verifyRef(try layout.recordRef(git.allocator, node.ref_name), node.published_oid));
-    }
-    try checks.append(git.allocator, try git.verifyRef(layout.tip_ref, s.topCut().published_oid));
-    const progress = s.replay();
-    s.rollback = .{ .expected = expected, .target = target };
-    s.phase = .{ .aborting = progress };
-    loaded.oid = try save(mutation, s, old, checks.items, &.{try git.resolveCommitAlloc("HEAD")});
-}
-
-/// Reverse the last completed edit, checking every published boundary first.
-/// An undo is itself a completed operation with reversed before/after positions.
-pub fn undo(original_git: *const Git) !void {
-    var context: Context = undefined;
-    context.init(original_git);
-    defer context.deinit();
-    var mutation = try context.git.beginStackMutation();
-    defer mutation.deinit();
-    const git = mutation.repo();
-    try coordination.requireQuiescent(git);
-    const oplog = (try git.readDirectRefAlloc(try RefName.init(layout.oplog_ref))) orelse return error.NoUndo;
-    var cursor: ?[]const u8 = oplog;
-    while (cursor) |oid| {
-        var loaded = checkpoint.loadAt(git, oid) catch |err| switch (err) {
-            error.InvalidEditSession => {
-                cursor = try checkpoint.previous(git, oid);
-                continue;
-            },
-            else => return err,
-        };
-        const s = &loaded.session;
-        if (s.outcome != .finished and s.outcome != .undone) {
-            cursor = try checkpoint.previous(git, oid);
-            continue;
+    if (s.phase == .aborted) return switchDestination(mutation, loaded);
+    if (s.phase == .detaching) try createWorkspace(mutation, loaded);
+    var workspace: ?OpenRepo = if (try workspaceRemoved(git, s)) null else try openWorkspace(git, s);
+    defer if (workspace) |*repo| repo.close();
+    var picking: ?[]const u8 = null;
+    const rescue = if (workspace) |*repo| try repo.git.resolveCommitAlloc("HEAD") else s.workNode().pending_oid;
+    if (workspace) |*repo| {
+        const w = &repo.git;
+        // Resolutions and unexpected files belong to the user; commit them first.
+        try coordination.requireClean(w);
+        picking = try w.cherryPickHeadAlloc();
+        if (picking) |oid| {
+            const p = s.replay() orelse return error.GitOperationInProgress;
+            const queue = loaded.plan orelse return error.InvalidEditSession;
+            if (p.next >= queue.len or !eql(oid, queue[p.next]) or !eql(rescue, p.before)) return error.EditStateChanged;
         }
-        // Global undo is allowed from another worktree once no session owns it.
-        s.owner = try owner(git);
-        s.origin = try git.currentBranchAlloc();
-        s.phase = .aborted; // require every branch to match, including the active cut
-        try checkRefs(git, s);
-        try available(git, s);
-        const target = try git.allocator.alloc([]const u8, s.nodes.len);
-        for (s.nodes, target) |*node, *to| {
-            to.* = node.original_oid;
-            node.original_oid = node.published_oid;
-            node.pending_oid = node.published_oid;
-        }
-        s.rollback = null;
-        s.oplog_parent = oplog;
-        s.outcome = .active;
-        s.operation = .undo;
-        s.id = try git.writeBlob(try checkpoint.encode(git.allocator, s));
-        try startRestore(&mutation, &loaded, target, null);
-        try abortSession(&mutation, &loaded);
-        return;
+        try coordination.requireNoGitOperation(w, .{ .allow_cherry_pick = picking != null });
     }
-    return error.NoUndo;
+    if (s.phase != .aborting) {
+        const expected = try git.allocator.alloc([]const u8, s.nodes.len);
+        for (expected, 0..) |*oid, i| oid.* = s.expectedOid(i);
+        const progress = s.replay();
+        s.abort_expected = expected;
+        s.phase = .{ .aborting = progress };
+        loaded.oid = try save(mutation, s, loaded.oid, &.{}, &.{rescue});
+    }
+    if (picking != null) try workspace.?.git.exec(&.{ "cherry-pick", "--quit" });
+    try checkRefs(git, s);
+    try prepareCheckout(mutation, loaded);
+    const original = try git.allocator.alloc([]const u8, s.nodes.len);
+    for (s.nodes, original) |node, *oid| oid.* = node.original_oid;
+    const publication = try replay_mod.publication(git, s.state, s.manifest, s.abort_expected.?, original);
+    s.manifest = publication.manifest;
+    for (s.nodes) |*node| {
+        node.published_oid = node.original_oid;
+        node.pending_oid = node.original_oid;
+    }
+    s.phase = .aborted;
+    loaded.oid = try save(mutation, s, loaded.oid, publication.updates, &.{rescue});
+    try switchDestination(mutation, loaded);
 }
-
-/// Drop the journal like `git rebase --quit`: HEAD, the index, files and every
-/// branch stay exactly as they are. Skips ref and plan validation so drifted or
-/// corrupt sessions can always be left; HEAD and the checkpoint stay retained.
+fn finish(mutation: *const Mutation, loaded: *Loaded, kind: @FieldType(operations.Record, "kind")) !void {
+    const git = mutation.repo();
+    const a = git.allocator;
+    const s = &loaded.session;
+    var moves: std.ArrayList(operations.Move) = .empty;
+    for (s.nodes, 0..) |node, i| {
+        const from = if (i == s.active) s.edited_oid else node.original_oid;
+        if (!eql(from, node.published_oid)) try moves.append(a, .{ .name = node.ref_name, .before = from, .after = node.published_oid });
+    }
+    const record = try operations.create(git, .{ .kind = kind, .before_manifest = s.before_manifest, .after_manifest = s.manifest, .moves = moves.items, .rescue = &.{ s.edited_oid, s.workNode().original_oid }, .previous = loaded.oid }, loaded.oid);
+    var updates: std.ArrayList(Git.RefUpdate) = .empty;
+    try updates.appendSlice(a, try expectedChecks(git, s));
+    try updates.appendSlice(a, &.{ try git.deleteRef(layout.session_ref, loaded.oid), try operations.update(git, s.oplog_parent, record) });
+    try mutation.publish(.{ .message = operations.label(.{ .kind = kind, .before_manifest = null, .after_manifest = null, .moves = &.{}, .rescue = &.{}, .previous = null }), .updates = updates.items });
+}
 fn quitSession(mutation: *const Mutation) !void {
     const git = mutation.repo();
+    const a = git.allocator;
     const oid = (try git.readDirectRefAlloc(try RefName.init(layout.session_ref))) orelse return error.NoEditSession;
-    const loaded = checkpoint.load(git) catch |err| switch (err) {
+    const loaded = checkpoint.loadMetadata(git, oid) catch |err| switch (err) {
         error.InvalidEditSession => null,
         else => return err,
     };
     try coordination.requireNoGitOperation(git, .{});
-    const head = try git.resolveCommitAlloc("HEAD");
-    const oplog = try git.readDirectRefAlloc(try RefName.init(layout.oplog_ref));
-    const archived = if (loaded) |l| valid: {
-        try checkOwner(git, &l.session);
-        var session = l.session;
-        session.outcome = .quit;
-        break :valid try checkpoint.create(git, &session, oid, &.{head}, "stakrr: quit edit");
-    } else corrupt: {
-        const kind = try git.output(&.{ "cat-file", "-t", oid });
-        var entries: std.ArrayList(Git.TreeEntry) = .empty;
-        var parents: std.ArrayList([]const u8) = .empty;
-        if (oplog) |previous| try parents.append(git.allocator, previous);
-        if (eql(kind, "commit")) {
-            try parents.append(git.allocator, oid);
-        } else {
-            try entries.append(git.allocator, .{ .name = "checkpoint", .oid = oid, .tree = eql(kind, "tree") });
+    var rescue: std.ArrayList([]const u8) = .empty;
+    try rescue.append(a, try git.resolveCommitAlloc("HEAD"));
+    var before: ?[]const u8 = null;
+    var after: ?[]const u8 = null;
+    if (loaded) |l| {
+        const s = &l.session;
+        try checkOwner(git, s);
+        before = s.before_manifest;
+        after = s.manifest;
+        const exists = blk: {
+            std.Io.Dir.cwd().access(git.io, s.workspace, .{}) catch |err| switch (err) {
+                error.FileNotFound => break :blk false,
+                else => return err,
+            };
+            break :blk true;
+        };
+        if (exists) {
+            var workspace = try openWorkspace(git, s);
+            defer workspace.close();
+            try coordination.requireNoGitOperation(&workspace.git, .{});
+            try rescue.append(a, try workspace.git.resolveCommitAlloc("HEAD"));
         }
-        try parents.append(git.allocator, head);
-        try entries.append(git.allocator, .{ .name = "rescue", .oid = try git.writeBlob(head) });
-        try entries.append(git.allocator, .{ .name = "previous", .oid = try git.writeBlob(oplog orelse "") });
-        break :corrupt try git.commitTree(try git.writeTree(entries.items), parents.items, "stakrr: quit corrupt edit");
-    };
-    try mutation.publish(.{ .message = "stakrr: quit edit", .updates = &.{
-        try oplogUpdate(git, oplog, archived),
-        try git.deleteRef(layout.session_ref, oid),
-    } });
+    }
+    const old = try git.readDirectRefAlloc(try RefName.init(layout.oplog_ref));
+    const record = try operations.create(git, .{ .kind = .quit, .before_manifest = before, .after_manifest = after, .moves = &.{}, .rescue = rescue.items, .previous = if (loaded != null) oid else old }, oid);
+    try mutation.publish(.{ .message = "stakrr: quit edit", .updates = &.{ try operations.update(git, old, record), try git.deleteRef(layout.session_ref, oid) } });
 }
-
-fn eql(a: []const u8, b: []const u8) bool {
-    return std.mem.eql(u8, a, b);
-}
-
-fn checkpointLabel(git: *const Git, s: *const Session) ![]const u8 {
-    return switch (s.phase) {
-        .switching => try std.fmt.allocPrint(git.allocator, "move to {s}", .{layout.shortBranch(s.origin)}),
-        .detaching, .replay, .conflict, .publishing => |p| try std.fmt.allocPrint(git.allocator, "{s} {d}/{d}", .{ @tagName(s.phase), p.next, p.plan_len }),
-        .aborting => if (s.operation == .undo) "undo completed edit" else "abort edit",
-        .aborted => if (s.operation == .undo) "completed edit undone" else "stack restored",
-    };
-}
-
-/// Journal and branch publication share one compare-and-swap transaction.
-fn save(
-    mutation: *const Mutation,
-    s: *const Session,
-    old: ?[]const u8,
-    changes: []const Git.RefUpdate,
-    retain: []const []const u8,
-) ![]const u8 {
+fn save(mutation: *const Mutation, s: *const Session, old: ?[]const u8, changes: []const Git.RefUpdate, retain: []const []const u8) ![]const u8 {
     const git = mutation.repo();
-    var scratch = std.heap.ArenaAllocator.init(git.allocator);
-    defer scratch.deinit();
-    const scratch_git = git.withAllocator(scratch.allocator());
-    const oid = try checkpoint.create(&scratch_git, s, old, retain, try checkpointLabel(&scratch_git, s));
+    const a = git.allocator;
+    const label = try std.fmt.allocPrint(a, "stakrr: checkpoint {s}", .{@tagName(s.phase)});
+    const oid = try checkpoint.create(git, s, old, retain, label);
     var updates: std.ArrayList(Git.RefUpdate) = .empty;
-    try updates.appendSlice(scratch_git.allocator, changes);
-    try updates.append(scratch_git.allocator, try git.verifyRef(layout.anchor_ref, s.anchor));
-    try updates.append(scratch_git.allocator, if (old) |previous|
-        try git.updateRef(layout.session_ref, previous, oid)
-    else
-        try git.createRef(layout.session_ref, oid));
-    try mutation.publish(.{ .message = "stakrr: edit checkpoint", .updates = updates.items });
-    return git.allocator.dupe(u8, oid);
+    try updates.appendSlice(a, changes);
+    var has_origin = false;
+    for (s.nodes) |node| if (eql(node.ref_name, s.origin)) {
+        has_origin = true;
+    };
+    if (!has_origin) try updates.append(a, try git.verifyRef(s.origin, s.origin_oid));
+    var has_state = false;
+    for (changes) |change| if (eql(change.name().bytes, layout.state_ref)) {
+        has_state = true;
+    };
+    if (!has_state) try updates.append(a, try git.verifyRef(layout.state_ref, s.manifest));
+    try updates.append(a, if (old) |previous| try git.updateRef(layout.session_ref, previous, oid) else try git.createRef(layout.session_ref, oid));
+    try mutation.publish(.{ .message = label, .updates = updates.items });
+    return oid;
 }
-
 fn owner(git: *const Git) ![]const u8 {
     return git.path(&.{ "rev-parse", "--absolute-git-dir" });
 }
-
 fn checkOwner(git: *const Git, s: *const Session) !void {
-    if (!eql(try owner(git), s.owner)) return error.WrongEditWorktree;
+    const actual = try owner(git);
+    if (eql(actual, s.owner)) return;
+    if (s.workspace_owner) |expected| if (eql(actual, expected)) {
+        var workspace = try openWorkspace(git, s);
+        workspace.close();
+        return;
+    };
+    return error.WrongEditWorktree;
 }
-
 fn available(git: *const Git, s: *const Session) !void {
+    var origin = try openOrigin(git, s);
+    defer origin.close();
     const refs = try git.allocator.alloc([]const u8, s.nodes.len + 1);
-    for (s.nodes, 0..) |node, i| refs[i] = node.ref_name;
+    for (s.nodes, refs[0..s.nodes.len]) |node, *ref| ref.* = node.ref_name;
     refs[s.nodes.len] = s.origin;
-    try coordination.requireAvailable(git, refs);
+    try coordination.requireAvailable(&origin.git, refs);
 }
-
+fn expectedChecks(git: *const Git, s: *const Session) ![]const Git.RefUpdate {
+    const checks = try git.allocator.alloc(Git.RefUpdate, s.nodes.len + 1);
+    for (s.nodes, checks[0..s.nodes.len], 0..) |node, *check, i| check.* = try git.verifyRef(node.ref_name, s.expectedOid(i));
+    checks[s.nodes.len] = try git.verifyRef(layout.state_ref, s.manifest);
+    return checks;
+}
 fn checkRefs(git: *const Git, s: *const Session) !void {
     if (try refDrift(git, s) != null) return error.EditStateChanged;
 }
-
 const Mismatch = struct {
     name: []const u8,
     expected: ?[]const u8,
     actual: ?[]const u8,
-
     fn of(name: []const u8, expected: ?[]const u8, actual: ?[]const u8) ?Mismatch {
         if (expected != null and actual != null and eql(expected.?, actual.?)) return null;
         return .{ .name = name, .expected = expected, .actual = actual };
     }
 };
-
-/// First persisted value that no longer matches the journal.
 fn refDrift(git: *const Git, s: *const Session) !?Mismatch {
-    const config = try git.configGet(layout.state_key);
-    if (Mismatch.of(layout.state_key, s.config, config)) |m| return m;
-    if (Mismatch.of(layout.anchor_ref, s.anchor, try git.readDirectRefAlloc(try RefName.init(layout.anchor_ref)))) |m| return m;
-    const tip = try git.readDirectRefAlloc(try RefName.init(layout.tip_ref));
-    if (Mismatch.of(layout.tip_ref, s.topCut().published_oid, tip)) |m| return m;
-
-    for (s.nodes[0 .. s.nodes.len - 1]) |node| {
-        const record = try layout.recordRef(git.allocator, node.ref_name);
-        if (Mismatch.of(record, node.published_oid, try git.readDirectRefAlloc(try RefName.init(record)))) |m| return m;
+    if (Mismatch.of(layout.state_ref, s.manifest, try git.readDirectRefAlloc(try RefName.init(layout.state_ref)))) |m| return m;
+    var known_origin = false;
+    for (s.nodes) |node| if (eql(node.ref_name, s.origin)) {
+        known_origin = true;
+    };
+    if (!known_origin) if (Mismatch.of(s.origin, s.origin_oid, try git.readDirectRefAlloc(try RefName.init(s.origin)))) |m| return m;
+    for (s.nodes, 0..) |node, i| if (Mismatch.of(node.ref_name, s.expectedOid(i), try git.readDirectRefAlloc(try RefName.init(node.ref_name)))) |m| return m;
+    const listed = try git.listDirectRefs(layout.layer_prefix);
+    for (listed.refs) |ref| {
+        var known = false;
+        for (s.nodes) |node| if (eql(node.ref_name, ref.name.bytes)) {
+            known = true;
+            break;
+        };
+        if (!known) return .{ .name = ref.name.bytes, .expected = null, .actual = try ref.oid.dupeHex(git.allocator) };
     }
-
-    var indexes: std.StringHashMapUnmanaged(usize) = .empty;
-    for (s.nodes, 0..) |node, i| try indexes.put(git.allocator, node.ref_name, i);
-    const seen = try git.allocator.alloc(bool, s.nodes.len);
-    @memset(seen, false);
-    const layers = (try git.listDirectRefs(layout.layer_prefix)).refs;
-    for (layers) |ref| {
-        const index = indexes.get(ref.name.bytes) orelse
-            return .{ .name = ref.name.bytes, .expected = null, .actual = try ref.oid.dupeHex(git.allocator) };
-        if (index == s.nodes.len - 1) return error.InvalidEditSession;
-        seen[index] = true;
-        if (nodeDrift(s, index, try ref.oid.dupeHex(git.allocator))) |m| return m;
-    }
-    for (s.nodes[0 .. s.nodes.len - 1], seen[0 .. s.nodes.len - 1], 0..) |node, found, i| {
-        if (!found) return .{ .name = node.ref_name, .expected = s.expectedOid(i), .actual = null };
-    }
-
-    const work = (try git.readDirectRefAlloc(try RefName.init(s.workNode().ref_name))) orelse
-        return .{ .name = s.workNode().ref_name, .expected = s.workNode().published_oid, .actual = null };
-    return nodeDrift(s, s.nodes.len - 1, work);
+    return null;
 }
-
-fn nodeDrift(s: *const Session, index: usize, actual: []const u8) ?Mismatch {
-    return Mismatch.of(s.nodes[index].ref_name, s.expectedOid(index), actual);
-}
-
-/// Where each phase leaves HEAD, mirroring the checks its handler makes.
 fn headDrift(git: *const Git, s: *const Session) !?Mismatch {
-    const current = try git.head();
-    const head = try git.resolveCommitAlloc("HEAD");
-    const actual = current orelse head;
-    switch (s.phase) {
-        .replay, .conflict, .publishing => |progress| {
-            if (current == null and s.phase == .replay and !eql(head, progress.before)) {
-                // a pick committed before its checkpoint is still in sequence
-                const parent = try git.output(&.{ "rev-list", "--parents", "-n", "1", head });
-                const expected = try std.fmt.allocPrint(git.allocator, "{s} {s}", .{ head, progress.before });
-                if (eql(parent, expected)) return null;
-            }
-            if (current != null) return .{ .name = "HEAD", .expected = progress.before, .actual = actual };
-            return Mismatch.of("HEAD", progress.before, head);
-        },
-        // HEAD only reaches the first replay commit once it detaches
-        .detaching, .switching, .aborting, .aborted => return null,
-    }
+    var origin = try openOrigin(git, s);
+    defer origin.close();
+    const branch = try origin.git.head();
+    if (branch) |ref| return Mismatch.of("HEAD", s.origin, ref);
+    if (s.final_detach) return null;
+    return .{ .name = "HEAD", .expected = s.origin, .actual = try origin.git.resolveCommitAlloc("HEAD") };
 }
-
-fn requireDetached(git: *const Git) !void {
-    if (try git.head() != null) return error.EditStateChanged;
-}
-
-// Merge rename handling can write paths absent from the incoming commit's
-// diff. Refuse all ignored files rather than predict those destinations.
 fn requireNoIgnored(git: *const Git) !void {
-    const ignored = try git.outputRaw(
-        &.{
-            "ls-files",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "--full-name",
-            "-z",
-            "--",
-            ":/",
-        },
-    );
-    defer git.allocator.free(ignored);
+    const ignored = try git.outputRaw(&.{ "ls-files", "--others", "--ignored", "--exclude-standard", "--full-name", "-z", "--", ":/" });
     if (ignored.len != 0) return error.IgnoredFilesPresent;
 }
-
-/// Only staged resolutions are accepted. Unstaged/untracked files must be
-/// preserved explicitly before continuing, just as for an ordinary transition.
 fn requireResolution(git: *const Git) !void {
     const unresolved = try git.output(&.{ "diff", "--no-relative", "--name-only", "--diff-filter=U" });
     if (unresolved.len != 0) return error.ReplayConflict;
     if (!try git.check(&.{ "diff", "--no-relative", "--quiet" }, 1)) return error.DirtyWorkTree;
-    const untracked = try git.output(
-        &.{ "ls-files", "--others", "--exclude-standard", "--full-name", "--", ":/" },
-    );
+    const untracked = try git.output(&.{ "ls-files", "--others", "--exclude-standard", "--full-name", "--", ":/" });
     if (untracked.len != 0) return error.DirtyWorkTree;
+}
+fn eql(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
 }

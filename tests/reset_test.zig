@@ -4,7 +4,7 @@ const stack = @import("stakrr").stack;
 const Repo = @import("support/repo.zig").Repo;
 
 test "reset refuses symbolic stakrr refs without changing refs or config" {
-    for ([_][]const u8{ "refs/stakrr/anchor", "refs/stakrr/tip", "refs/heads/stakrr/p1" }) |ref_name| {
+    for ([_][]const u8{ "refs/stakrr/state", "refs/heads/stakrr/p1" }) |ref_name| {
         var repo = try Repo.init();
         defer repo.deinit();
 
@@ -38,9 +38,6 @@ test "reset refuses symbolic stakrr refs without changing refs or config" {
         try testing.expect(main != null);
         try testing.expectEqualStrings(base, main.?);
         try repo.expectOutput(&.{ "symbolic-ref", "--no-recurse", ref_name }, "refs/heads/work");
-        const state = try repo.git.configGet(@import("stakrr").layout.state_key);
-        defer if (state) |value| testing.allocator.free(value);
-        try testing.expect(state != null);
     }
 }
 
@@ -73,8 +70,7 @@ test "reset keeps layers by default and blocks re-init until they go" {
     try testing.expectEqual(@as(usize, 0), result.deleted_layers);
 
     try testing.expect(try repo.hasRef("refs/heads/stakrr/p1"));
-    try repo.expectNoRef("refs/stakrr/tip");
-    try repo.expectNoRef("refs/stakrr/anchor");
+    try repo.expectNoRef("refs/stakrr/state");
 
     try testing.expectError(
         error.NotInitialized,
@@ -114,25 +110,6 @@ test "reset --delete-layers allows a clean re-init" {
     try stack.initStack(&repo.git, "main");
 }
 
-test "reset recovers from corrupt and outdated state" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-
-    const base = try repo.initStack();
-    defer testing.allocator.free(base);
-
-    // duplicate values make configGet fail; reset must not depend on it
-    try repo.exec(&.{ "config", "--local", "--add", "stakrr.state", "v1 garbage" });
-
-    try testing.expectError(
-        error.InvalidGitConfig,
-        stack.inspect(&repo.git),
-    );
-
-    _ = try stack.reset(&repo.git, .{ .delete_layers = false });
-    try stack.initStack(&repo.git, "main");
-}
-
 test "reset refuses to delete a checked-out layer" {
     var repo = try Repo.init();
     defer repo.deinit();
@@ -150,7 +127,7 @@ test "reset refuses to delete a checked-out layer" {
         error.LayerCheckedOut,
         stack.reset(&repo.git, .{ .delete_layers = true }),
     );
-    try testing.expect(try repo.hasRef("refs/stakrr/anchor"));
+    try testing.expect(try repo.hasRef("refs/stakrr/state"));
 }
 
 test "reset refuses to delete a layer checked out in another worktree" {

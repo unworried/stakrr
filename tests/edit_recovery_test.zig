@@ -1,570 +1,324 @@
-//! Recovery after process death and corrupt checkpoints, driven through the
-//! CLI with support/git_fault.sh.
+//! Named crash boundaries and recovery against real Git repositories.
 const std = @import("std");
 const testing = std.testing;
 const stakrr = @import("stakrr");
-const stack = stakrr.stack;
 const edit = stakrr.edit;
 const layout = stakrr.layout;
 const cli = @import("support/cli.zig");
 const Repo = @import("support/repo.zig").Repo;
 const fixture = @import("support/edit_fixture.zig");
-const setup = fixture.setup;
-const conflictSetup = fixture.conflictSetup;
-const valid = fixture.valid;
-const noSession = fixture.noSession;
-const expectRecoverable = fixture.expectRecoverable;
-const linked = fixture.linked;
-const on = fixture.on;
 
-fn replaceCheckpoint(repo: *const Repo, value: std.json.Value) ![]u8 {
-    const raw = try std.json.Stringify.valueAlloc(testing.allocator, value, .{});
-    defer testing.allocator.free(raw);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+fn inject(repo: *const Repo, command: []const u8, fault: []const u8) !void {
+    try repo.env.put("STAKRR_TEST_FAULT", fault);
+    const result = try cli.run(repo, &.{command});
+    defer result.deinit();
+    try result.expectKilled();
+    const marker = try std.fmt.allocPrint(testing.allocator, "{s}.fired", .{repo.env.get("STAKRR_TEST_COUNTER").?});
+    defer testing.allocator.free(marker);
+    try repo.expectFile(marker, fault);
+    _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
+}
+fn paused(repo: *const Repo) !void {
+    try fixture.setup(repo);
+    try fixture.correctModels(repo);
+    try cli.installFaultShim(repo);
+    try inject(repo, "restack", "after:detaching:1");
+}
+
+test "named replay, workspace, checkout and archival boundaries resume exactly once" {
+    for ([_][]const u8{ "before", "after" }) |side| {
+        for ([_][]const u8{
+            "detaching:1",  "workspace-create:1", "replay:1",          "pick:1",      "replay:2",   "replay:3",    "replay:4",           "pick:2",             "pick:3",
+            "publishing:1", "publishing:2",       "checkout-detach:1", "switching:1", "checkout:1", "switching:2", "workspace-unlock:1", "workspace-remove:1", "archive:1",
+        }) |boundary| {
+            var repo = try Repo.init();
+            defer repo.deinit();
+            try fixture.setup(&repo);
+            try fixture.correctModels(&repo);
+            try cli.installFaultShim(&repo);
+            const fault = try std.fmt.allocPrint(testing.allocator, "{s}:{s}", .{ side, boundary });
+            defer testing.allocator.free(fault);
+            try inject(&repo, "restack", fault);
+            if (std.mem.eql(u8, fault, "before:detaching:1")) {
+                try cli.expectSuccess(&repo, &.{"restack"});
+            } else if (std.mem.eql(u8, fault, "after:archive:1")) {
+                try fixture.noSession(&repo);
+                try cli.expectSuccess(&repo, &.{"continue"});
+            } else try cli.expectSuccess(&repo, &.{"continue"});
+            try fixture.noSession(&repo);
+            try fixture.valid(&repo);
+            try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/work");
+            try repo.expectOutput(&.{ "log", "--format=%s", "--reverse", "main..work" }, "models\ncorrection\napi\ndelete obsolete\nrolling");
+            try repo.expectNoRef(layout.transaction_ref);
+        }
+    }
+}
+
+test "named abort restoration and archival boundaries retain edited commits" {
+    for ([_][]const u8{ "before", "after" }) |side| {
+        for ([_][]const u8{ "aborting:1", "aborting:2", "checkout-detach:1", "aborted:1", "checkout:1", "aborted:2", "workspace-remove:1", "archive:1" }) |boundary| {
+            var repo = try Repo.init();
+            defer repo.deinit();
+            try paused(&repo);
+            const edited = try repo.git.resolveCommitAlloc("stakrr/models");
+            defer testing.allocator.free(edited);
+            const recorded = try fixture.boundary(&repo, "models");
+            defer testing.allocator.free(recorded);
+            const fault = try std.fmt.allocPrint(testing.allocator, "{s}:{s}", .{ side, boundary });
+            defer testing.allocator.free(fault);
+            try inject(&repo, "abort", fault);
+            if (try repo.hasRef(layout.session_ref)) {
+                try cli.expectSuccess(&repo, &.{"abort"});
+            } else try cli.expectSuccess(&repo, &.{"continue"}); // finish pending archive intent
+            try repo.expectRef("refs/heads/stakrr/models", recorded);
+            try fixture.expectRecoverable(&repo, edited);
+            try fixture.noSession(&repo);
+            try fixture.valid(&repo);
+        }
+    }
+}
+
+test "conflicts resume from original worktree or managed workspace without touching original files" {
+    for ([_]bool{ false, true }) |from_workspace| {
+        var repo = try Repo.init();
+        defer repo.deinit();
+        try fixture.conflictSetup(&repo);
+        const original = try repo.git.resolveCommitAlloc("HEAD");
+        defer testing.allocator.free(original);
+        const result = try cli.run(&repo, &.{"restack"});
+        defer result.deinit();
+        try testing.expectEqual(@as(?u8, 3), result.code);
+        try testing.expect(std.mem.indexOf(u8, result.stderr, "workspace: ") != null);
+        try repo.expectFile("shared", "edited\n");
+        try repo.expectOutput(&.{ "rev-parse", "HEAD" }, original);
+        try repo.expectOutput(&.{ "status", "--porcelain" }, "");
+        var workspace = try fixture.workspace(&repo);
+        defer workspace.tmp.dir.close(testing.io);
+        try workspace.write("shared", "resolved\n");
+        try workspace.exec(&.{ "add", "shared" });
+        const resumed = try cli.runAt(&repo, &.{"continue"}, if (from_workspace) workspace.tmp.dir else repo.tmp.dir);
+        defer resumed.deinit();
+        if (resumed.code != 0) std.debug.print("resume: {s}\n", .{resumed.stderr});
+        try testing.expectEqual(@as(?u8, 0), resumed.code);
+        try repo.expectOutput(&.{ "show", "work:shared" }, "resolved");
+        try fixture.validConflict(&repo);
+        try fixture.noSession(&repo);
+    }
+}
+
+fn replaceCheckpoint(repo: *const Repo, value: std.json.Value) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const git = repo.git.withAllocator(arena.allocator());
     var entries: std.ArrayList(stakrr.git.Git.TreeEntry) = .empty;
-    try entries.append(git.allocator, .{ .name = "session.json", .oid = try git.writeBlob(raw) });
-    if (value.object.get("plan_oid")) |plan| {
-        if (plan == .string) try entries.append(git.allocator, .{ .name = "plan", .oid = plan.string });
-    }
-    const oid = try repo.git.commitTree(try git.writeTree(entries.items), &.{}, "test checkpoint");
-    errdefer testing.allocator.free(oid);
-    try repo.exec(&.{ "update-ref", layout.session_ref, oid });
-    return oid;
-}
-
-const correct = fixture.correctModels;
-
-/// restack from models, killed right after its first checkpoint
-fn pausedBeforeDetach(repo: *Repo) !void {
-    try setup(repo);
-    try on(repo, "models");
-    try repo.write("model", "corrected\n");
-    try repo.commitAll("correction");
-    try cli.installFaultShim(repo);
-    try repo.env.put("STAKRR_TEST_FAULT", "after:1");
-    const stopped = try cli.run(repo, &.{"restack"});
-    defer stopped.deinit();
-    try stopped.expectKilled();
-    _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
-    try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
-}
-
-fn expectInvalidCheckpointUnchanged(repo: *const Repo, oid: []const u8) !void {
-    const refs = try repo.git.output(&.{"show-ref"});
-    defer testing.allocator.free(refs);
-    for ([_]edit.Request{ .continue_edit, .abort }) |request| {
-        try testing.expectError(error.InvalidEditSession, edit.run(&repo.git, request));
-        try repo.expectOutput(&.{"show-ref"}, refs);
-        try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
-        try repo.expectOutput(&.{ "status", "--porcelain=v1" }, "");
-        try repo.expectRef(layout.session_ref, oid);
-        try repo.expectOutput(&.{ "show", "HEAD:model" }, "corrected");
-    }
-}
-
-test "replay resumes after process death on either side of every ref checkpoint" {
-    for ([_][]const u8{ "before", "after" }) |side| {
-        for (1..8) |checkpoint| {
-            var repo = try Repo.init();
-            defer repo.deinit();
-            try setup(&repo);
-            try correct(&repo);
-            try cli.installFaultShim(&repo);
-            const fault = try std.fmt.allocPrint(testing.allocator, "{s}:{d}", .{ side, checkpoint });
-            defer testing.allocator.free(fault);
-            try repo.env.put("STAKRR_TEST_FAULT", fault);
-            const killed = try cli.run(&repo, &.{"restack"});
-            defer killed.deinit();
-            try killed.expectKilled();
-            _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
-            if (checkpoint == 1 and std.mem.eql(u8, side, "before")) {
-                // nothing was journaled, so the restack simply starts over
-                try cli.expectSuccess(&repo, &.{"restack"});
-            } else {
-                try cli.expectSuccess(&repo, &.{"continue"});
-            }
-            try noSession(&repo);
-            try valid(&repo);
-            try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/work");
-            try repo.expectOutput(&.{ "show", "work:model" }, "corrected");
-            try repo.expectOutput(
-                &.{ "log", "--format=%s", "--reverse", "main..work" },
-                "models\ncorrection\napi\ndelete obsolete\nrolling",
-            );
-        }
-    }
-}
-
-test "a successful cherry-pick interrupted before journaling is incorporated exactly once" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-    try setup(&repo);
-    try correct(&repo);
-    try cli.installFaultShim(&repo);
-    try repo.env.put("STAKRR_TEST_FAULT", "pick");
-    const killed = try cli.run(&repo, &.{"restack"});
-    defer killed.deinit();
-    try killed.expectKilled();
-    _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
-    try cli.expectSuccess(&repo, &.{"continue"});
-    try repo.expectOutput(
-        &.{ "log", "--format=%s", "--reverse", "main..work" },
-        "models\ncorrection\napi\ndelete obsolete\nrolling",
-    );
-    try noSession(&repo);
-}
-
-test "conflicts continue after restarting the CLI process" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-    try conflictSetup(&repo);
-    const conflict = try cli.run(&repo, &.{"restack"});
-    defer conflict.deinit();
-    try testing.expectEqual(@as(?u8, 3), conflict.code);
-    const status = try cli.run(&repo, &.{"status"});
-    defer status.deinit();
-    try testing.expectEqual(@as(?u8, 0), status.code);
-    try testing.expect(std.mem.indexOf(u8, status.stdout, "models (conflict)") != null);
-    try repo.write("shared", "resolved\n");
-    try repo.exec(&.{ "add", "shared" });
-    try cli.expectSuccess(&repo, &.{"continue"});
-    try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
-    try noSession(&repo);
-}
-
-test "abort and its restoration transaction resume after process death" {
-    for ([_][]const u8{ "before", "after" }) |side| {
-        for (1..3) |checkpoint| {
-            var repo = try Repo.init();
-            defer repo.deinit();
-            try conflictSetup(&repo);
-            const models = try repo.git.resolveCommitAlloc(layout.record_prefix ++ "models");
-            defer testing.allocator.free(models);
-            const api = try repo.git.resolveCommitAlloc("stakrr/api");
-            defer testing.allocator.free(api);
-            const work = try repo.git.resolveCommitAlloc("work");
-            defer testing.allocator.free(work);
-            const edited = try repo.git.resolveCommitAlloc("HEAD");
-            defer testing.allocator.free(edited);
-            try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .restack));
-            // a committed resolution leaves nothing for abort to refuse
-            try repo.write("shared", "resolved\n");
-            try repo.exec(&.{ "add", "shared" });
-            try repo.exec(&.{ "commit", "-q", "--no-edit" });
-            const resolution = try repo.git.resolveCommitAlloc("HEAD");
-            defer testing.allocator.free(resolution);
-            try cli.installFaultShim(&repo);
-            const fault = try std.fmt.allocPrint(testing.allocator, "{s}:{d}", .{ side, checkpoint });
-            defer testing.allocator.free(fault);
-            try repo.env.put("STAKRR_TEST_FAULT", fault);
-            const killed = try cli.run(&repo, &.{"abort"});
-            defer killed.deinit();
-            try killed.expectKilled();
-            _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
-            try cli.expectSuccess(&repo, &.{"abort"});
-            // the stack is back where it was; the layer's new commit stays recoverable
-            try repo.expectRef("refs/heads/stakrr/models", models);
-            try repo.expectRef("refs/heads/stakrr/api", api);
-            try repo.expectRef("refs/heads/work", work);
-            try expectRecoverable(&repo, edited);
-            try expectRecoverable(&repo, resolution);
-            try noSession(&repo);
-            try fixture.validConflict(&repo);
-        }
-    }
-}
-
-test "branch occupancy appearing during replay blocks publication" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-    try setup(&repo);
-    const work = try repo.git.resolveCommitAlloc("work");
-    defer testing.allocator.free(work);
-    try correct(&repo);
-    try cli.installFaultShim(&repo);
-    try repo.env.put("STAKRR_TEST_FAULT", "after:6");
-    const killed = try cli.run(&repo, &.{"restack"});
-    defer killed.deinit();
-    try killed.expectKilled();
-    _ = repo.env.swapRemove("STAKRR_TEST_FAULT");
-    const other = try linked(&repo, "linked", "work");
-    defer other.cwd.?.close(testing.io);
-    try testing.expectError(error.BranchOccupied, edit.run(&repo.git, .continue_edit));
-    try repo.expectRef("refs/heads/work", work);
-    try other.exec(&.{ "switch", "-q", "--detach" });
-    try edit.run(&repo.git, .continue_edit);
-    try valid(&repo);
-    try noSession(&repo);
-}
-
-test "session validation rejects extra layers and corrupt checkpoints" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-    try conflictSetup(&repo);
-    try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .restack));
-    try repo.exec(&.{ "branch", "stakrr/extra", "HEAD" });
-    try testing.expectError(error.EditStateChanged, edit.run(&repo.git, .continue_edit));
-    try repo.exec(&.{ "branch", "-D", "stakrr/extra" });
-    try repo.exec(&.{ "checkout", "--ours", "shared" });
-    try repo.exec(&.{ "add", "shared" });
-    try edit.run(&repo.git, .abort);
-    try noSession(&repo);
-    const bad = try repo.git.writeBlob("{}");
-    defer testing.allocator.free(bad);
-    try repo.exec(&.{ "update-ref", layout.session_ref, bad });
-    try testing.expectError(error.InvalidEditSession, edit.run(&repo.git, .abort));
-    try testing.expectError(error.EditInProgress, stack.reset(&repo.git, .{ .delete_layers = true }));
-}
-
-test "continue and abort reject an inconsistent replay plan before changing Git state" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-    try conflictSetup(&repo);
-    try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .restack));
-    try repo.exec(&.{ "checkout", "--ours", "shared" });
-    try repo.exec(&.{ "add", "shared" });
-
-    const checkpoint = (try repo.readRef(layout.session_ref)).?;
-    defer testing.allocator.free(checkpoint);
-    const raw = try fixture.checkpointJson(&repo, checkpoint);
-    defer testing.allocator.free(raw);
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, raw, .{});
-    defer parsed.deinit();
-    parsed.value.object.getPtr("plan_len").?.integer += 1;
-    const invalid_oid = try replaceCheckpoint(&repo, parsed.value);
-    defer testing.allocator.free(invalid_oid);
-
-    const head = try repo.git.resolveCommitAlloc("HEAD");
-    defer testing.allocator.free(head);
-    const picking = (try repo.git.cherryPickHeadAlloc()).?;
-    defer testing.allocator.free(picking);
-    for ([_]edit.Request{ .continue_edit, .abort }) |request| {
-        try testing.expectError(error.InvalidEditSession, edit.run(&repo.git, request));
-        try repo.expectOutput(&.{ "rev-parse", "--verify", "HEAD" }, head);
-        try repo.expectOutput(&.{ "rev-parse", "--verify", "CHERRY_PICK_HEAD" }, picking);
-        try repo.expectRef(layout.session_ref, invalid_oid);
-    }
-    try repo.exec(&.{ "update-ref", layout.session_ref, checkpoint });
-    try edit.run(&repo.git, .abort);
-    try noSession(&repo);
-}
-
-test "every checkpoint phase rejects inconsistent state before changing Git" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-    try pausedBeforeDetach(&repo);
-    const checkpoint = (try repo.readRef(layout.session_ref)).?;
-    defer testing.allocator.free(checkpoint);
-    const raw = try fixture.checkpointJson(&repo, checkpoint);
-    defer testing.allocator.free(raw);
-    const phases = [_][]const u8{
-        "switching",
-        "detaching",
-        "replay",
-        "conflict",
-        "publishing",
-        "aborting",
-        "aborted",
+    try entries.append(git.allocator, .{ .name = "session.json", .oid = try git.writeBlob(try std.json.Stringify.valueAlloc(git.allocator, value, .{})) });
+    if (value.object.get("progress")) |progress| if (progress == .object) {
+        if (progress.object.get("plan_oid")) |oid| if (oid == .string) {
+            try entries.append(git.allocator, .{ .name = "plan", .oid = oid.string });
+        };
     };
-    for (phases) |phase| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, raw, .{});
-        defer parsed.deinit();
-        const object = &parsed.value.object;
-        object.getPtr("phase").?.* = .{ .string = phase };
-        if (std.mem.eql(u8, phase, "switching")) {
-            object.getPtr("active").?.* = .{ .integer = 999 };
-        } else if (std.mem.eql(u8, phase, "detaching")) {
-            object.getPtr("next").?.* = .{ .integer = 1 };
-        } else if (std.mem.eql(u8, phase, "replay")) {
-            object.getPtr("plan_oid").?.* = .null;
-            object.getPtr("plan_len").?.* = .{ .integer = 0 };
-        } else if (std.mem.eql(u8, phase, "conflict")) {
-            object.getPtr("next").?.* = object.get("plan_len").?;
-        } else if (std.mem.eql(u8, phase, "publishing")) {
-            object.getPtr("next").?.* = .{ .integer = 0 };
-        } else if (std.mem.eql(u8, phase, "aborting")) {
-            object.getPtr("plan_oid").?.* = .null;
-        } else {
-            object.getPtr("id").?.* = .{
-                .string = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            };
-        }
-        const invalid = try replaceCheckpoint(&repo, parsed.value);
-        defer testing.allocator.free(invalid);
-        try expectInvalidCheckpointUnchanged(&repo, invalid);
-    }
-    try repo.exec(&.{ "update-ref", layout.session_ref, checkpoint });
-    try edit.run(&repo.git, .abort);
-    try noSession(&repo);
+    const oid = try git.commitTree(try git.writeTree(entries.items), &.{}, "test corrupt progress");
+    try git.exec(&.{ "update-ref", layout.session_ref, oid });
 }
 
-test "invalid replay plans are rejected before detach and before a clean abort" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-    try pausedBeforeDetach(&repo);
-    const checkpoint = (try repo.readRef(layout.session_ref)).?;
-    defer testing.allocator.free(checkpoint);
-    const raw = try fixture.checkpointJson(&repo, checkpoint);
-    defer testing.allocator.free(raw);
-    for ([_]enum { length, reverse, duplicate, malformed, extra }{ .length, .reverse, .duplicate, .malformed, .extra }) |corruption| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, raw, .{});
-        defer parsed.deinit();
-        if (corruption != .length) {
-            const oid = parsed.value.object.get("plan_oid").?.string;
-            const plan = try repo.git.output(&.{ "cat-file", "blob", oid });
-            defer testing.allocator.free(plan);
-            var commits: std.ArrayList([]const u8) = .empty;
-            defer commits.deinit(testing.allocator);
-            var lines = std.mem.tokenizeScalar(u8, plan, '\n');
-            while (lines.next()) |line| try commits.append(testing.allocator, line);
-            switch (corruption) {
-                .reverse => std.mem.reverse([]const u8, commits.items),
-                .duplicate => commits.items[0] = commits.items[1],
-                .malformed => commits.items[0] = "not-an-oid",
-                .extra => try commits.append(testing.allocator, commits.items[0]),
-                .length => unreachable,
-            }
-            const changed = try std.mem.join(testing.allocator, "\n", commits.items);
-            defer testing.allocator.free(changed);
-            const bad_plan = try repo.git.writeBlob(changed);
-            defer testing.allocator.free(bad_plan);
-            parsed.value.object.getPtr("plan_oid").?.* = .{ .string = bad_plan };
-            const invalid = try replaceCheckpoint(&repo, parsed.value);
-            defer testing.allocator.free(invalid);
-            try expectInvalidCheckpointUnchanged(&repo, invalid);
-        } else {
-            parsed.value.object.getPtr("plan_len").?.integer += 1;
-            const invalid = try replaceCheckpoint(&repo, parsed.value);
-            defer testing.allocator.free(invalid);
-            try expectInvalidCheckpointUnchanged(&repo, invalid);
-        }
-    }
-    try repo.exec(&.{ "update-ref", layout.session_ref, checkpoint });
-    try edit.run(&repo.git, .continue_edit);
-    try valid(&repo);
-    try noSession(&repo);
-}
-
-test "replay plans cannot omit a commit between cut boundaries" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-    try pausedBeforeDetach(&repo);
-    const checkpoint = (try repo.readRef(layout.session_ref)).?;
-    defer testing.allocator.free(checkpoint);
-    const raw = try fixture.checkpointJson(&repo, checkpoint);
-    defer testing.allocator.free(raw);
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, raw, .{});
-    defer parsed.deinit();
-    const object = &parsed.value.object;
-    const plan = try repo.git.outputRaw(&.{ "cat-file", "blob", object.get("plan_oid").?.string });
-    defer testing.allocator.free(plan);
-    // The first API commit is inside the cut; later commits still include
-    // every cut boundary, so boundary-only validation would accept this plan.
-    const first_newline = std.mem.indexOfScalar(u8, plan, '\n').?;
-    const shortened = try repo.git.writeBlob(plan[first_newline + 1 ..]);
-    defer testing.allocator.free(shortened);
-    object.getPtr("plan_oid").?.* = .{ .string = shortened };
-    object.getPtr("plan_len").?.integer -= 1;
-    const invalid = try replaceCheckpoint(&repo, parsed.value);
-    defer testing.allocator.free(invalid);
-    try expectInvalidCheckpointUnchanged(&repo, invalid);
-    try repo.exec(&.{ "update-ref", layout.session_ref, checkpoint });
-    try edit.run(&repo.git, .continue_edit);
-    try valid(&repo);
-    try noSession(&repo);
-}
-
-test "restarted detach refuses newly created ignored files without changing state" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-    try pausedBeforeDetach(&repo);
-    try repo.write(".git/info/exclude", "precious\n");
-    try repo.write("precious", "ignored data\n");
-    const refs = try repo.git.output(&.{"show-ref"});
-    defer testing.allocator.free(refs);
-    try testing.expectError(error.IgnoredFilesPresent, edit.run(&repo.git, .continue_edit));
-    try repo.expectOutput(&.{"show-ref"}, refs);
-    try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
-    try repo.expectFile("precious", "ignored data\n");
-    try repo.tmp.dir.deleteFile(testing.io, "precious");
-    try edit.run(&repo.git, .continue_edit);
-    try noSession(&repo);
-}
-
-test "checkout hooks cannot bypass the ignored-file replay guard" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-    try setup(&repo);
-    try correct(&repo);
-    try repo.write(".git/info/exclude", "api\n");
-    try repo.tmp.dir.createDir(testing.io, ".git/checkout-hooks", .default_dir);
-    try repo.tmp.dir.writeFile(testing.io, .{
-        .sub_path = ".git/checkout-hooks/post-checkout",
-        .data = "#!/bin/sh\nprintf 'ignored from checkout hook\\n' > api\n",
-        .flags = .{ .permissions = .executable_file },
-    });
-    try repo.exec(&.{ "config", "core.hooksPath", ".git/checkout-hooks" });
-    const work = try repo.git.resolveCommitAlloc("work");
-    defer testing.allocator.free(work);
-    try testing.expectError(error.IgnoredFilesPresent, edit.run(&repo.git, .restack));
-    try repo.expectRef("refs/heads/work", work);
-    try repo.expectFile("api", "ignored from checkout hook\n");
-    try repo.exec(&.{ "config", "core.hooksPath", "/dev/null" });
-    try repo.tmp.dir.deleteFile(testing.io, "api");
-    try edit.run(&repo.git, .continue_edit);
-    try repo.expectOutput(&.{ "show", "work:api" }, "api");
-    try noSession(&repo);
-}
-
-test "an unrelated commit checkpoint reports invalid session without changing refs" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-    try setup(&repo);
-    const commit_oid = try repo.git.resolveCommitAlloc("HEAD");
-    defer testing.allocator.free(commit_oid);
-    try repo.exec(&.{ "update-ref", layout.session_ref, commit_oid });
-    const refs = try repo.git.output(&.{"show-ref"});
-    defer testing.allocator.free(refs);
-    try testing.expectError(error.InvalidEditSession, edit.readStatus(&repo.git));
-    for ([_]edit.Request{ .continue_edit, .abort }) |request| {
-        try testing.expectError(error.InvalidEditSession, edit.run(&repo.git, request));
-        try repo.expectOutput(&.{"show-ref"}, refs);
-    }
-    try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/work");
-}
-
-test "quit drops only the journal of drifted and corrupt sessions" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-    try conflictSetup(&repo);
-    try testing.expectError(error.NoEditSession, edit.run(&repo.git, .quit));
-    try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .restack));
-    // a committed resolution leaves no pick for quit to refuse
-    try repo.write("shared", "resolved\n");
-    try repo.exec(&.{ "add", "shared" });
-    try repo.exec(&.{ "commit", "-q", "--no-edit" });
-    try repo.exec(&.{ "branch", "-f", "stakrr/api", "main" });
-    try testing.expectError(error.EditStateChanged, edit.run(&repo.git, .abort));
-    const head = try repo.git.resolveCommitAlloc("HEAD");
-    defer testing.allocator.free(head);
-    const checkpoint = (try repo.readRef(layout.session_ref)).?;
-    defer testing.allocator.free(checkpoint);
-    const branches = try repo.git.output(&.{ "for-each-ref", "refs/heads/" });
-    defer testing.allocator.free(branches);
-
-    try edit.run(&repo.git, .quit);
-    try noSession(&repo);
-    try repo.expectOutput(&.{ "for-each-ref", "refs/heads/" }, branches);
-    try repo.expectOutput(&.{ "rev-parse", "--verify", "HEAD" }, head);
-    try repo.expectOutput(&.{ "status", "--porcelain=v1" }, "");
-    try expectRecoverable(&repo, head);
-    try expectRecoverable(&repo, checkpoint);
-
-    const corrupt = try repo.git.writeBlob("not a checkpoint");
-    defer testing.allocator.free(corrupt);
-    try repo.exec(&.{ "update-ref", layout.session_ref, corrupt });
-    try testing.expectError(error.InvalidEditSession, edit.run(&repo.git, .abort));
-    try cli.expectSuccess(&repo, &.{"quit"});
-    try noSession(&repo);
-    try expectRecoverable(&repo, corrupt);
-}
-
-test "quit refuses while a replay pick is in progress" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-    try conflictSetup(&repo);
-    try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .restack));
-    const checkpoint = (try repo.readRef(layout.session_ref)).?;
-    defer testing.allocator.free(checkpoint);
-    try testing.expectError(error.GitOperationInProgress, edit.run(&repo.git, .quit));
-    try repo.expectRef(layout.session_ref, checkpoint);
-}
-
-test "invalid checkpoint object IDs refuse resume and remain quittable" {
-    for ([_][]const u8{ "sha1", "sha256" }) |format| {
-        var repo = try Repo.initOptions(.{ .object_format = format });
+test "malformed progress, invalid IDs and altered replay plans refuse before mutation" {
+    for ([_][]const u8{ "version", "id", "before_manifest", "manifest", "edited_oid", "plan_oid", "plan_len", "next", "active", "workspace", "node" }) |field| {
+        var repo = try Repo.init();
         defer repo.deinit();
-        try pausedBeforeDetach(&repo);
-        const checkpoint = (try repo.readRef(layout.session_ref)).?;
-        defer testing.allocator.free(checkpoint);
-        const raw = try fixture.checkpointJson(&repo, checkpoint);
+        try paused(&repo);
+        const oid = (try repo.readRef(layout.session_ref)).?;
+        defer testing.allocator.free(oid);
+        const raw = try fixture.checkpointJson(&repo, oid);
         defer testing.allocator.free(raw);
-        const zero: [64]u8 = @splat('0');
-        const other: [64]u8 = @splat('a');
-        const other_len: usize = if (checkpoint.len == 40) 64 else 40;
-        for ([_][]const u8{ zero[0..checkpoint.len], other[0..other_len] }) |invalid| {
-            var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, raw, .{});
-            defer parsed.deinit();
-            parsed.value.object.getPtr("nodes").?.array.items[0].object.getPtr("original_oid").?.* = .{ .string = invalid };
-            const corrupt = try replaceCheckpoint(&repo, parsed.value);
-            defer testing.allocator.free(corrupt);
-            try testing.expectError(error.InvalidEditSession, edit.readStatus(&repo.git));
-            try expectInvalidCheckpointUnchanged(&repo, corrupt);
-
-            // Quit must preserve dirty user work while retaining the corrupt checkpoint.
-            try repo.write("user-file", "staged\n");
-            try repo.exec(&.{ "add", "user-file" });
-            try repo.write("user-file", "unstaged\n");
-            const index = try repo.git.output(&.{"write-tree"});
-            defer testing.allocator.free(index);
-            const branches = try repo.git.output(&.{ "for-each-ref", "refs/heads/" });
-            defer testing.allocator.free(branches);
-            try cli.expectSuccess(&repo, &.{"quit"});
-            try noSession(&repo);
-            try repo.expectOutput(&.{"write-tree"}, index);
-            try repo.expectOutput(&.{ "for-each-ref", "refs/heads/" }, branches);
-            try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/stakrr/models");
-            try repo.expectFile("user-file", "unstaged\n");
-            try expectRecoverable(&repo, corrupt);
-            // Restore the fixture's clean state for the next corrupt checkpoint.
-            try repo.exec(&.{ "restore", "--staged", "user-file" });
-            try repo.tmp.dir.deleteFile(testing.io, "user-file");
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, raw, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        const a = parsed.arena.allocator();
+        if (std.mem.eql(u8, field, "plan_oid")) {
+            const blob = try repo.git.writeBlob("missing commits\n");
+            defer testing.allocator.free(blob);
+            try parsed.value.object.getPtr("progress").?.object.put(a, field, .{ .string = try a.dupe(u8, blob) });
+        } else if (std.mem.eql(u8, field, "plan_len") or std.mem.eql(u8, field, "next")) {
+            try parsed.value.object.getPtr("progress").?.object.put(a, field, .{ .integer = 999 });
+        } else if (std.mem.eql(u8, field, "active") or std.mem.eql(u8, field, "version")) {
+            try parsed.value.object.put(a, field, .{ .integer = 999 });
+        } else if (std.mem.eql(u8, field, "node")) {
+            try parsed.value.object.getPtr("nodes").?.array.items[0].object.put(a, "original_oid", .{ .string = "0000000000000000000000000000000000000000" });
+        } else try parsed.value.object.put(a, field, .{ .string = "invalid" });
+        try replaceCheckpoint(&repo, parsed.value);
+        const before = try repo.git.output(&.{"show-ref"});
+        defer testing.allocator.free(before);
+        for ([_]edit.Request{ .continue_edit, .abort }) |request| {
+            try testing.expectError(error.InvalidEditSession, edit.run(&repo.git, request));
+            try repo.expectOutput(&.{"show-ref"}, before);
+            try repo.expectOutput(&.{ "symbolic-ref", "HEAD" }, "refs/heads/work");
+            try repo.expectOutput(&.{ "status", "--porcelain" }, "");
         }
+        try edit.run(&repo.git, .quit);
+        try fixture.noSession(&repo);
     }
 }
 
-test "log rejects zero and wrong-format checkpoint history links" {
-    for ([_][]const u8{ "sha1", "sha256" }) |format| {
-        var repo = try Repo.initOptions(.{ .object_format = format });
+test "quit refuses active workspace pick and preserves workspace files after Git quit" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try fixture.conflictSetup(&repo);
+    try testing.expectError(error.ReplayConflict, edit.run(&repo.git, .restack));
+    var workspace = try fixture.workspace(&repo);
+    defer workspace.tmp.dir.close(testing.io);
+    try testing.expectError(error.GitOperationInProgress, edit.run(&repo.git, .quit));
+    try workspace.exec(&.{ "cherry-pick", "--quit" });
+    const before = try workspace.git.outputRaw(&.{ "diff", "--binary" });
+    defer testing.allocator.free(before);
+    try edit.run(&repo.git, .quit);
+    try fixture.noSession(&repo);
+    try workspace.expectOutput(&.{ "diff", "--binary" }, std.mem.trimEnd(u8, before, "\r\n"));
+    try workspace.write("precious", "preserved\n");
+    try workspace.expectFile("precious", "preserved\n");
+}
+
+test "corrupt checkpoints archive without interpreting them and retain raw objects" {
+    for ([_][]const u8{ "blob", "commit" }) |kind| {
+        var repo = try Repo.init();
         defer repo.deinit();
-        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        try fixture.setup(&repo);
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
         defer arena.deinit();
         const git = repo.git.withAllocator(arena.allocator());
-        const head = try repo.commit("base");
-        defer testing.allocator.free(head);
-        const rescue = try git.writeBlob(head);
-        const zero: [64]u8 = @splat('0');
-        const other: [64]u8 = @splat('a');
-        const other_len: usize = if (head.len == 40) 64 else 40;
-        for ([_][]const u8{ zero[0..head.len], other[0..other_len] }) |invalid| {
-            const tree = try git.writeTree(&.{
-                .{ .name = "rescue", .oid = rescue },
-                .{ .name = "previous", .oid = try git.writeBlob(invalid) },
-            });
-            const checkpoint = try git.commitTree(tree, &.{head}, "corrupt history link");
-            try repo.exec(&.{ "update-ref", layout.oplog_ref, checkpoint });
-            try testing.expectError(error.InvalidEditSession, edit.readLog(&repo.git));
-            try repo.expectRef(layout.oplog_ref, checkpoint);
-        }
+        const blob = try git.writeBlob("corrupt progress");
+        const oid = if (std.mem.eql(u8, kind, "blob")) blob else try git.commitTree(try git.writeTree(&.{.{ .name = "session.json", .oid = blob }}), &.{}, "corrupt session");
+        try git.exec(&.{ "update-ref", layout.session_ref, oid });
+        try edit.run(&repo.git, .quit);
+        try repo.exec(&.{ "reflog", "expire", "--expire=now", "--all" });
+        try repo.exec(&.{ "gc", "--prune=now" });
+        try repo.exec(&.{ "cat-file", "-e", oid });
+        try repo.exec(&.{ "fsck", "--no-reflogs", "--full" });
+        try fixture.noSession(&repo);
     }
 }
 
-test "pending restack status offers continue without conflict instructions" {
+test "branch occupancy or dirty invocation at final publication retains replay for continuation" {
+    for ([_]bool{ false, true }) |dirty| {
+        var repo = try Repo.init();
+        defer repo.deinit();
+        try fixture.setup(&repo);
+        try fixture.correctModels(&repo);
+        try cli.installFaultShim(&repo);
+        try inject(&repo, "restack", "after:publishing:1");
+        const manifest = (try repo.readRef(layout.state_ref)).?;
+        defer testing.allocator.free(manifest);
+        if (dirty) {
+            try repo.write("precious", "user work\n");
+            try testing.expectError(error.DirtyWorkTree, edit.run(&repo.git, .continue_edit));
+            try repo.expectFile("precious", "user work\n");
+            try repo.tmp.dir.deleteFile(testing.io, "precious");
+        } else {
+            const other = try fixture.linked(&repo, "occupied", "stakrr/api");
+            defer other.cwd.?.close(testing.io);
+            try testing.expectError(error.BranchOccupied, edit.run(&repo.git, .continue_edit));
+            try other.exec(&.{ "switch", "--quiet", "--detach" });
+        }
+        try repo.expectRef(layout.state_ref, manifest);
+        try cli.expectSuccess(&repo, &.{"continue"});
+        try fixture.valid(&repo);
+    }
+}
+
+test "workspace cleanup preserves ignored and unexpected files and resumes after preservation" {
     var repo = try Repo.init();
     defer repo.deinit();
-    try pausedBeforeDetach(&repo);
-    const result = try cli.run(&repo, &.{"status"});
-    defer result.deinit();
-    try testing.expectEqual(@as(?u8, 0), result.code);
-    try testing.expect(std.mem.indexOf(u8, result.stdout, "(detaching) → stakrr/models") != null);
-    try testing.expect(std.mem.indexOf(u8, result.stdout, "\n  stakrr continue\n") != null);
-    try testing.expect(std.mem.indexOf(u8, result.stdout, "\nreplay 0/3 done\n") != null);
-    try testing.expect(std.mem.indexOf(u8, result.stdout, "  stakrr quit leaves") != null);
-    try testing.expect(std.mem.indexOf(u8, result.stdout, "resolve conflicts") == null);
-    try testing.expect(std.mem.indexOf(u8, result.stdout, "recovery:") == null);
-    try testing.expect(std.mem.indexOf(u8, result.stdout, "worktree:") == null);
-    try edit.run(&repo.git, .continue_edit);
-    try noSession(&repo);
+    try fixture.setup(&repo);
+    try fixture.correctModels(&repo);
+    try cli.installFaultShim(&repo);
+    try inject(&repo, "restack", "after:switching:1");
+    var workspace = try fixture.workspace(&repo);
+    defer workspace.tmp.dir.close(testing.io);
+    try workspace.exec(&.{ "config", "core.excludesFile", "info/exclude" });
+    try workspace.write("precious", "unexpected\n");
+    try testing.expectError(error.WorkspaceCleanupPending, edit.run(&repo.git, .continue_edit));
+    try workspace.expectFile("precious", "unexpected\n");
+    try workspace.tmp.dir.deleteFile(testing.io, "precious");
+    try cli.expectSuccess(&repo, &.{"continue"});
+    try fixture.noSession(&repo);
+}
+
+test "operation log shows completed records and active checkpoints after restart" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try paused(&repo);
+    const raw = try fixture.checkpointJson(&repo, layout.session_ref);
+    defer testing.allocator.free(raw);
+    var metadata = try std.json.parseFromSlice(std.json.Value, testing.allocator, raw, .{});
+    defer metadata.deinit();
+    try testing.expectEqual(@as(i64, 1), metadata.value.object.get("version").?.integer);
+    var active = try edit.readLog(&repo.git);
+    defer active.deinit();
+    try testing.expect(active.steps.len != 0);
+    try cli.expectSuccess(&repo, &.{"continue"});
+    var log = try edit.readLog(&repo.git);
+    defer log.deinit();
+    try testing.expectEqualStrings("stakrr: restack", log.steps[0].label);
+    try testing.expect(log.steps.len > 2);
+    try testing.expect(log.steps[0].moves.len != 0);
+}
+
+test "abort restores original refs after publication checkout and workspace removal interruptions" {
+    for ([_][]const u8{ "after:switching:1", "after:checkout:1", "after:workspace-remove:1" }) |fault| {
+        var repo = try Repo.init();
+        defer repo.deinit();
+        try fixture.setup(&repo);
+        const boundary = try fixture.boundary(&repo, "models");
+        defer testing.allocator.free(boundary);
+        const work = try repo.git.resolveCommitAlloc("work");
+        defer testing.allocator.free(work);
+        try fixture.correctModels(&repo);
+        try cli.installFaultShim(&repo);
+        try inject(&repo, "restack", fault);
+        try cli.expectSuccess(&repo, &.{"abort"});
+        try repo.expectRef("refs/heads/stakrr/models", boundary);
+        try repo.expectRef("refs/heads/work", work);
+        try fixture.valid(&repo);
+        try fixture.noSession(&repo);
+    }
+}
+
+test "conflict checkpoint interruptions preserve invocation and resume the recorded pick" {
+    for ([_][]const u8{ "before:conflict:1", "after:conflict:1" }) |fault| {
+        var repo = try Repo.init();
+        defer repo.deinit();
+        try fixture.conflictSetup(&repo);
+        try cli.installFaultShim(&repo);
+        try inject(&repo, "restack", fault);
+        try repo.expectFile("shared", "edited\n");
+        try repo.expectOutput(&.{ "status", "--porcelain" }, "");
+        var workspace = try fixture.workspace(&repo);
+        defer workspace.tmp.dir.close(testing.io);
+        try workspace.write("shared", "resolved\n");
+        try workspace.exec(&.{ "add", "shared" });
+        try cli.expectSuccess(&repo, &.{"continue"});
+        try fixture.validConflict(&repo);
+    }
+}
+
+test "foreign workspace lock ownership refuses replay without changing managed state" {
+    var repo = try Repo.init();
+    defer repo.deinit();
+    try fixture.setup(&repo);
+    try fixture.correctModels(&repo);
+    try cli.installFaultShim(&repo);
+    try inject(&repo, "restack", "after:replay:1");
+    var status = (try edit.readStatus(&repo.git)).?;
+    defer status.deinit();
+    const refs = try repo.git.output(&.{"show-ref"});
+    defer testing.allocator.free(refs);
+    try repo.exec(&.{ "worktree", "unlock", status.workspace });
+    try repo.exec(&.{ "worktree", "lock", "--reason", "foreign ownership", status.workspace });
+    try testing.expectError(error.WorkspaceChanged, edit.run(&repo.git, .continue_edit));
+    try repo.expectOutput(&.{"show-ref"}, refs);
+    try repo.expectOutput(&.{ "status", "--porcelain" }, "");
+    try repo.exec(&.{ "worktree", "unlock", status.workspace });
+    const reason = try std.fmt.allocPrint(testing.allocator, "stakrr {s}", .{status.session_id});
+    defer testing.allocator.free(reason);
+    try repo.exec(&.{ "worktree", "lock", "--reason", reason, status.workspace });
+    try cli.expectSuccess(&repo, &.{"continue"});
+    try fixture.valid(&repo);
 }

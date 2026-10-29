@@ -8,7 +8,7 @@ const fixture = @import("support/edit_fixture.zig");
 const cli = @import("support/cli.zig");
 
 fn positions(repo: *const Repo) ![]u8 {
-    return repo.git.output(&.{ "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/", layout.tip_ref });
+    return repo.git.output(&.{ "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/", layout.state_ref });
 }
 
 fn stage(repo: *const Repo, path: []const u8, data: []const u8) !void {
@@ -56,8 +56,8 @@ test "fix adds a commit to a lower layer and replays everything above it" {
     try testing.expectEqual(@as(usize, 1), log.steps.len);
     try testing.expectEqual(@as(usize, 3), log.steps[0].moves.len);
     for (log.steps[0].moves) |move| {
-        try testing.expect(!std.mem.eql(u8, move.before, move.after));
-        try repo.expectRef(move.name, move.after);
+        try testing.expect(!std.mem.eql(u8, move.before, move.after.?));
+        try repo.expectRef(move.name, move.after.?);
         const old = for (before.refs) |ref| {
             if (std.mem.eql(u8, ref.name.bytes, move.name)) break ref.oid;
         } else return error.TestExpectedRef;
@@ -86,7 +86,7 @@ test "fix log starts from the actual refs after work between operations" {
     for (log.steps[0].moves) |move| {
         if (!std.mem.eql(u8, move.name, "refs/heads/work")) continue;
         try testing.expectEqualStrings(old_work, move.before);
-        try repo.expectRef(move.name, move.after);
+        try repo.expectRef(move.name, move.after.?);
         return;
     }
     return error.TestExpectedRef;
@@ -138,22 +138,6 @@ test "fix leaves unstaged edits alone" {
 
     try repo.expectOutput(&.{ "status", "--porcelain" }, " M tail");
     try repo.expectOutput(&.{ "show", "work:tail" }, "rolling");
-}
-
-test "undo reverses a fix" {
-    var repo = try Repo.init();
-    defer repo.deinit();
-    try fixture.setup(&repo);
-    const before = try positions(&repo);
-    defer testing.allocator.free(before);
-    try stage(&repo, "model", "fixed\n");
-
-    var result = try fix.fix(&repo.git, .{ .layer = "models", .how = .{ .message = "tweak model" } });
-    defer result.deinit(testing.allocator);
-    try cli.expectSuccess(&repo, &.{"undo"});
-
-    try expectUnchanged(&repo, before);
-    try fixture.valid(&repo);
 }
 
 test "a conflicting fix changes nothing" {

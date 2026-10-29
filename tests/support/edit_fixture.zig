@@ -103,3 +103,26 @@ pub fn validConflict(repo: *const Repo) !void {
         try testing.expect(!layer.stale());
     }
 }
+
+/// Borrowed fixture view of the managed workspace. Close tmp.dir, never deinit.
+pub fn workspace(repo: *const Repo) !Repo {
+    var status = (try stakrr.edit.readStatus(&repo.git)).?;
+    defer status.deinit();
+    var view = repo.*;
+    view.tmp.dir = try std.Io.Dir.cwd().openDir(testing.io, status.workspace, .{});
+    view.git.cwd = view.tmp.dir;
+    return view;
+}
+pub fn boundary(repo: *const Repo, name: []const u8) ![]u8 {
+    const loaded = try stakrr.state_store.load(&repo.git);
+    defer testing.allocator.free(loaded.oid);
+    var state = loaded.state;
+    defer state.deinit();
+    for (state.value.layers) |*layer| if (std.mem.eql(u8, name, layout.layerName(layer.branch.name.bytes).?)) return layer.recorded_boundary_oid.dupeHex(testing.allocator);
+    return error.TestMissingLayer;
+}
+pub fn expectBoundary(repo: *const Repo, name: []const u8, expected: []const u8) !void {
+    const oid = try boundary(repo, name);
+    defer testing.allocator.free(oid);
+    try testing.expectEqualStrings(expected, oid);
+}

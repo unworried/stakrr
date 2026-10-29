@@ -21,7 +21,7 @@ test "cli: bare repositories reject worktree commands without changing refs" {
         &.{"down"},                     &.{ "fix", "-m", "fix" },
         &.{"restack"},                  &.{"continue"},
         &.{"abort"},                    &.{"quit"},
-        &.{"undo"},                     &.{"log"},
+        &.{"log"},
     };
     for (commands) |args| {
         const result = try stakrr(&repo, args);
@@ -264,19 +264,14 @@ test "cli: conflict status shows detached replay and a resolution hint" {
     const status = try stakrr(&repo, &.{"status"});
     defer status.deinit();
     try testing.expectEqual(@as(?u8, 0), status.code);
-    const expected = try std.fmt.allocPrint(
-        testing.allocator,
-        "stack  main → work\nedit   stakrr/p1 (conflict) → stakrr/p1\nreplay 1/1 stopped at {s} upper\n\n" ++
-            "  │ work\n  │ stakrr/p1   conflict\n  └ main        base\n\n  1 layer\n\n" ++
-            "  resolve conflicts, git add, then stakrr continue\n" ++
-            "  to give up, commit the resolution, then stakrr abort\n",
-        .{upper[0..7]},
-    );
-    defer testing.allocator.free(expected);
-    try testing.expectEqualStrings(expected, status.stdout);
+    try testing.expect(std.mem.indexOf(u8, status.stdout, "workspace: ") != null);
+    try testing.expect(std.mem.indexOf(u8, status.stdout, "replay 1/1 stopped at ") != null);
+    try testing.expect(std.mem.indexOf(u8, status.stdout, "▸ stakrr/p1   conflict") != null);
+    var workspace = try @import("support/edit_fixture.zig").workspace(&repo);
+    defer workspace.tmp.dir.close(testing.io);
 
-    try repo.exec(&.{ "checkout", "--ours", "shared" });
-    try repo.exec(&.{ "add", "shared" });
+    try workspace.exec(&.{ "checkout", "--ours", "shared" });
+    try workspace.exec(&.{ "add", "shared" });
     const aborted = try stakrr(&repo, &.{"abort"});
     defer aborted.deinit();
     try testing.expectEqualStrings(
