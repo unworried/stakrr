@@ -37,7 +37,7 @@ grab a build from [releases](https://github.com/unworried/stakrr/releases),
 verify it and put it on your `PATH`:
 
 ```sh
-tag=v0.1.1             # choose a published tag from the releases page
+tag=v0.2.0             # choose a published tag from the releases page
 target=aarch64-macos   # x86_64-macos · aarch64-linux-musl · x86_64-linux-musl
 curl -fsSLO https://github.com/unworried/stakrr/releases/download/$tag/stakrr-$tag-$target.tar.gz
 curl -fsSLO https://github.com/unworried/stakrr/releases/download/$tag/SHA256SUMS
@@ -68,6 +68,7 @@ For Bash (3.2+), source the completion file in `~/.bashrc`:
 ```bash
 source /absolute/path/to/stakrr/completions/stakrr.bash
 ```
+
 Completion covers commands, flags, cut names for `go` and `fix`, local branches
 for `init --base`, and refs for `cut --at`.
 
@@ -240,7 +241,7 @@ HEAD plus the checkpoint are retained in `refs/stakrr/oplog` (inspect them with
 | ● | `stakrr quit` | drop a pending restack, leaving HEAD and every branch as they are |
 | ○ | `stakrr submit` | publish review branches, excluding rolling work |
 
-<sub>● shipped · ○ planned for m2</sub>
+<sub>● shipped · ○ planned for m3</sub>
 
 Exit codes: 0 success, 1 failure, 2 usage, 3 replay conflict pending, 4 tree not
 clean enough to proceed (dirty, ignored files, or a Git operation running), 5 refs
@@ -304,24 +305,26 @@ worktree.
 
 ```
 m1  safe rolling stacks       ■■■■  init · cut · status · reset · go · up · down
-m2  publishing + recovery     ■■■□  local editing + recovery shipped; submit planned
-m3  base + stack maintenance  □□□□  update base · retire landed layers · replay remaining work
+m2  local editing + recovery  ■■■■  fix · restack · continue · abort · quit · log
+m3  publishing + maintenance  □□□□  submit · update base · retire landed layers · replay remaining work
 ```
 
 m1 is complete: cuts record boundaries without rewriting history.
 
-m2 already includes `fix`, `restack`, conflict continuation, `abort`, `quit`,
-the operation journal, `log` and interrupted ref publication recovery.
-Remote publication with `submit` remains planned.
+m2 is complete: `fix`, `restack`, conflict continuation, `abort`, `quit`,
+the operation journal, `log` and interrupted ref publication recovery are shipped.
 
-m3 will keep stacks current as upstream changes land:
+m3 will publish review branches and keep stacks current as upstream changes land:
 
+- publish review branches with `submit`, excluding rolling work
 - restack layers and rolling work onto an updated base; today's `restack` only
   replays descendants of an edited cut
 - explicitly retire merged layers from stack tracking while preserving the
   remaining work
 - support conflict continuation, journal checkpoints and abort for these
   operations using the existing recovery machinery
+- reduce boilerplate in the regression tests and revisit ignored-file handling
+  during replay workspace cleanup
 
 Later: extract hunks from existing commits into a lower layer, rewriting their
 original commits too. `fix` already folds staged changes into a cut; moving
