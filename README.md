@@ -62,6 +62,12 @@ compinit
 
 If your shell framework already runs `compinit`, put the `fpath` line before
 loading the framework. Restart your shell after updating the configuration.
+
+For Bash (3.2+), source the completion file in `~/.bashrc`:
+
+```bash
+source /absolute/path/to/stakrr/completions/stakrr.bash
+```
 Completion covers commands, flags, cut names for `go` and `fix`, local branches
 for `init --base`, and refs for `cut --at`.
 
