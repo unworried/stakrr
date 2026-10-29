@@ -49,8 +49,8 @@ CLI output and exit codes as well as refs and file bytes:
 - Initialize, cut at HEAD and an earlier commit, navigate through layers and
   inspect status. Existing branch tips and compatible dirty work must survive.
 - Stage a fix on a lower layer with unrelated unstaged/untracked work; verify
-  descendant contents, then clean the scratch changes and undo twice. Compare
-  exact branch, layer-record and tip OIDs before and after each undo.
+  descendant contents, then clean the scratch changes and inspect completed records. Compare
+  exact branch, manifest and branch OIDs before and after publication.
 - Commit on a lower layer, restack, and inspect the operation log. Exercise a
   real replay conflict separately with continue, abort and quit.
 - Refuse invalid names, symbolic managed refs, occupied layers and a held

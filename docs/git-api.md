@@ -57,7 +57,7 @@ stakrr identity so ref bookkeeping works before a user configures their own.
 Acquire the context before observing state used to construct updates:
 
 ```zig
-var mutation = try original_git.beginStackMutation();
+var mutation = try mutation_mod.begin(original_git, .stack);
 defer mutation.deinit();
 const git = mutation.repo();
 
@@ -67,18 +67,18 @@ defer snapshot.deinit();
 // Compute new objects and retain every expected old value.
 const updates = [_]Git.RefUpdate{
     try git.updateRef(branch_name, old_hex, new_hex),
-    try git.verifyRef(anchor_name, anchor_hex),
+    try git.verifyRef(layout.state_ref, manifest_oid),
 };
 try mutation.publish(.{ .message = label, .updates = &updates });
 ```
 
-`beginStackMutation()` requires a working tree, acquires the shared lock, recovers
-pending publication, and refuses an active edit session. `beginEditMutation()`
-allows that session. `beginRefMutation()` supports bare repositories and provides
-the same lock and recovery guarantees without requiring a working tree.
+Workflows call `mutation.begin(git, kind)` directly. `.stack` requires a worktree,
+acquires the common lock, recovers publication and refuses active progress. `.edit`
+allows progress; `.refs` also supports bare repositories. Git plumbing exposes no
+workflow acquisition helpers.
 
 Checkout and replay methods also live on the context: `switchBranch(BranchRef)`,
-`detach(Oid)`, `cherryPick(Oid)`, `commitResolution()` and `quitCherryPick()`.
+`cherryPick(Oid)` and `commitResolution()`.
 Switching preserves Git's refusal to overwrite ignored files and disables branch
 guessing. Automated picks and resolution commits centralize hook/signing settings
 and preserve empty commits. Workflows retain validation of cleanliness, HEAD,
@@ -106,9 +106,11 @@ uses the same validator when recovering remaining writes. `publish()` refuses
 an unexpected pending intent instead of silently recovering after a snapshot
 was read. Low-level protocol publication is reserved for the journal backend.
 
-All persisted formats currently use v1: stack configuration, edit checkpoints
-and publication intents. Writers and readers use the version constants in
-`layout.zig`. Development formats are revised directly without legacy migration.
+Stack manifests, active execution progress, completed records and publication
+intents use version 1. The pure `stack_state.zig` codec owns decoded
+state; `state_store.zig` handles commit-backed loading and retention. Observations
+own an arena and expose unavailable evidence explicitly; strict mutation snapshots
+remain separate.
 
 The common lock coordinates stakrr processes. Ordinary Git writers do not take
 it; expected-OID transactions and validation under Git's ref locks remain

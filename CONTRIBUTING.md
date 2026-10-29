@@ -15,9 +15,9 @@ zig build test -Doptimize=ReleaseSafe
 for poking at the cli by hand. See [the test guide](tests/README.md) for shared
 fixtures, fault injection and the manual regression checklist.
 
-The source layout stays flat: `layout.zig` names every ref, config key and
-persisted format version; `git_types.zig` defines validated refs, branch names,
-OIDs and ref updates; `git.zig` provides Git queries, object plumbing and
+The source layout stays flat: `layout.zig` names persisted refs and the checkpoint
+and publication-intent format versions; `git_types.zig` defines validated refs,
+branch names, OIDs and ref updates; `git.zig` provides Git queries, object plumbing and
 subprocess helpers. `mutation.zig` owns the shared lock from recovery through
 publication, checkout and replay. `ref_transaction.zig` retains publication
 intent for recovery; `ref_backend.zig` implements Git's ref transaction protocol;
@@ -47,10 +47,9 @@ boundaries and recovery rules. When changing behavior, update the matching flow
 and regression coverage in the same change. Keep the README focused on usage;
 keep the exact command flow in that one reference.
 
-Stack configuration, edit checkpoints and publication intents currently use v1.
-While the project is pre-1.0, revise those schemas directly and keep readers,
-writers and format documentation aligned; no migration between development
-formats is maintained.
+Stack manifests, active progress, completed records and publication intents use v1.
+During active development, revise these schemas directly and keep readers, writers,
+tests and format documentation aligned. Keep their version tags at v1.
 
 ## // commits
 

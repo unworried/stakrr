@@ -79,7 +79,7 @@ echo "${dim}try${reset}"
 echo "  stakrr init --base main"
 echo "  stakrr cut models --at HEAD~3"
 echo "  stakrr status"
-echo "  git config --local --get stakrr.state"
+echo "  git show refs/stakrr/state:stack.json"
 echo
 echo "${dim}exit the shell with 'exit' or ctrl-d${reset}"
 echo
