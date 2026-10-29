@@ -1,0 +1,2 @@
+- m3: revisit ignored-file handling during replay workspace cleanup
+- m3: refactor tests to have less boilerplate

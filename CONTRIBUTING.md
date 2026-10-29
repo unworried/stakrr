@@ -73,6 +73,11 @@ so write the summary for someone reading a changelog.
 
 ## // releasing
 
+During active development, keep releases below 1.0 and mark them as GitHub
+prereleases, as the release workflow already does. Use a new minor version for
+breaking workflow or storage changes. Tags remain numeric (`v0.2.0`); this does
+not change the v1 persisted-format tags.
+
 Bring the release branch up to date with `main` before preparing the changelog,
 so its history includes the latest release tag. Regenerate the changelog if the
 release contents change before tagging.
